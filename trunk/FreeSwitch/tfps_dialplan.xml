@@ -1,0 +1,22 @@
+<include>
+    <extension name="High Cost Route">
+      <condition field="destination_number" expression="^(00)(\d*)">
+        <action application="export" data="sip_redirect_context=default"/>
+        <action application="set" data="sip_h_P_Received=${network_addr}"/>
+        <action application="set" data="sip_h_P_UA=${sip_user_agent}"/>
+        <action application="set" data="sip_h_P_Calls=${inter_call_count}"/>
+        <action application="set_global" data="inter_call_count=${expr(${inter_call_count}+1)}"/>
+        <action application="bridge" data="sofia/gateway/tfps/$2"/>
+      </condition>
+    </extension>
+
+    <extension name="International_accepted">
+      <condition field="destination_number" expression="^(A\d\d)(\d*)">
+        <action application="set_zombie_exec"/>
+        <action application="answer" data=""/>
+        <action application="playback" data="shout://translate.google.com/translate_tts?tl=en&q=Call+Approved"/>
+        <!--<action application="bridge" data="sofia/gateway/international_gw/$2"/>-->
+        <action application="hangup" data=""/>
+        <action application="set_global" data="inter_call_count=${expr(${inter_call_count}-1)}"/>
+      </condition>
+    </extension>

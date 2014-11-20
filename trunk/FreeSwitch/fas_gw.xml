@@ -1,0 +1,10 @@
+<include>
+  <gateway name="sippulse_fas">
+  <param name="username" value="<username>"/>
+  <param name="realm" value="tfps.co"/>
+  <param name="from-domain" value="tfps.co"/>
+  <param name="password" value="<password>"/>
+  <param name="proxy" value="server1.tfps.co:9090"/>
+  <param name="register" value="false"/>
+  </gateway>
+</include>
