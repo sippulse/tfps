@@ -1,4 +1,4 @@
-How to install TFPS for Asterisk
+#summary How to install TFPS for Asterisk
 
 = Introduction =
 
