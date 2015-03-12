@@ -19,8 +19,8 @@ Define FROM which countries you are going to allow calls.
 
 [InstallationforAsterisk Installation for Asterisk]
 
-Installation for Elastix/Trixbox/FreePBX
+[InstallationforElastix Installation for Elastix/Trixbox/FreePBX]
 
-Installation for Freeswitch
+[InstallationforFreeswitch Installation for FreeSwitch]
 
-Installation for OpenSIPS
+[InstallationforOpenSIPS Installation for OpenSIPS]
