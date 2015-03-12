@@ -19,8 +19,8 @@ Define FROM which countries you are going to allow calls.
 
 [http://www.tfps.co/fpsportal/media/fps_user_guide.pdf Installation for Asterisk]
 
-[InstallationforElastix Installation for Elastix/Trixbox/FreePBX]
+[http://www.tfps.co/fpsportal/media/fps_user_guide_elastix.pdf Installation for Elastix/Trixbox/FreePBX]
 
-[InstallationforFreeswitch Installation for FreeSwitch]
+[http://www.tfps.co/fpsportal/media/fps_user_guide_freeswitch.pdf Installation for FreeSwitch]
 
-[InstallationforOpenSIPS Installation for OpenSIPS]
+[http://www.tfps.co/fpsportal/media/fps_user_guide_opensips.pdf Installation for OpenSIPS]
