@@ -15,10 +15,10 @@ Define how many calls per day you are going to allow on working hours and off-ho
 Define TO which countries you are going to allow calls.
 Define FROM which countries you are going to allow calls.
 
-[Installation for Asterisk]
+Installation for Asterisk
 
-[Installation for Elastix/Trixbox/FreePBX]
+Installation for Elastix/Trixbox/FreePBX
 
-[Installation for Freeswitch]
+Installation for Freeswitch
 
-[Installation for OpenSIPS]
+Installation for OpenSIPS
