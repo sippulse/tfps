@@ -1,4 +1,6 @@
+#summary Installation and account creation
 #labels TFPS,INSTALLATION
+
 How to create a new account
 
 To create an account you should access the menu Sign-in. After signing in you will receive FREE 100 transactions, valid for 30 days. 
