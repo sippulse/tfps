@@ -34,4 +34,6 @@ Your phone system can be integrated to the TFPS using SIP redirects or Restful A
 
 There are three methods of operation, Free, Basic and ITSP. In the Free Plan, the system is completely automated, there is nothing to configure. In the Basic mode you can configure call thresholds and Geo restrictions. In the ITSP mode you can have your own domain and configure different policies for different users. We will have a detailed description of the system in the next chapters.
 
-# More information at our WIKI https://github.com/flaviogoncalves/tfps/wiki
+# More information at our WIKI
+
+https://github.com/flaviogoncalves/tfps/wiki
