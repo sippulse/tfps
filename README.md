@@ -36,4 +36,4 @@ There are three methods of operation, Free, Basic and ITSP. In the Free Plan, th
 
 # More information at our WIKI
 
-https://github.com/flaviogoncalves/tfps/wiki
+https://github.com/sippulse/tfps/wiki
