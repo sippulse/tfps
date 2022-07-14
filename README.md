@@ -18,7 +18,7 @@ The system was created for IP PBX users and ITSP (Internet Telephony Service Pro
 
 ## How It Works!
 
-TFPS learns the address, dialed numbers and behavior from strategically placed honeypots. We learn in realitime, IP addresses and Premium Rate Numbers associated to fraudulent activities. We also learn from our own detection process. Some customers have in-site honeypots to detect targeted attacks. Once an address is learned it is updated in real-time in the blacklist database. Beyond the blacklist rules, calls will also be checked against pre or dynamically set rules, such as:
+TFPS learns the address, dialed numbers and behavior from strategically placed honeypots. We learn in realtime, IP addresses and Premium Rate Numbers associated to fraudulent activities. We also learn from our own detection process. Some customers have in-site honeypots to detect targeted attacks. Once an address is learned it is updated in real-time in the blacklist database. Beyond the blacklist rules, calls will also be checked against pre or dynamically set rules, such as:
 
 * Country of Origin (IP Geolocation)
 * Country of Destination (Dialed #)
