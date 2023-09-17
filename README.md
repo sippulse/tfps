@@ -1,3 +1,5 @@
+** This project has been discontinued, its functionality was incorporated in the SipPulse Softwitch **
+
 # tfps
 
 ## Overview
