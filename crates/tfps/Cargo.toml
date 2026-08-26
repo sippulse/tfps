@@ -1,0 +1,22 @@
+[package]
+name = "tfps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TFPS — prevenção de fraude IRSF em redes SIP. Observa, aprende e bloqueia."
+
+[[bin]]
+name = "tfps"
+path = "src/main.rs"
+
+[dependencies]
+tfps-core = { path = "../tfps-core" }
+socket2 = "0.6"
+aya = "0.14.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+ureq = { version = "3.4.0", default-features = false, features = ["rustls", "json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[lints]
+workspace = true

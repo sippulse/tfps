@@ -1,0 +1,9 @@
+[package]
+name = "tfps-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Núcleo do TFPS: parse de SIP, canonicalização, novidade e veredito. Sem I/O."
+
+[lints]
+workspace = true
