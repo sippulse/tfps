@@ -119,7 +119,7 @@ impl NoiseFilter {
         for (sig, kind, n) in &mut self.extra {
             if matches_sig(ua, sig, *kind) {
                 *n += 1;
-                return Some("<arquivo>");
+                return Some("<file>");
             }
         }
         None
@@ -199,7 +199,7 @@ impl NoiseFilter {
             for pat in &self.extra_injection {
                 if lower.contains(pat.as_str()) {
                     self.injections += 1;
-                    return Some("<arquivo>");
+                    return Some("<file>");
                 }
             }
         }
@@ -370,7 +370,7 @@ mod tests {
             "sip:1001@pbx.example.com",
             "<sip:5511999998888@gw.example.com>;tag=abc123",
             "sip:200@10.0.0.5:5060;transport=udp",
-            "\"Ramal 200\" <sip:200@pbx.com>;tag=x",
+            "\"Ext 200\" <sip:200@pbx.com>;tag=x",
             "sip:+5511999998888@carrier.net;user=phone",
         ] {
             assert!(
@@ -395,15 +395,15 @@ mod tests {
     fn a_file_adds_and_never_replaces() {
         let mut f = NoiseFilter::new();
         f.add_signature("MyLocalScanner");
-        f.add_signature("=ExatoAssim");
+        f.add_signature("=ExactlyThis");
         f.add_signature("# ignored comment");
         f.add_signature("   ");
 
         // The new one works…
         assert!(f.is_noise(Some("MyLocalScanner/2.0")).is_some());
-        assert!(f.is_noise(Some("ExatoAssim")).is_some());
+        assert!(f.is_noise(Some("ExactlyThis")).is_some());
         assert!(
-            f.is_noise(Some("ExatoAssim e mais")).is_none(),
+            f.is_noise(Some("ExactlyThis and more")).is_none(),
             "= is double-anchored"
         );
         // …and the built-ins still apply. That is the point: it adds, it does not replace.

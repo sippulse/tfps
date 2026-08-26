@@ -381,7 +381,7 @@ impl Engine {
     ) -> Decision {
         // The A-number is an unverified assertion by the sender; it serves as a grouping
         // key, never as identity. The trust anchor is the peer. `SPEC.md` §5.
-        let a_number = req.from_user().unwrap_or("<sem-from>").to_string();
+        let a_number = req.from_user().unwrap_or("<no-from>").to_string();
 
         *state.country_calls.entry(c.index.0).or_insert(0) += 1;
         state.total_calls += 1;

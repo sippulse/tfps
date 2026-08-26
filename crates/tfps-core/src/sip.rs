@@ -272,7 +272,7 @@ mod tests {
         "INVITE sip:9011252612345678@pbx.example.com SIP/2.0\r\n",
         "Via: SIP/2.0/UDP 10.0.0.5:5060;branch=z9hG4bK776asdhds;rport\r\n",
         "Max-Forwards: 70\r\n",
-        "From: \"Ramal 200\" <sip:200@pbx.example.com>;tag=1928301774\r\n",
+        "From: \"Ext 200\" <sip:200@pbx.example.com>;tag=1928301774\r\n",
         "To: <sip:9011252612345678@pbx.example.com>\r\n",
         "Call-ID: a84b4c76e66710@pc33.example.com\r\n",
         "CSeq: 314159 INVITE\r\n",
@@ -332,11 +332,11 @@ mod tests {
     #[test]
     fn only_the_topmost_via_is_kept() {
         let msg = "INVITE sip:1@e.com SIP/2.0\r\n\
-                   Via: SIP/2.0/UDP topo;branch=PRIMEIRO\r\n\
-                   Via: SIP/2.0/UDP baixo;branch=SEGUNDO\r\n\
+                   Via: SIP/2.0/UDP top;branch=FIRST\r\n\
+                   Via: SIP/2.0/UDP bottom;branch=SECOND\r\n\
                    \r\n";
         let r = parse_request(msg.as_bytes()).unwrap();
-        assert_eq!(r.via_branch(), Some("PRIMEIRO"));
+        assert_eq!(r.via_branch(), Some("FIRST"));
     }
 
     #[test]
@@ -377,7 +377,7 @@ mod tests {
             Some(Message::Request(_))
         ));
         // Junk is still junk.
-        assert!(parse(b"nao sou sip").is_none());
+        assert!(parse(b"not sip at all").is_none());
     }
 
     #[test]

@@ -263,7 +263,7 @@ fn main() -> ExitCode {
         config::Loaded::File(c, path) => {
             apply_config(&mut args, &c);
             println!("  configuration     : {}", path.display());
-            // As assinaturas do arquivo entram depois que o motor existe; guardadas aqui.
+            // File signatures are applied after the engine exists; kept here until then.
             extra_signatures = c.signatures.clone();
             extra_injection = c.injection.clone();
         }

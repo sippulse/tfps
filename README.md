@@ -357,6 +357,7 @@ signal fires.
 ## Documentation
 
 - [`SPEC.md`](SPEC.md) — the architecture and the decisions, with the reasoning behind each
+- [`DETECTION.md`](DETECTION.md) — how a packet is examined: every test, in the order the code applies them
 - [`CONTEXT.md`](CONTEXT.md) — the vocabulary, normative for code and documentation
 
 ## License

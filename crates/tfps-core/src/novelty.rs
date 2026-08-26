@@ -256,7 +256,7 @@ mod tests {
         // is normal traffic from someone working through the world slowly.
         let mut p = PairState::default();
         for i in 0..NOVEL_COUNTRIES_TO_BLOCK as u16 {
-            let o = p.observe(c(i), t(i as u32 * 600)); // 10 min entre cada
+            let o = p.observe(c(i), t(i as u32 * 600)); // 10 min apart
             assert!(!o.triggered, "should not fire at {i}");
         }
     }
