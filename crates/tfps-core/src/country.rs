@@ -1,45 +1,45 @@
-//! Resolução de país a partir dos dígitos internacionais, e o índice compacto que o
-//! bitmap de novidade usa.
+//! Country resolution from international digits, plus the compact index the novelty
+//! bitmap uses.
 //!
-//! O alfabeto de países é pequeno — algo em torno de 250 — e é **essa** propriedade que
-//! torna a novidade barata: pertinência cabe num bitmap exato de 256 bits, sem sketch e
-//! sem falso positivo (`SPEC.md` §6). Nada aqui seria possível com um alfabeto grande.
+//! The country alphabet is small — around 250 — and it is **that** property which makes
+//! novelty cheap: membership fits in an exact 256-bit bitmap, with no sketch and no false
+//! positives (`SPEC.md` §6). None of this would be possible with a large alphabet.
 //!
-//! A tabela é de código de discagem E.164 → ISO 3166-1 alpha-2, com casamento pelo
-//! prefixo mais longo (códigos têm 1 a 3 dígitos, e `1` colide com `1242`, `1246`, …).
-//! Isto responde *"que país é este"*, e não *"esta faixa está alocada"* — a segunda é
-//! trabalho da libphonenumber e entra depois.
+//! The table maps E.164 calling code → ISO 3166-1 alpha-2, matched by longest prefix
+//! (codes are 1 to 3 digits, and `1` collides with `1242`, `1246`, …). It answers *"which
+//! country is this"*, not *"is this range allocated"* — the latter is libphonenumber's job
+//! and comes later.
 
 use crate::dialplan::InternationalDigits;
 
-/// Índice compacto e estável de país, usado como posição no bitmap de novidade.
+/// Compact, stable country index, used as the bit position in the novelty bitmap.
 ///
-/// **O índice é explícito na tabela e nunca é reatribuído nem reusado.** Isto não é
-/// zelo: bitmaps são persistidos por 45 a 90 dias, e se o índice fosse derivado da
-/// posição no array, inserir um país novo deslocaria todos os seguintes e os bitmaps
-/// gravados passariam a apontar para o país errado — silenciosamente. País novo recebe
-/// o próximo índice livre, independentemente de onde entre na ordenação.
+/// **The index is explicit in the table and is never reassigned or reused.** This is not
+/// fussiness: bitmaps are persisted for 45 to 90 days, and if the index were derived from
+/// array position, inserting a new country would shift every following one and stored
+/// bitmaps would silently start pointing at the wrong country. A new country gets the next
+/// free index, regardless of where it lands in the ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CountryIndex(pub u16);
 
-/// Um país de destino resolvido.
+/// A resolved destination country.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Country {
     pub index: CountryIndex,
-    /// ISO 3166-1 alpha-2. Códigos não geográficos usam rótulos próprios (ver tabela).
+    /// ISO 3166-1 alpha-2. Non-geographic codes use their own labels (see the table).
     pub iso: &'static str,
-    /// Código de discagem E.164 que casou.
+    /// The E.164 calling code that matched.
     pub calling_code: &'static str,
 }
 
-/// Códigos E.164 → (ISO 3166-1 alpha-2, índice estável).
+/// E.164 codes → (ISO 3166-1 alpha-2, stable index).
 ///
-/// Ordenada por código apenas para leitura humana; a ordem **não** define o índice.
+/// Sorted by code for human reading only; the ordering does **not** define the index.
 ///
-/// Entradas não geográficas relevantes ao IRSF: `800` (freephone), `808` (compartilhado),
-/// `870`/`878`/`881`/`882`/`883` (satélite e serviços de rede), `979` (**a única faixa
-/// premium internacional legítima pela ITU-T E.169.2** — e nenhum IRSF observado a usa,
-/// porque toda fraude é numeração nacional sequestrada).
+/// Non-geographic entries relevant to IRSF: `800` (freephone), `808` (shared cost),
+/// `870`/`878`/`881`/`882`/`883` (satellite and network services), and `979` (**the only
+/// legitimate international premium range under ITU-T E.169.2** — and no observed IRSF
+/// uses it, because all such fraud is hijacked national numbering).
 static CODES: &[(&str, &str, u16)] = &[
     ("1", "NANP", 0),
     ("1242", "BS", 1),
@@ -283,18 +283,18 @@ static CODES: &[(&str, &str, u16)] = &[
     ("998", "UZ", 239),
 ];
 
-/// Quantos países a tabela conhece. O bitmap precisa comportar isto.
+/// How many countries the table knows. The bitmap must hold this many.
 pub const COUNTRY_COUNT: usize = CODES.len();
 
-/// O bitmap de novidade tem 256 bits. Se a tabela passar disso, a compilação para —
-/// e não um teste, porque o modo de falha silencioso seria índice fora do bitmap.
+/// The novelty bitmap is 256 bits. If the table grows past that, the build stops — not a
+/// test, because the silent failure mode would be an index outside the bitmap.
 const _: () = assert!(COUNTRY_COUNT <= 256);
 
-/// Resolve o país a partir dos dígitos internacionais, pelo **prefixo mais longo**.
+/// Resolves the country from international digits, by **longest prefix**.
 ///
-/// O casamento longo é obrigatório e não é detalhe: `1` é o NANP inteiro, mas `1246`
-/// é Barbados. Casar curto colocaria metade do Caribe dentro dos Estados Unidos e
-/// destruiria a novidade por país exatamente onde o IRSF é comum.
+/// Longest-match is mandatory and not a detail: `1` is the whole NANP, but `1246` is
+/// Barbados. Matching short would place half the Caribbean inside the United States and
+/// destroy per-country novelty exactly where IRSF is common.
 pub fn resolve(digits: &InternationalDigits) -> Option<Country> {
     let d = digits.0.as_str();
     let mut best: Option<usize> = None;
@@ -310,11 +310,11 @@ pub fn resolve(digits: &InternationalDigits) -> Option<Country> {
     })
 }
 
-/// Faixa intrinsecamente de risco — satélite e serviços de rede não geográficos.
+/// Intrinsically risky ranges — satellite and non-geographic network services.
 ///
-/// Isto **não bloqueia sozinho** (`SPEC.md` §6): a medição deu 0,4% de importância para
-/// estrutura, e 72,8% dos IPRNs observados são telefonia fixa e móvel ordinária. Entra
-/// como sinal que compõe, nunca como veredito.
+/// This **does not block on its own** (`SPEC.md` §6): measurement put structure at 0.4% of
+/// feature importance, and 72.8% of observed IPRNs are ordinary fixed and mobile numbers.
+/// It contributes to a signal, never a verdict.
 pub fn is_non_geographic(c: &Country) -> bool {
     c.iso.starts_with("SAT-") || c.iso.starts_with("NET-") || c.iso.starts_with("INTL-")
 }
@@ -328,75 +328,72 @@ mod tests {
     }
 
     #[test]
-    fn casa_pelo_codigo_mais_longo() {
-        // O caso que importa: `1246` é Barbados, não Estados Unidos.
+    fn matches_the_longest_code() {
+        // The case that matters: `1246` is Barbados, not the United States.
         assert_eq!(resolve(&dig("12465551234")).unwrap().iso, "BB");
         assert_eq!(resolve(&dig("12125551234")).unwrap().iso, "NANP");
-        // E `35` não existe: `351` é Portugal, `355` é Albânia.
+        // And `35` does not exist: `351` is Portugal, `355` is Albania.
         assert_eq!(resolve(&dig("351912345678")).unwrap().iso, "PT");
         assert_eq!(resolve(&dig("355692345678")).unwrap().iso, "AL");
     }
 
     #[test]
-    fn resolve_os_destinos_de_irsf_do_corpus() {
-        // Os países de cabeça do corpus histórico do dev (SPEC, achados do TFPS 2023).
+    fn resolves_the_irsf_destinations_from_the_corpus() {
+        // The head countries of the historical corpus (SPEC, 2023 TFPS findings).
         for (d, iso) in [
-            ("252612345678", "SO"), // Somália
-            ("371234567", "LV"),    // Letônia
-            ("38761234567", "BA"),  // Bósnia
-            ("22012345678", "GM"),  // Gâmbia
-            ("2451234567", "GW"),   // Guiné-Bissau
+            ("252612345678", "SO"), // Somalia
+            ("371234567", "LV"),    // Latvia
+            ("38761234567", "BA"),  // Bosnia
+            ("22012345678", "GM"),  // Gambia
+            ("2451234567", "GW"),   // Guinea-Bissau
             ("9601234567", "MV"),   // Maldivas
             ("53512345678", "CU"),  // Cuba
-            ("2241234567", "GN"),   // Guiné
+            ("2241234567", "GN"),   // Guinea
         ] {
-            assert_eq!(resolve(&dig(d)).unwrap().iso, iso, "falhou para {d}");
+            assert_eq!(resolve(&dig(d)).unwrap().iso, iso, "failed for {d}");
         }
     }
 
     #[test]
-    fn reconhece_satelite_e_a_faixa_premium_legitima() {
+    fn recognises_satellite_and_the_legitimate_premium_range() {
         let sat = resolve(&dig("870123456789")).unwrap();
         assert!(is_non_geographic(&sat));
-        // +979 é a única faixa premium internacional legítima (ITU-T E.169.2), e
-        // nenhum IRSF observado a usa — toda fraude é numeração nacional sequestrada.
+        // +979 is the only legitimate international premium range (ITU-T E.169.2), and no
+        // observed IRSF uses it — all such fraud is hijacked national numbering.
         let premium = resolve(&dig("9791234567")).unwrap();
         assert_eq!(premium.iso, "INTL-PREMIUM");
         assert!(is_non_geographic(&premium));
     }
 
     #[test]
-    fn geografico_nao_e_marcado_como_risco_estrutural() {
+    fn geographic_is_not_flagged_as_structural_risk() {
         assert!(!is_non_geographic(&resolve(&dig("5511999998888")).unwrap()));
     }
 
     #[test]
-    fn codigo_inexistente_devolve_none() {
+    fn a_nonexistent_code_returns_none() {
         assert!(resolve(&dig("999123456789")).is_none());
     }
 
     #[test]
-    fn indices_sao_unicos_e_cabem_no_bitmap() {
+    fn indices_are_unique_and_fit_the_bitmap() {
         let mut vistos = std::collections::HashSet::new();
         for (code, _, idx) in CODES {
-            assert!(
-                vistos.insert(*idx),
-                "índice {idx} duplicado (código {code})"
-            );
+            assert!(vistos.insert(*idx), "duplicate index {idx} (code {code})");
         }
-        // O teto de 256 é garantido em tempo de compilação (ver `const _` acima).
+        // The 256 ceiling is guaranteed at compile time (see the `const _` above).
         for (_, _, idx) in CODES {
-            assert!((*idx as usize) < 256, "índice {idx} não cabe no bitmap");
+            assert!((*idx as usize) < 256, "index {idx} does not fit the bitmap");
         }
     }
 
     #[test]
-    fn a_tabela_esta_ordenada_por_codigo_para_leitura() {
-        // Ordenação é conveniência de leitura, não contrato — o índice é explícito.
+    fn the_table_is_sorted_by_code_for_readability() {
+        // Sorting is a reading convenience, not a contract — the index is explicit.
         for par in CODES.windows(2) {
             assert!(
                 par[0].0 <= par[1].0,
-                "fora de ordem: {} depois de {}",
+                "out of order: {} after {}",
                 par[1].0,
                 par[0].0
             );
@@ -404,9 +401,10 @@ mod tests {
     }
 
     #[test]
-    fn indice_nao_depende_da_posicao_no_array() {
-        // A garantia que protege bitmaps persistidos: o índice vem da tabela, não da
-        // posição. Se alguém inserir um país no meio, os demais não podem se mover.
+    fn the_index_does_not_depend_on_array_position() {
+        // The guarantee that protects persisted bitmaps: the index comes from the table,
+        // not from position. If someone inserts a country in the middle, the rest must not
+        // move.
         let so = resolve(&dig("252612345678")).unwrap();
         let pos = CODES.iter().position(|(c, _, _)| *c == "252").unwrap();
         assert_eq!(so.index.0, CODES[pos].2);

@@ -3,7 +3,7 @@ name = "tfps"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "TFPS — prevenção de fraude IRSF em redes SIP. Observa, aprende e bloqueia."
+description = "TFPS — IRSF fraud prevention for SIP networks. Observes, learns and blocks."
 
 [[bin]]
 name = "tfps"

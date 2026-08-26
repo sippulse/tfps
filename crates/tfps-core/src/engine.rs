@@ -1,14 +1,16 @@
-//! O motor: junta despelamento, resolução de país e novidade num veredito.
+//! The engine: joins prefix stripping, country resolution and novelty into a verdict.
 //!
-//! Segue o fluxo do `SPEC.md` §3. Duas propriedades desse fluxo são estruturais e estão
-//! codificadas aqui:
+//! It follows the flow in `SPEC.md` §3. Two properties of that flow are structural and are
+//! encoded here:
 //!
-//! - **o filtro de prefixo vem antes de tudo**, e o que não é internacional sai sem
-//!   canonicalizar — é o que faz o custo escalar com o volume internacional, não com o total;
-//! - **o caminho de decisão não tem estado de diálogo**: duração e desfecho são pós-fato e
-//!   pertencem ao caminho de aprendizado.
+//! - **the prefix filter comes before everything**, and whatever is not international
+//!   leaves without being canonicalised — that is what makes cost scale with international
+//!   volume rather than total volume;
+//! - **the decision path has no dialog state**: duration and outcome are post-facto and
+//!   belong to the learning path.
 //!
-//! O motor não lê relógio nem toca rede. Tempo entra por parâmetro.
+//! The engine never reads a clock and never touches the network. Time arrives as a
+//! parameter.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -19,12 +21,12 @@ use crate::novelty::{PairState, RotatingBitmap, Timestamp};
 use crate::perimeter::{AuthAbuse, NoiseFilter};
 use crate::sip::{self, Message, Method};
 
-/// Em que modo a camada comportamental está.
+/// Which mode the behavioural layer is in.
 ///
-/// O perímetro bloqueia desde o minuto 1; o comportamento espera. `SPEC.md` §9.
+/// The perimeter blocks from minute one; behaviour waits. `SPEC.md` §9.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Observa e **não bloqueia**, até o instante dado.
+    /// Observes and **does not block**, until the given instant.
     Learning {
         until: Timestamp,
     },
@@ -37,64 +39,64 @@ impl Mode {
     }
 }
 
-/// O que o motor decidiu sobre uma tentativa.
+/// What the engine decided about one attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    /// Não é assunto do sistema — não é SIP, não é INVITE, ou não é internacional.
-    /// **Nunca é bloqueio**, e a distinção importa: o `R07` do TFPS Java negava o que
-    /// não classificava e virou 39% de todas as rejeições.
+    /// Not this system's business — not SIP, not an INVITE, or not international.
+    /// **Never a block**, and the distinction matters: `R07` in the Java-era TFPS denied
+    /// whatever it could not classify and became 39% of all rejections.
     OutOfScope(&'static str),
-    /// Internacional, conhecido ou insuficiente para disparar.
+    /// International, either already known or not enough to fire.
     Pass { country: &'static str, novel: bool },
-    /// Teria bloqueado, mas a camada comportamental ainda está aprendendo.
+    /// Would have blocked, but the behavioural layer is still learning.
     WouldBlock {
         country: &'static str,
         novel_in_window: usize,
     },
-    /// Bloqueio: o par acumulou países inéditos demais na janela.
+    /// Block: the pair accumulated too many first-time countries within the window.
     Block {
         country: &'static str,
         novel_in_window: usize,
     },
-    /// Ruído de perímetro: ferramenta de varredura conhecida pelo user-agent.
-    /// Quando a imposição entrar, isto morre no `XDP_DROP` e some do sngrep.
+    /// Perimeter noise: a scanning tool identified by its user-agent.
+    /// Under enforcement this dies at `XDP_DROP` and vanishes from sngrep.
     Noise { signature: &'static str },
-    /// Padrão de injeção na URI. Sinal de confiança **mais alta** que o user-agent:
-    /// ferramenta de varredura pode forjar UA legítimo, mas nenhum telefone real põe
-    /// aspa simples ou `--` no `From`.
+    /// An injection pattern in the URI. **Higher** confidence than a user-agent: a
+    /// scanning tool can forge a legitimate UA, but no real phone puts a single quote or
+    /// `--` in the `From` header.
     Injection { pattern: &'static str },
-    /// Excesso de tentativas **autenticadas** numa janela curta — força bruta de
-    /// credencial. É a Cadeia A do `SPEC.md`, observada no fio em vez de no log.
+    /// Too many **authenticated** attempts in a short window — credential brute force.
+    /// This is Chain A from `SPEC.md`, observed on the wire instead of in a log.
     AuthAbuse { attempts: u32 },
-    /// Internacional pela forma, mas sem país reconhecível na tabela E.164.
-    /// **Não bloqueia** — carrega os dígitos para que o operador possa diagnosticar,
-    /// em vez de virar um contador mudo.
+    /// International by shape, but with no recognisable country in the E.164 table.
+    /// **Does not block** — it carries the digits so the operator can diagnose, instead of
+    /// becoming a mute counter.
     UnknownCountry(String),
 }
 
-/// Contadores para os requisitos de observabilidade do `SPEC.md` §12.
+/// Counters for the observability requirements in `SPEC.md` §12.
 ///
-/// Existem porque o argumento do projeto contra o `fail2ban` é que **o incumbente falha
-/// em silêncio**. Um sistema que não sabe dizer o que está vendo repetiria isso.
+/// They exist because this project's argument against `fail2ban` is that **the incumbent
+/// fails silently**. A system unable to say what it is seeing would repeat that.
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
     pub packets: u64,
     pub sip_parsed: u64,
-    /// Respostas SIP. Contadas à parte de `not_sip`: confundi-las com lixo faria o
-    /// operador concluir que está capturando a interface errada.
+    /// SIP responses. Counted separately from `not_sip`: mistaking them for junk would
+    /// make an operator conclude they are capturing the wrong interface.
     pub responses: u64,
-    /// Keepalive CRLF de NAT. Contado à parte porque numa 5060 com clientes residenciais
-    /// é a maioria dos pacotes — e chamá-lo de lixo faria o relatório mentir.
+    /// NAT CRLF keepalives. Counted separately because on a 5060 with residential clients
+    /// they are most of the packets — calling them junk would make the report lie.
     pub keepalives: u64,
     pub not_sip: u64,
-    /// Pacotes que o perímetro removeria. É o numerador da medição que o ticket 17 pede:
-    /// que fração do tráfego numa porta pública é varredura.
+    /// Packets the perimeter would remove. The numerator of the measurement the project
+    /// wants: what fraction of traffic on a public port is scanning.
     pub noise: u64,
-    /// URIs com padrão de injeção — a regra R12 do TFPS 2023, ressuscitada.
+    /// URIs carrying an injection pattern — rule R12 of the 2023 TFPS, revived.
     pub injections: u64,
-    /// Origens condenadas por força bruta de autenticação.
+    /// Sources condemned for authentication brute force.
     pub auth_abuse: u64,
-    /// Tentativas autenticadas observadas — o denominador do sinal acima.
+    /// Authenticated attempts observed — the denominator for the signal above.
     pub auth_attempts: u64,
     pub invites: u64,
     pub international: u64,
@@ -103,26 +105,27 @@ pub struct Stats {
     pub novel: u64,
     pub blocks: u64,
     pub would_block: u64,
-    /// Pares recusados por teto de memória. **Diferente de zero é sintoma de ataque de
-    /// rotação de A-number** — e precisa aparecer no relatório, não sumir em silêncio.
+    /// Pairs refused by the memory ceiling. **Non-zero is a symptom of an A-number
+    /// rotation attack** — and it must show up in the report, not vanish silently.
     pub pairs_dropped: u64,
-    /// Peers recusados por teto.
+    /// Peers refused by the ceiling.
     pub peers_dropped: u64,
 }
 
-/// Teto de pares por peer.
+/// Ceiling of pairs per peer.
 ///
-/// Existe porque o `SPEC.md` §5 diz que **rotacionar A-number é comportamento esperado do
-/// atacante** — e sem teto o sistema responde a isso alocando até morrer. A ~150 bytes por
-/// par, um atacante a 1000 INVITEs/s com A-number único enche 192 MB em ~20 minutos.
-/// Um antifraude com vetor de DoS descrito na própria especificação não cumpre a premissa.
+/// It exists because `SPEC.md` §5 states that **rotating the A-number is expected attacker
+/// behaviour** — and without a ceiling the system answers that by allocating until it dies.
+/// At ~150 bytes per pair, an attacker at 1000 INVITEs/s with unique A-numbers fills 192 MB
+/// in about 20 minutes. An anti-fraud system with a DoS vector described in its own
+/// specification does not meet the premise.
 const MAX_PAIRS_PER_PEER: usize = 50_000;
 
-/// Teto de peers distintos. Peer é o IP de origem, que não é forjável na posição de
-/// observação — então este teto é muito mais folgado que o de pares.
+/// Ceiling of distinct peers. A peer is the source IP, which is not forgeable from the
+/// observation point — so this ceiling is far looser than the pair one.
 const MAX_PEERS: usize = 10_000;
 
-/// Uma linha do estado de um par, como o armazenamento durável a vê.
+/// One row of a pair's state, as the durable store sees it.
 #[derive(Debug, Clone)]
 pub struct PairRecord {
     pub peer: Ipv4Addr,
@@ -133,7 +136,7 @@ pub struct PairRecord {
     pub last_seen: u32,
 }
 
-/// Frequência de um país para um peer.
+/// How often a peer calls one country.
 #[derive(Debug, Clone, Copy)]
 pub struct PeerCountryRecord {
     pub peer: Ipv4Addr,
@@ -144,14 +147,14 @@ pub struct PeerCountryRecord {
 #[derive(Debug, Default)]
 struct PeerState {
     dial_plan: DialPlan,
-    /// Estado por A-number, com o instante da última observação para poder podar.
+    /// Per-A-number state, with the last-seen instant so pruning is possible.
     pairs: HashMap<String, (PairState, u32)>,
-    /// Distribuição de frequência por país — o prior que um par novo herda.
-    /// `SPEC.md` §6: herdar o conjunto inteiro do peer não funcionaria, porque peer
-    /// wholesale liga para 200 países e a saturação voltaria.
+    /// Per-country frequency distribution — the prior a brand-new pair inherits.
+    /// `SPEC.md` §6: inheriting the peer's whole set would not work, because a wholesale
+    /// peer calls 200 countries and saturation would come straight back.
     country_calls: HashMap<u16, u32>,
     total_calls: u32,
-    /// Contador de força bruta desta origem.
+    /// Brute-force counter for this source.
     auth: AuthAbuse,
 }
 
@@ -174,8 +177,8 @@ impl Engine {
         }
     }
 
-    /// Declara o plano de discagem de um peer. Ver `SPEC.md` §4: declarar bate aprender
-    /// por valer já na primeira chamada, em vez de esperar convergência.
+    /// Declares a peer's dial plan. See `SPEC.md` §4: declaring beats learning because it
+    /// holds on the very first call instead of waiting for convergence.
     pub fn declare_dial_plan(&mut self, peer: Ipv4Addr, plan: DialPlan) {
         self.peers.entry(peer).or_default().dial_plan = plan;
     }
@@ -196,10 +199,10 @@ impl Engine {
         self.peers.values().map(|p| p.pairs.len()).sum()
     }
 
-    /// Estado de um par, no formato que o armazenamento durável grava.
+    /// A pair's state, in the shape the durable store writes.
     ///
-    /// O núcleo **não faz I/O** — ele exporta e importa; quem grava é o binário. É o que
-    /// mantém tudo aqui determinístico e testável sem disco.
+    /// The core does **no I/O** — it exports and imports; the binary writes. That is what
+    /// keeps everything here deterministic and testable without a disk.
     pub fn export_pairs(&self) -> impl Iterator<Item = PairRecord> + '_ {
         self.peers.iter().flat_map(|(ip, st)| {
             st.pairs.iter().map(move |(a, (pair, last))| {
@@ -216,7 +219,7 @@ impl Engine {
         })
     }
 
-    /// Frequência de países por peer — o prior que um par novo herda.
+    /// Per-peer country frequencies — the prior a brand-new pair inherits.
     pub fn export_peer_countries(&self) -> impl Iterator<Item = PeerCountryRecord> + '_ {
         self.peers.iter().flat_map(|(ip, st)| {
             st.country_calls
@@ -229,8 +232,8 @@ impl Engine {
         })
     }
 
-    /// Restaura um par. Respeita os tetos de memória: estado persistido não pode ser
-    /// usado para contornar o limite que protege contra rotação de A-number.
+    /// Restores a pair. It honours the memory ceilings: persisted state must not be used
+    /// to bypass the limit that protects against A-number rotation.
     pub fn import_pair(&mut self, r: PairRecord) {
         if self.peers.len() >= MAX_PEERS && !self.peers.contains_key(&r.peer) {
             return;
@@ -262,15 +265,15 @@ impl Engine {
         st.total_calls = st.total_calls.saturating_add(r.calls);
     }
 
-    /// Memória aproximada do estado de aprendizado, para o relatório. O operador precisa
-    /// poder ver isto crescer antes de o serviço ser morto por limite de cgroup.
+    /// Approximate memory held by learning state, for the report. The operator needs to
+    /// watch this grow before the service is killed by a cgroup limit.
     pub fn approx_state_bytes(&self) -> usize {
-        const PER_PAIR: usize = 160; // PairState + chave String + overhead do HashMap
+        const PER_PAIR: usize = 160; // PairState + String key + HashMap overhead
         const PER_PEER: usize = 256;
         self.peers.len() * PER_PEER + self.pair_count() * PER_PAIR
     }
 
-    /// Processa um datagrama SIP vindo de `peer`.
+    /// Processes a SIP datagram coming from `peer`.
     pub fn observe(&mut self, peer: Ipv4Addr, payload: &[u8], now: Timestamp) -> Decision {
         self.stats.packets += 1;
 
@@ -280,31 +283,32 @@ impl Engine {
                 r
             }
             Some(Message::Response(_)) => {
-                // O caminho de aprendizado usará isto (`200 OK` diz se atendeu); o de
-                // decisão, não. Por ora conta, para que o relatório seja honesto.
+                // The learning path will use this (`200 OK` says whether it was answered);
+                // the decision path will not. For now it is counted, so the report is
+                // honest.
                 self.stats.responses += 1;
-                return Decision::OutOfScope("resposta SIP");
+                return Decision::OutOfScope("SIP response");
             }
             Some(Message::Keepalive) => {
                 self.stats.keepalives += 1;
-                return Decision::OutOfScope("keepalive de NAT");
+                return Decision::OutOfScope("NAT keepalive");
             }
             None => {
                 self.stats.not_sip += 1;
-                return Decision::OutOfScope("não é SIP");
+                return Decision::OutOfScope("not SIP");
             }
         };
 
-        // Perímetro vem antes de tudo, e vale para **qualquer** método: scanner manda
-        // OPTIONS e REGISTER tanto quanto INVITE. Sai aqui sem tocar em estado nenhum,
-        // que é justamente o ponto — ruído não pode entrar na linha de base.
+        // The perimeter comes before everything, and applies to **any** method: scanners
+        // send OPTIONS and REGISTER as much as INVITE. It leaves here without touching any
+        // state, which is exactly the point — noise must not enter the baseline.
         if let Some(sig) = self.noise_filter.is_noise(req.user_agent) {
             self.stats.noise += 1;
             return Decision::Noise { signature: sig };
         }
 
-        // Injeção na URI vem junto do perímetro e vale para qualquer método: o ataque
-        // aparece tanto em INVITE quanto em REGISTER e OPTIONS.
+        // URI injection belongs with the perimeter and applies to any method: the attack
+        // shows up in INVITE as much as in REGISTER and OPTIONS.
         if let Some(pat) =
             self.noise_filter
                 .injection_in_uri(&[Some(req.request_uri), req.from, req.to])
@@ -313,9 +317,9 @@ impl Engine {
             return Decision::Injection { pattern: pat };
         }
 
-        // Força bruta de credencial: conta `REGISTER` **com `Authorization`**, nunca o
-        // `401` de desafio — todo registro legítimo recebe um, e contá-los bloquearia
-        // todos os clientes. Ver `perimeter::AUTH_ATTEMPTS_TO_BLOCK`.
+        // Credential brute force: counts `REGISTER` **carrying `Authorization`**, never
+        // the `401` challenge — every legitimate registration receives one, and counting
+        // those would block every customer. See `perimeter::AUTH_ATTEMPTS_TO_BLOCK`.
         if req.method == Method::Register && req.authorization.is_some() {
             self.stats.auth_attempts += 1;
             if self.peers.len() < MAX_PEERS || self.peers.contains_key(&peer) {
@@ -333,33 +337,33 @@ impl Engine {
         }
 
         if req.method != Method::Invite {
-            return Decision::OutOfScope("não é INVITE");
+            return Decision::OutOfScope("not an INVITE");
         }
         self.stats.invites += 1;
 
         let Some(dialed) = req.request_user else {
-            return Decision::OutOfScope("INVITE sem número discado");
+            return Decision::OutOfScope("INVITE with no dialled number");
         };
 
         if self.peers.len() >= MAX_PEERS && !self.peers.contains_key(&peer) {
             self.stats.peers_dropped += 1;
-            return Decision::OutOfScope("teto de peers atingido");
+            return Decision::OutOfScope("peer ceiling reached");
         }
         let state = self.peers.entry(peer).or_insert_with(|| PeerState {
             dial_plan: self.default_plan.clone(),
             ..Default::default()
         });
 
-        // Filtro mais barato do caminho quente: o que não é internacional sai aqui,
-        // sem canonicalizar e sem tocar em nenhum estado.
+        // The cheapest filter on the hot path: whatever is not international leaves here,
+        // without canonicalising and without touching any state.
         let Some(digits) = state.dial_plan.to_international(dialed) else {
-            return Decision::OutOfScope("não é internacional para este peer");
+            return Decision::OutOfScope("not international for this peer");
         };
         self.stats.international += 1;
 
         let Some(c) = country::resolve(&digits) else {
-            // Internacional pela forma, mas sem país reconhecível. **Não bloqueia** —
-            // seria o erro do R07. Carrega os dígitos para diagnóstico.
+            // International by shape, but with no recognisable country. **No block** —
+            // that would be the R07 mistake. It carries the digits for diagnosis.
             self.stats.unknown_country += 1;
             return Decision::UnknownCountry(digits.0);
         };
@@ -375,21 +379,22 @@ impl Engine {
         mode: Mode,
         stats: &mut Stats,
     ) -> Decision {
-        // O A-number é asserção não verificada do remetente; serve de agrupamento,
-        // nunca de identidade. A âncora de confiança é o peer. `SPEC.md` §5.
+        // The A-number is an unverified assertion by the sender; it serves as a grouping
+        // key, never as identity. The trust anchor is the peer. `SPEC.md` §5.
         let a_number = req.from_user().unwrap_or("<sem-from>").to_string();
 
         *state.country_calls.entry(c.index.0).or_insert(0) += 1;
         state.total_calls += 1;
 
-        // Poda antes de inserir: pares vistos uma vez e nunca mais — a assinatura da
-        // rotação de A-number — saem sozinhos, e o legítimo, que volta, permanece.
+        // Prune before inserting: pairs seen once and never again — the signature of
+        // A-number rotation — fall out on their own, while legitimate ones that come back
+        // stay.
         if state.pairs.len() >= MAX_PAIRS_PER_PEER && !state.pairs.contains_key(&a_number) {
             let cutoff = now.0.saturating_sub(crate::novelty::WINDOW_SECS);
             state.pairs.retain(|_, (_, last)| *last >= cutoff);
             if state.pairs.len() >= MAX_PAIRS_PER_PEER {
-                // Ainda cheio depois da poda: recusa o par novo em vez de crescer.
-                // Perde-se aprendizado desse A-number, não a integridade do processo.
+                // Still full after pruning: refuse the new pair instead of growing. What
+                // is lost is learning about that A-number, not the process's integrity.
                 stats.pairs_dropped += 1;
                 return Decision::Pass {
                     country: c.iso,
@@ -456,17 +461,17 @@ mod tests {
     }
 
     #[test]
-    fn trafego_domestico_sai_pelo_filtro_mais_barato() {
+    fn domestic_traffic_leaves_through_the_cheapest_filter() {
         let mut e = engine();
         let d = e.observe(peer(), &invite("200", "2005"), t(0));
         assert!(matches!(d, Decision::OutOfScope(_)));
-        // Não tocou em estado nenhum: nem par, nem peer.
+        // It touched no state at all: neither pair nor peer.
         assert_eq!(e.pair_count(), 0);
         assert_eq!(e.stats.international, 0);
     }
 
     #[test]
-    fn internacional_conhecido_passa() {
+    fn a_known_international_destination_passes() {
         let mut e = engine();
         let d = e.observe(peer(), &invite("200", "00551199998888"), t(0));
         assert_eq!(
@@ -476,7 +481,7 @@ mod tests {
                 novel: true
             }
         );
-        // A segunda para o mesmo país já não é novidade.
+        // The second call to the same country is no longer novel.
         let d = e.observe(peer(), &invite("200", "00551199997777"), t(10));
         assert_eq!(
             d,
@@ -488,9 +493,9 @@ mod tests {
     }
 
     #[test]
-    fn dez_paises_ineditos_numa_hora_bloqueiam() {
+    fn ten_first_time_countries_in_an_hour_block() {
         let mut e = engine();
-        let destinos = [
+        let destinations = [
             "00252612345678", // SO
             "00371234567",    // LV
             "0038761234567",  // BA
@@ -500,28 +505,28 @@ mod tests {
             "0053512345678",  // CU
             "002241234567",   // GN
             "0021612345678",  // TN
-            "0037112345678",  // LV? não — 371 já usado; usa MK
+            "0037112345678",  // repeats LV on purpose: only 9 distinct countries
         ];
-        let mut ultimo = None;
-        for (i, d) in destinos.iter().enumerate() {
-            ultimo = Some(e.observe(peer(), &invite("200", d), t(i as u32 * 60)));
+        let mut last = None;
+        for (i, d) in destinations.iter().enumerate() {
+            last = Some(e.observe(peer(), &invite("200", d), t(i as u32 * 60)));
         }
-        // O décimo destino repete a Letônia, então só 9 países inéditos: não dispara.
-        assert!(matches!(ultimo, Some(Decision::Pass { .. })));
+        // The tenth destination repeats Latvia, so only 9 first-time countries: no fire.
+        assert!(matches!(last, Some(Decision::Pass { .. })));
 
-        // Um país inédito de verdade fecha a conta.
+        // One genuinely new country closes the count.
         let d = e.observe(peer(), &invite("200", "0038912345678"), t(700));
         assert!(
             matches!(d, Decision::Block { .. }),
-            "esperava bloqueio, veio {d:?}"
+            "expected a block, got {d:?}"
         );
         assert_eq!(e.stats.blocks, 1);
     }
 
     #[test]
-    fn em_aprendizado_nao_bloqueia_mas_registra() {
+    fn learning_mode_does_not_block_but_records() {
         let mut e = Engine::new(DialPlan::new(["00"]), Mode::Learning { until: t(100_000) });
-        let destinos = [
+        let destinations = [
             "00252612345678",
             "00371234567",
             "0038761234567",
@@ -533,24 +538,24 @@ mod tests {
             "0021612345678",
             "0038912345678",
         ];
-        let mut ultimo = None;
-        for (i, d) in destinos.iter().enumerate() {
-            ultimo = Some(e.observe(peer(), &invite("200", d), t(i as u32 * 60)));
+        let mut last = None;
+        for (i, d) in destinations.iter().enumerate() {
+            last = Some(e.observe(peer(), &invite("200", d), t(i as u32 * 60)));
         }
         assert!(
-            matches!(ultimo, Some(Decision::WouldBlock { .. })),
-            "em aprendizado só registra, veio {ultimo:?}"
+            matches!(last, Some(Decision::WouldBlock { .. })),
+            "learning mode only records, got {last:?}"
         );
         assert_eq!(e.stats.blocks, 0);
         assert_eq!(e.stats.would_block, 1);
     }
 
     #[test]
-    fn pares_diferentes_nao_somam_entre_si() {
-        // O acúmulo é por par (peer, A-number). Dez ramais estreando um país cada
-        // é tráfego normal de escritório, não fraude.
+    fn different_pairs_do_not_add_up_together() {
+        // Accumulation is per (peer, A-number) pair. Ten extensions each debuting one
+        // country is normal office traffic, not fraud.
         let mut e = engine();
-        let destinos = [
+        let destinations = [
             "00252612345678",
             "00371234567",
             "0038761234567",
@@ -562,12 +567,12 @@ mod tests {
             "0021612345678",
             "0038912345678",
         ];
-        for (i, d) in destinos.iter().enumerate() {
-            let ramal = format!("2{i:02}");
-            let dec = e.observe(peer(), &invite(&ramal, d), t(i as u32 * 60));
+        for (i, d) in destinations.iter().enumerate() {
+            let extension = format!("2{i:02}");
+            let dec = e.observe(peer(), &invite(&extension, d), t(i as u32 * 60));
             assert!(
                 matches!(dec, Decision::Pass { .. }),
-                "ramal {ramal}: {dec:?}"
+                "extension {extension}: {dec:?}"
             );
         }
         assert_eq!(e.pair_count(), 10);
@@ -575,29 +580,29 @@ mod tests {
     }
 
     #[test]
-    fn rotacao_de_a_number_nao_cresce_sem_limite() {
-        // O ataque que o SPEC §5 descreve como esperado: A-number novo a cada chamada.
-        // Sem teto isto derrubaria o processo por memória — que seria um vetor de DoS
-        // descrito na própria especificação do produto.
+    fn a_number_rotation_does_not_grow_without_bound() {
+        // The attack SPEC §5 describes as expected: a new A-number on every call. Without
+        // a ceiling this would kill the process on memory — a DoS vector described in the
+        // product's own specification.
         let mut e = engine();
         for i in 0..(MAX_PAIRS_PER_PEER + 5_000) {
             let a = format!("spoof{i}");
-            // Todos na mesma janela, para que a poda não possa removê-los.
+            // All in the same window, so pruning cannot remove them.
             e.observe(peer(), &invite(&a, "00551199998888"), t(0));
         }
         assert!(
             e.pair_count() <= MAX_PAIRS_PER_PEER,
-            "estourou o teto: {} pares",
+            "ceiling exceeded: {} pairs",
             e.pair_count()
         );
-        assert!(e.stats.pairs_dropped > 0, "deveria contar as recusas");
+        assert!(e.stats.pairs_dropped > 0, "refusals must be counted");
     }
 
     #[test]
-    fn depois_do_ataque_a_poda_devolve_o_espaco_a_quem_chega() {
-        // Um ataque de rotação enche o teto numa janela. Quando a janela passa e um
-        // par novo e legítimo aparece, a poda limpa os que nunca voltaram — o sistema
-        // se recupera sozinho, sem varredura em segundo plano.
+    fn after_the_attack_pruning_returns_space_to_newcomers() {
+        // A rotation attack fills the ceiling within one window. When the window passes
+        // and a genuinely new pair shows up, pruning clears the ones that never returned —
+        // the system recovers on its own, with no background sweep.
         let mut e = engine();
         for i in 0..MAX_PAIRS_PER_PEER {
             e.observe(
@@ -609,41 +614,41 @@ mod tests {
         assert_eq!(
             e.pair_count(),
             MAX_PAIRS_PER_PEER,
-            "o ataque deve encher o teto"
+            "the attack must fill the ceiling"
         );
 
-        // Duas janelas depois chega um cliente novo de verdade.
+        // Two windows later a genuinely new customer arrives.
         let dec = e.observe(
             peer(),
-            &invite("cliente-novo", "00551199998888"),
+            &invite("new-customer", "00551199998888"),
             t(crate::novelty::WINDOW_SECS * 2),
         );
-        assert!(matches!(dec, Decision::Pass { .. }), "veio {dec:?}");
+        assert!(matches!(dec, Decision::Pass { .. }), "got {dec:?}");
         assert!(
             e.pair_count() < 10,
-            "a poda deveria ter varrido os efêmeros, restaram {}",
+            "pruning should have swept the ephemeral ones; {} remain",
             e.pair_count()
         );
     }
 
     #[test]
-    fn a_memoria_estimada_e_reportavel() {
+    fn estimated_memory_is_reportable() {
         let mut e = engine();
         for i in 0..100 {
             e.observe(peer(), &invite(&format!("r{i}"), "00551199998888"), t(0));
         }
         assert!(e.approx_state_bytes() > 0);
         // O teto absoluto precisa caber no MemoryMax=192M da unidade systemd.
-        let teto = MAX_PEERS * 256 + MAX_PEERS * MAX_PAIRS_PER_PEER * 160;
-        assert!(teto > 0); // documenta que o pior caso teórico é enorme:
-                           // por isso o teto de pares é POR PEER e o de peers é baixo — na prática,
-                           // um peer sob ataque satura o seu próprio limite sem afetar os demais.
+        let ceiling = MAX_PEERS * 256 + MAX_PEERS * MAX_PAIRS_PER_PEER * 160;
+        assert!(ceiling > 0); // documents that the theoretical worst case is huge:
+                              // which is why the pair ceiling is PER PEER and the peer ceiling is low — in
+                              // practice a peer under attack saturates its own limit without affecting others.
     }
 
     #[test]
-    fn lixo_nao_derruba_nem_bloqueia() {
+    fn junk_neither_crashes_nor_blocks() {
         let mut e = engine();
-        for p in [&b"nao sou sip"[..], &[0xff, 0xfe][..], &b""[..]] {
+        for p in [&b"not sip at all"[..], &[0xff, 0xfe][..], &b""[..]] {
             assert!(matches!(
                 e.observe(peer(), p, t(0)),
                 Decision::OutOfScope(_)
@@ -654,19 +659,19 @@ mod tests {
     }
 
     #[test]
-    fn plano_declarado_por_peer_vence_o_padrao() {
+    fn a_peer_declared_plan_beats_the_default() {
         let mut e = Engine::new(DialPlan::new(["00"]), Mode::Active);
-        let outro = Ipv4Addr::new(10, 0, 0, 9);
-        e.declare_dial_plan(outro, DialPlan::new(["9011"]));
+        let other = Ipv4Addr::new(10, 0, 0, 9);
+        e.declare_dial_plan(other, DialPlan::new(["9011"]));
 
-        // Para o peer com plano próprio, `00…` não é internacional.
+        // For the peer with its own plan, `00…` is not international.
         assert!(matches!(
-            e.observe(outro, &invite("200", "00551199998888"), t(0)),
+            e.observe(other, &invite("200", "00551199998888"), t(0)),
             Decision::OutOfScope(_)
         ));
-        // Mas `9011…` é.
+        // But `9011…` is.
         assert!(matches!(
-            e.observe(outro, &invite("200", "9011551199998888"), t(1)),
+            e.observe(other, &invite("200", "9011551199998888"), t(1)),
             Decision::Pass { country: "BR", .. }
         ));
     }

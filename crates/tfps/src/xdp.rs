@@ -1,15 +1,14 @@
-//! Imposição por XDP — o que faz o lixo sumir do sngrep.
+//! XDP enforcement — what makes the garbage disappear from sngrep.
 //!
-//! A ordem no kernel é a razão de tudo: o XDP roda em `netif_receive_skb_internal`,
-//! **antes** de `__netif_receive_skb_core` entregar o pacote aos taps `ptype_all`, que é
-//! onde o libpcap engata. Pacote descartado aqui nunca chega ao sngrep, ao tcpdump nem
-//! ao tshark.
+//! Kernel ordering is the whole reason: XDP runs in `netif_receive_skb_internal`, **before**
+//! `__netif_receive_skb_core` hands the packet to the `ptype_all` taps, which is where
+//! libpcap hooks. A packet dropped here never reaches sngrep, tcpdump or tshark.
 //!
-//! É por isso que `nftables` não serviria: o drop dele acontece em netfilter, **depois**
-//! do tap, e a captura continuaria poluída. Essa diferença de ordenação é o único
-//! argumento técnico que distingue as duas opções para este fim.
+//! That is why `nftables` would not do: its drop happens in netfilter, **after** the tap,
+//! and the capture would stay polluted. This ordering difference is the only technical
+//! argument that separates the two options for this purpose.
 //!
-//! O programa em si está em `ebpf/tfps_xdp.c`, compilado com clang no alvo.
+//! The program itself lives in `ebpf/tfps_xdp.c`, compiled with clang on the target.
 
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -18,48 +17,47 @@ use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData};
 use aya::programs::{Xdp, XdpMode};
 use aya::Ebpf;
 
-/// Onde o objeto BPF é procurado quando não se passa `--xdp-obj`.
+/// Where the BPF object is looked for when `--xdp-obj` is not given.
 pub const DEFAULT_OBJ: &str = "/usr/local/lib/tfps/tfps_xdp.o";
 
-/// Mapa de drop já fixado por outro produto, procurado antes de anexar programa próprio.
+/// A drop map already pinned by another product, checked before attaching our own program.
 ///
-/// O SipPulse **já roda** um `xdp_sipdrop` do SipVault nesta posição, alimentado por
-/// APIBAN e por detecção de falha de autenticação. Só cabe **um** programa XDP por
-/// interface, e desanexar o que está lá quebraria proteção em produção.
+/// Only **one** XDP program fits per interface, and detaching whatever is already there
+/// would break protection in production.
 ///
-/// Escrever no mapa existente é a decisão certa por três motivos: não há conflito de
-/// hook, não se duplica plano de imposição — que é o pecado da "máquina pela metade" que
-/// matou o TFPS 2023 —, e o descarte continua acontecendo no XDP, antes do tap do
-/// libpcap, que é o que limpa o sngrep.
+/// Writing into the existing map is the right call for three reasons: there is no hook
+/// conflict, no duplicated enforcement plane — the "half-built machinery" sin that killed
+/// the 2023 TFPS — and the drop still happens at XDP, before the libpcap tap, which is what
+/// keeps sngrep clean.
 pub const SIPVAULT_DROP_MAP: &str = "/sys/fs/bpf/sipvault/drop_ips";
 
-/// Índices do array de contadores, espelhando `ebpf/tfps_xdp.c`.
+/// Indices into the counter array, mirroring `ebpf/tfps_xdp.c`.
 const C_DROPPED: u32 = 0;
 const C_SEEN: u32 = 1;
 const C_EXPIRED: u32 = 2;
 
-/// Como a imposição foi obtida.
+/// How enforcement was obtained.
 pub enum Backend {
-    /// Escrevendo num mapa de drop já fixado por outro produto (SipVault).
-    /// A chave é o IP como número **big-endian**, convenção daquele programa —
-    /// determinada empiricamente contra o mapa em produção, não presumida.
+    /// Writing into a drop map already pinned by another product.
+    /// The key is the IP as a **big-endian** number, that program's convention —
+    /// determined empirically against the production map, not assumed.
     Shared { map: BpfHashMap<MapData, u32, u64> },
-    /// Programa próprio, carregado e anexado por nós.
+    /// Our own program, loaded and attached by us.
     Own { bpf: Box<Ebpf> },
 }
 
 pub struct Enforcer {
     backend: Backend,
-    /// Quantas origens **este processo** condenou. Contado à parte porque, no modo
-    /// compartilhado, o total do mapa é majoritariamente trabalho do dono dele —
-    /// reportá-lo como nosso seria mentir sobre o que o produto está fazendo.
+    /// How many sources **this process** condemned. Counted separately because in shared
+    /// mode the map total is mostly its owner's work — reporting it as ours would lie about
+    /// what the product is doing.
     pub blocked_by_us: u64,
-    /// Descrição legível de onde a imposição está acontecendo — vai para o relatório,
-    /// porque o operador precisa saber quem está bloqueando.
+    /// Human-readable description of where enforcement is happening — it goes into the
+    /// report, because the operator needs to know who is doing the blocking.
     pub mode: String,
 }
 
-/// Contadores lidos do kernel.
+/// Counters read from the kernel.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Counters {
     pub dropped: u64,
@@ -68,12 +66,12 @@ pub struct Counters {
 }
 
 impl Enforcer {
-    /// Obtém imposição: usa um mapa de drop já fixado, se houver, e só anexa programa
-    /// próprio quando não houver.
+    /// Obtains enforcement: uses an already-pinned drop map if there is one, and only
+    /// attaches our own program when there is not.
     ///
-    /// Falha aqui **nunca é silenciosa**: o chamador precisa avisar alto e seguir em modo
-    /// somente-observação. Um antifraude que aparenta proteger sem proteger é exatamente
-    /// a crítica que este projeto faz ao incumbente.
+    /// Failure here is **never silent**: the caller must say so loudly and carry on in
+    /// observe-only mode. An anti-fraud system that appears to protect without protecting
+    /// is exactly the criticism this project levels at the incumbent.
     pub fn attach(
         shared_map: &Path,
         obj: &Path,
@@ -84,10 +82,10 @@ impl Enforcer {
             match Self::use_shared(shared_map) {
                 Ok(e) => return Ok(e),
                 Err(err) => {
-                    // Não é fatal — cai para o programa próprio —, mas precisa ser dito:
-                    // silêncio aqui esconderia que a imposição mudou de dono.
+                    // Not fatal — it falls back to our own program — but it must be said:
+                    // silence here would hide that enforcement changed hands.
                     eprintln!(
-                        "aviso: mapa compartilhado {} existe mas não pude usá-lo: {err}",
+                        "warning: shared map {} exists but could not be used: {err}",
                         shared_map.display()
                     );
                 }
@@ -97,20 +95,20 @@ impl Enforcer {
     }
 
     fn use_shared(path: &Path) -> Result<Self, String> {
-        // O mapa do SipVault é `lru_hash`; aceitar `hash` também deixa a integração
-        // funcionar com qualquer produto que fixe um mapa de drop compatível.
+        // The pinned map is typically `lru_hash`; accepting `hash` as well lets this work
+        // with any product that pins a compatible drop map.
         let map = Self::open_pinned(path, true)
             .or_else(|_| Self::open_pinned(path, false))
-            .map_err(|e| format!("mapa não é hash<u32,u64>: {e}"))?;
+            .map_err(|e| format!("map is not a hash<u32,u64>: {e}"))?;
         Ok(Self {
-            mode: format!("mapa compartilhado {}", path.display()),
+            mode: format!("shared map {}", path.display()),
             blocked_by_us: 0,
             backend: Backend::Shared { map },
         })
     }
 
     fn open_pinned(path: &Path, lru: bool) -> Result<BpfHashMap<MapData, u32, u64>, String> {
-        let data = MapData::from_pin(path).map_err(|e| format!("abrindo pin: {e}"))?;
+        let data = MapData::from_pin(path).map_err(|e| format!("opening pin: {e}"))?;
         let wrapped = if lru {
             Map::LruHashMap(data)
         } else {
@@ -122,7 +120,7 @@ impl Enforcer {
     fn load(obj: &Path, iface: &str, ports: &[u16]) -> Result<Self, String> {
         if !obj.exists() {
             return Err(format!(
-                "objeto BPF não encontrado em {}. Compile com: \
+                "BPF object not found at {}. Build it with: \
                  clang -O2 -g -target bpf -c ebpf/tfps_xdp.c -o {}",
                 obj.display(),
                 obj.display()
@@ -130,34 +128,34 @@ impl Enforcer {
         }
 
         let mut bpf =
-            Ebpf::load_file(obj).map_err(|e| format!("carregando {}: {e}", obj.display()))?;
+            Ebpf::load_file(obj).map_err(|e| format!("loading {}: {e}", obj.display()))?;
 
         let prog: &mut Xdp = bpf
             .program_mut("tfps_filter")
-            .ok_or("programa `tfps_filter` não está no objeto")?
+            .ok_or("program `tfps_filter` is not in the object")?
             .try_into()
-            .map_err(|e| format!("`tfps_filter` não é um programa XDP: {e}"))?;
+            .map_err(|e| format!("`tfps_filter` is not an XDP program: {e}"))?;
         prog.load()
-            .map_err(|e| format!("verifier recusou o programa: {e}"))?;
+            .map_err(|e| format!("the verifier rejected the program: {e}"))?;
 
-        // Nativo primeiro; genérico como degradação. O genérico roda depois da alocação
-        // do `sk_buff` e custa mais por pacote — mas continua **antes** do tap do
-        // libpcap, que é o que importa para limpar o sngrep.
+        // Native first, generic as a fallback. Generic runs after `sk_buff` allocation and
+        // costs more per packet — but it is still **before** the libpcap tap, which is what
+        // matters for a clean sngrep.
         let mode = match prog.attach(iface, XdpMode::Driver) {
-            Ok(_) => "nativo (DRV)",
+            Ok(_) => "native (DRV)",
             Err(native_err) => match prog.attach(iface, XdpMode::Skb) {
-                Ok(_) => "genérico (SKB)",
+                Ok(_) => "generic (SKB)",
                 Err(skb_err) => {
                     return Err(format!(
-                        "não consegui anexar XDP em {iface}: nativo falhou ({native_err}); \
-                         genérico falhou ({skb_err})"
+                        "could not attach XDP on {iface}: native failed ({native_err}); \
+                         generic failed ({skb_err})"
                     ))
                 }
             },
         };
 
         let mut me = Self {
-            mode: format!("programa próprio, XDP {mode} em {iface}"),
+            mode: format!("own program, XDP {mode} on {iface}"),
             blocked_by_us: 0,
             backend: Backend::Own { bpf: Box::new(bpf) },
         };
@@ -167,22 +165,24 @@ impl Enforcer {
 
     fn publish_ports(&mut self, ports: &[u16]) -> Result<(), String> {
         let Backend::Own { bpf } = &mut self.backend else {
-            return Ok(()); // mapa compartilhado tem a própria política de portas
+            return Ok(()); // a shared map has its own port policy
         };
-        let mut map: BpfHashMap<_, u16, u8> =
-            BpfHashMap::try_from(bpf.map_mut("sip_ports").ok_or("mapa `sip_ports` ausente")?)
-                .map_err(|e| format!("abrindo `sip_ports`: {e}"))?;
+        let mut map: BpfHashMap<_, u16, u8> = BpfHashMap::try_from(
+            bpf.map_mut("sip_ports")
+                .ok_or("map `sip_ports` is missing")?,
+        )
+        .map_err(|e| format!("opening `sip_ports`: {e}"))?;
         for p in ports {
             map.insert(p, 1u8, 0)
-                .map_err(|e| format!("publicando porta {p}: {e}"))?;
+                .map_err(|e| format!("publishing port {p}: {e}"))?;
         }
         Ok(())
     }
 
-    /// Condena uma origem: todo tráfego SIP dela é descartado até expirar.
+    /// Condemns a source: all of its SIP traffic is dropped until the block expires.
     ///
-    /// `ttl_secs` de 0 significa sem expiração. Expiração existe porque bloqueio errado
-    /// precisa se desfazer sozinho — ninguém estará acordado às 3h para desbloquear.
+    /// A `ttl_secs` of 0 means no expiry. Expiry exists because a wrong block must undo
+    /// itself — nobody will be awake at 3 a.m. to unblock a customer.
     pub fn block(&mut self, ip: Ipv4Addr, ttl_secs: u64) -> Result<(), String> {
         let until = if ttl_secs == 0 {
             0u64
@@ -192,32 +192,32 @@ impl Enforcer {
         self.blocked_by_us += 1;
         match &mut self.backend {
             Backend::Shared { map } => {
-                // Convenção do SipVault: IP como número **big-endian**. Determinada
-                // empiricamente contra o mapa em produção, casando um IP que o fail2ban
-                // havia banido — não presumida a partir do código.
+                // The pinned map's convention: IP as a **big-endian** number. Determined
+                // empirically against the production map, by matching an IP that fail2ban
+                // had banned — not assumed from source code.
                 map.insert(u32::from_be_bytes(ip.octets()), until, 0)
-                    .map_err(|e| format!("bloqueando {ip} no mapa compartilhado: {e}"))
+                    .map_err(|e| format!("blocking {ip} in the shared map: {e}"))
             }
             Backend::Own { bpf } => {
-                // Convenção nossa: `ip->saddr` cru, sem `ntohl`.
+                // Our own convention: raw `ip->saddr`, no `ntohl`.
                 let mut map: BpfHashMap<_, u32, u64> =
-                    BpfHashMap::try_from(bpf.map_mut("blocked").ok_or("mapa `blocked` ausente")?)
-                        .map_err(|e| format!("abrindo `blocked`: {e}"))?;
+                    BpfHashMap::try_from(bpf.map_mut("blocked").ok_or("map `blocked` is missing")?)
+                        .map_err(|e| format!("opening `blocked`: {e}"))?;
                 map.insert(u32::from_ne_bytes(ip.octets()), until, 0)
-                    .map_err(|e| format!("bloqueando {ip}: {e}"))
+                    .map_err(|e| format!("blocking {ip}: {e}"))
             }
         }
     }
 
-    /// O modo compartilhado usa o programa de outro produto, cujos contadores têm
-    /// semântica própria. Devolver zeros ali seria relatório falso.
+    /// Shared mode uses another product's program, whose counters have their own
+    /// semantics. Returning zeros there would be a false report.
     pub fn has_own_counters(&self) -> bool {
         matches!(self.backend, Backend::Own { .. })
     }
 
     pub fn counters(&self) -> Counters {
         let Backend::Own { bpf } = &self.backend else {
-            return Counters::default(); // contadores do mapa compartilhado são do dono dele
+            return Counters::default(); // a shared map's counters belong to its owner
         };
         let Some(map) = bpf.map("counters") else {
             return Counters::default();
@@ -232,7 +232,7 @@ impl Enforcer {
         }
     }
 
-    /// Quantas origens estão condenadas neste momento.
+    /// How many sources are condemned right now.
     pub fn blocked_count(&self) -> usize {
         match &self.backend {
             Backend::Shared { map } => map.keys().count(),
@@ -245,10 +245,10 @@ impl Enforcer {
     }
 }
 
-/// Nanossegundos de `CLOCK_MONOTONIC`, para casar com `bpf_ktime_get_ns()` no kernel.
+/// `CLOCK_MONOTONIC` nanoseconds, to match `bpf_ktime_get_ns()` in the kernel.
 ///
-/// Lido de `/proc/uptime` para não precisar de `unsafe` nem de `libc` direto — a precisão
-/// de 10 ms é irrelevante para TTLs medidos em minutos.
+/// Read from `/proc/uptime` to avoid needing `unsafe` or `libc` directly — 10 ms precision
+/// is irrelevant for TTLs measured in minutes.
 fn monotonic_ns() -> u64 {
     std::fs::read_to_string("/proc/uptime")
         .ok()
@@ -258,10 +258,10 @@ fn monotonic_ns() -> u64 {
         .unwrap_or(0)
 }
 
-/// Descobre a interface da rota padrão, para não obrigar o operador a declará-la.
+/// Finds the default-route interface, so the operator need not declare it.
 ///
-/// Coerente com o resto do produto: descobre sozinho, mas o valor é anunciado — e pode
-/// ser sobrescrito quando a descoberta erra.
+/// Consistent with the rest of the product: it discovers on its own, announces what it
+/// found, and can be overridden when discovery gets it wrong.
 pub fn default_interface() -> Option<String> {
     let routes = std::fs::read_to_string("/proc/net/route").ok()?;
     for line in routes.lines().skip(1) {
@@ -280,17 +280,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn monotonic_avanca_e_nao_e_zero() {
-        // Se `/proc/uptime` não existir o TTL vira absoluto pequeno e tudo expiraria
-        // na hora — vale garantir que a leitura funciona onde o teste roda.
+    fn monotonic_is_readable_and_nonzero() {
+        // If `/proc/uptime` is missing, the TTL becomes a small absolute value and
+        // everything would expire at once — worth asserting the read works here.
         let a = monotonic_ns();
-        assert!(a > 0, "não consegui ler /proc/uptime");
+        assert!(a > 0, "could not read /proc/uptime");
     }
 
     #[test]
-    fn a_chave_do_mapa_casa_a_ordem_de_rede_do_iphdr() {
-        // O programa lê `ip->saddr`, que está em ordem de rede. `from_ne_bytes` sobre os
-        // octetos reproduz exatamente esse layout na máquina little-endian onde roda.
+    fn the_map_key_matches_the_iphdr_network_order() {
+        // The program reads `ip->saddr`, which is in network order. `from_ne_bytes` over
+        // the octets reproduces exactly that layout on the little-endian host it runs on.
         let ip = Ipv4Addr::new(203, 0, 113, 5);
         let key = u32::from_ne_bytes(ip.octets());
         assert_eq!(key.to_ne_bytes(), [203, 0, 113, 5]);

@@ -1,24 +1,24 @@
-//! Perímetro — remoção de ruído por assinatura de user-agent.
+//! Perimeter — noise removal by user-agent signature and URI shape.
 //!
-//! **Não existe para pegar fraude.** Existe para impedir que lixo contamine a linha de
-//! base comportamental: se varredura alimenta o baseline de um par, o modelo aprende que
-//! rajada para destino estranho é normal ali, e a defesa se envenena sozinha (`SPEC.md` §7).
+//! **It does not exist to catch fraud.** It exists to keep garbage out of the behavioural
+//! baseline: if scanning feeds a pair's baseline, the model learns that a burst to a
+//! strange destination is normal there, and the defence poisons itself (`SPEC.md` §7).
 //!
-//! É também o **gancho de retenção do produto**: pacote removido aqui, quando a imposição
-//! entrar, morre no `XDP_DROP` e portanto **não aparece no sngrep** — o operador instala,
-//! abre a captura, e o lixo sumiu.
+//! It is also the **product's retention hook**: a packet removed here dies at `XDP_DROP`
+//! and therefore **never appears in sngrep** — the operator installs it, opens a capture,
+//! and the garbage is gone.
 //!
-//! Expectativa calibrada, e ela é modesta: na geração Java do TFPS a regra de user-agent
-//! disparou 260 vezes em 19 meses, com a lista congelada em 16 assinaturas por uma década.
-//! Como *detecção* isso é quase inútil — atacante competente usa UA normal. Como **filtro
-//! de volume** é adequado, porque os scanners preguiçosos com UA padrão são a maioria
-//! absoluta dos pacotes.
+//! Calibrated expectations, and they are modest: in the Java-era TFPS the user-agent rule
+//! fired 260 times over 19 months, with the list frozen at 16 signatures for a decade. As
+//! *detection* that is nearly useless — a competent attacker uses a normal UA. As a
+//! **volume filter** it is adequate, because lazy scanners with default UAs are the vast
+//! majority of packets.
 
-/// Assinaturas de ferramenta conhecida.
+/// Known tool signatures.
 ///
-/// Herdadas da tabela `dialplan` (dpid 99997) do TFPS 2023, convertidas de regex para
-/// casamento simples — todas eram âncora de início ou string literal, e um casador de
-/// prefixo dispensa a dependência de regex no caminho quente.
+/// Inherited from the `dialplan` table (dpid 99997) of the 2023 TFPS, converted from regex
+/// to simple matching — every one of them was a start anchor or a literal string, and a
+/// prefix matcher avoids a regex dependency on the hot path.
 static SIGNATURES: &[(&str, Match)] = &[
     ("sipcli", Match::Prefix),
     ("friendly", Match::Prefix),
@@ -40,44 +40,44 @@ static SIGNATURES: &[(&str, Match)] = &[
     ("opensip", Match::Exact),
 ];
 
-/// Padrões de injeção que aparecem em URI de ataque.
+/// Injection patterns that show up in attack URIs.
 ///
-/// Herdados da regra **R12** do `tfps.m4` de 2023, que fazia sete verificações sobre
-/// `$au`, `$ru`, `$rU`, `$fU`, `$fu` e o `Contact`. Diferente do user-agent, isto **não
-/// tem explicação inocente**: nenhum telefone põe aspa simples ou `--` no `From`. Por
-/// isso é sinal de confiança mais alta que a lista de ferramentas.
+/// Inherited from rule **R12** of the 2023 `tfps.m4`, which ran seven checks over `$au`,
+/// `$ru`, `$rU`, `$fU`, `$fu` and `Contact`. Unlike a user-agent, this has **no innocent
+/// explanation**: no phone puts a single quote or `--` in the `From` header. That makes it
+/// a higher-confidence signal than the tool list.
 static INJECTION: &[&str] = &[
-    "'",   // aspa simples — o clássico
-    "%27", // aspa simples percent-encoded
-    "--",  // comentário SQL
+    "'",   // single quote — the classic
+    "%27", // percent-encoded single quote
+    "--",  // SQL comment
     "\\",  // escape
     "%24", // `$`
-    "%60", // crase
-    "==", "?=?",   // visto em campo pelo dev
+    "%60", // backtick
+    "==", "?=?",   // seen in the field
     "union", // `UNION SELECT`
-    "select", ";", // separador de comando fora de parâmetro
+    "select", ";", // command separator outside a parameter
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Match {
-    /// Começa com a assinatura. Cobre `^sipcli`, `^friendly`, etc.
+    /// Starts with the signature. Covers `^sipcli`, `^friendly`, and so on.
     Prefix,
-    /// É exatamente a assinatura. Cobre `^PBX$`, `^Trixbox$`, `^opensip$` — âncoras nas
-    /// duas pontas, porque `PBX` como prefixo casaria user-agent legítimo de PBX real.
+    /// Equals the signature exactly. Covers `^PBX$`, `^Trixbox$`, `^opensip$` — anchored
+    /// at both ends, because `PBX` as a prefix would match a real PBX's legitimate UA.
     Exact,
 }
 
-/// Filtro de ruído, com contagem por assinatura.
+/// Noise filter, with per-signature counts.
 ///
-/// A contagem não é enfeite: o `SPEC.md` §12 exige reportar padrão que casa zero vezes.
-/// Assinatura que não dispara em três meses está podre, e o operador precisa saber —
-/// foi exatamente o que o `fail2ban` nunca fez.
+/// The counting is not decoration: `SPEC.md` §12 requires reporting patterns that match
+/// zero times. A signature that has not fired in three months is rotten, and the operator
+/// needs to know — precisely what `fail2ban` never did.
 #[derive(Debug, Clone)]
 pub struct NoiseFilter {
     hits: Vec<u64>,
-    /// Assinaturas acrescentadas por arquivo, com suas próprias contagens.
+    /// Signatures added from a file, with their own counts.
     extra: Vec<(String, Match, u64)>,
-    /// Padrões de injeção acrescentados por arquivo.
+    /// Injection patterns added from a file.
     extra_injection: Vec<String>,
     injections: u64,
 }
@@ -98,15 +98,15 @@ impl NoiseFilter {
         }
     }
 
-    /// O user-agent casa alguma assinatura conhecida de ferramenta de varredura?
+    /// Does the user-agent match a known scanning-tool signature?
     ///
-    /// Comparação sem diferenciar maiúsculas: o TFPS 2023 tinha `^[sS][iI][vV][uU][sS]`
-    /// escrito à mão justamente por causa disso.
+    /// Case-insensitive comparison: the 2023 TFPS had `^[sS][iI][vV][uU][sS]` written out
+    /// by hand for exactly this reason.
     pub fn is_noise(&mut self, user_agent: Option<&str>) -> Option<&'static str> {
         let ua = user_agent?.trim();
         if ua.is_empty() {
-            // User-agent ausente é comum em tráfego legítimo (o TFPS Java viu 6.843
-            // INVITEs sem UA). Ausência **não** é ruído.
+            // A missing user-agent is common in legitimate traffic (the Java-era TFPS saw
+            // 6,843 INVITEs with no UA). Absence is **not** noise.
             return None;
         }
         for (i, (sig, kind)) in SIGNATURES.iter().enumerate() {
@@ -115,7 +115,7 @@ impl NoiseFilter {
                 return Some(sig);
             }
         }
-        // As do arquivo vêm depois: as embutidas têm a contagem estável do relatório.
+        // File signatures come second: the built-ins keep the report's stable counts.
         for (sig, kind, n) in &mut self.extra {
             if matches_sig(ua, sig, *kind) {
                 *n += 1;
@@ -125,7 +125,7 @@ impl NoiseFilter {
         None
     }
 
-    /// Assinaturas e quantas vezes cada uma casou, para o relatório.
+    /// Signatures and how many times each matched, for the report.
     pub fn hits(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
         SIGNATURES
             .iter()
@@ -133,13 +133,13 @@ impl NoiseFilter {
             .map(|((sig, _), n)| (*sig, *n))
     }
 
-    /// Acrescenta uma assinatura de user-agent vinda de arquivo.
+    /// Adds a user-agent signature coming from a file.
     ///
-    /// **Acrescenta, nunca substitui.** Um arquivo que substituísse faria o operador que
-    /// escreve três linhas perder as 18 embutidas sem perceber — downgrade silencioso,
-    /// que é precisamente a falha que este projeto condena no `fail2ban`.
+    /// **It adds, never replaces.** A file that replaced would make an operator who writes
+    /// three lines silently lose the 18 built-ins — a silent downgrade, precisely the
+    /// failure this project condemns in `fail2ban`.
     ///
-    /// Sintaxe: `texto` casa por prefixo; `=texto` casa exato (o equivalente a `^…$`).
+    /// Syntax: `text` matches by prefix; `=text` matches exactly (equivalent to `^…$`).
     pub fn add_signature(&mut self, raw: &str) {
         let raw = raw.trim();
         if raw.is_empty() || raw.starts_with('#') {
@@ -154,7 +154,7 @@ impl NoiseFilter {
         }
     }
 
-    /// Acrescenta um padrão de injeção vindo de arquivo.
+    /// Adds an injection pattern coming from a file.
     pub fn add_injection(&mut self, raw: &str) {
         let raw = raw.trim();
         if !raw.is_empty() && !raw.starts_with('#') {
@@ -162,7 +162,7 @@ impl NoiseFilter {
         }
     }
 
-    /// Quantas assinaturas o filtro conhece ao todo — embutidas mais as do arquivo.
+    /// How many signatures the filter knows in total — built-ins plus file entries.
     pub fn signature_count(&self) -> (usize, usize) {
         (SIGNATURES.len(), self.extra.len())
     }
@@ -171,19 +171,19 @@ impl NoiseFilter {
         (INJECTION.len(), self.extra_injection.len())
     }
 
-    /// A URI carrega padrão de injeção?
+    /// Does the URI carry an injection pattern?
     ///
-    /// Recebe as URIs cruas (Request-URI e `From`) porque o ataque costuma vir na parte
-    /// de usuário ou no host, e normalizar antes esconderia o que se procura.
+    /// Takes raw URIs (Request-URI and `From`) because the attack usually lands in the user
+    /// part or the host, and normalising first would hide what we are looking for.
     ///
-    /// **Não** é aplicado à mensagem inteira: `Via`, `User-Agent` e corpo SDP contêm
-    /// caracteres legítimos que casariam por acidente.
+    /// It is **not** applied to the whole message: `Via`, `User-Agent` and the SDP body
+    /// contain legitimate characters that would match by accident.
     pub fn injection_in_uri(&mut self, uris: &[Option<&str>]) -> Option<&'static str> {
         for uri in uris.iter().flatten() {
             let lower = uri.to_ascii_lowercase();
             for pat in INJECTION {
-                // `;` é legítimo como separador de parâmetro em URI SIP (`;tag=`,
-                // `;transport=`), então só conta quando aparece na **parte de usuário**.
+                // `;` is legitimate as a SIP URI parameter separator (`;tag=`,
+                // `;transport=`), so it only counts inside the **user part**.
                 if *pat == ";" {
                     if user_part(&lower).is_some_and(|u| u.contains(';')) {
                         self.injections += 1;
@@ -210,7 +210,7 @@ impl NoiseFilter {
         self.injections
     }
 
-    /// Assinaturas que nunca casaram — as candidatas a estarem podres.
+    /// Signatures that never matched — the candidates for being rotten.
     pub fn cold_signatures(&self) -> Vec<&'static str> {
         self.hits()
             .filter(|(_, n)| *n == 0)
@@ -219,38 +219,38 @@ impl NoiseFilter {
     }
 }
 
-/// Quantas tentativas autenticadas numa janela caracterizam força bruta.
+/// How many authenticated attempts within a window constitute brute force.
 ///
-/// **Não se conta `401` cru**, e isso é a diferença entre funcionar e derrubar todos os
-/// clientes: o desafio digest é o fluxo normal — todo `REGISTER` legítimo recebe um `401`
-/// com nonce antes de reenviar com `Authorization`. Contar desafios bloquearia todo mundo.
+/// **A bare `401` is never counted**, and that is the difference between working and
+/// knocking every customer offline: the digest challenge is the normal flow — every
+/// legitimate `REGISTER` gets a `401` with a nonce before resending with `Authorization`.
+/// Counting challenges would block everyone.
 ///
-/// O que se conta é **`REGISTER` carregando `Authorization`**: um telefone legítimo manda
-/// um por ciclo de registro (tipicamente a cada 300 s), enquanto quem testa credencial
-/// manda muitos por segundo. Nenhuma correlação de resposta é necessária, e nenhum estado
-/// de diálogo.
+/// What is counted is a **`REGISTER` carrying `Authorization`**: a legitimate phone sends
+/// one per registration cycle (typically every 300 s), while someone testing credentials
+/// sends many per second. No response correlation is needed, and no dialog state.
 pub const AUTH_ATTEMPTS_TO_BLOCK: u32 = 20;
 
-/// Janela do contador acima, em segundos.
+/// Window for the counter above, in seconds.
 ///
-/// Medido no servidor de referência: **2 desafios em 45 s** de tráfego legítimo, ou seja
-/// ~2,7/min. Vinte por minuto dá ~7× de folga. **Ressalva honesta**: NAT grande agrega
-/// muitos telefones num IP e pode encostar no limiar — é a mesma limitação do `fail2ban`,
-/// e o bloqueio é temporário justamente por isso.
+/// Measured on the reference server: **2 challenges in 45 s** of legitimate traffic, about
+/// 2.7/min. Twenty per minute leaves roughly 7× headroom. **Honest caveat**: a large NAT
+/// aggregates many phones behind one IP and may approach the threshold — the same
+/// limitation `fail2ban` has, and precisely why the block is temporary.
 pub const AUTH_WINDOW_SECS: u32 = 60;
 
-/// Contador de tentativas autenticadas por origem, em janela deslizante.
+/// Per-source counter of authenticated attempts, over a sliding window.
 #[derive(Debug, Clone, Default)]
 pub struct AuthAbuse {
-    /// Carimbos das últimas tentativas. Anel do tamanho exato do limiar: se a mais antiga
-    /// ainda está na janela, o limiar foi atingido.
+    /// Timestamps of recent attempts. A ring sized exactly to the threshold: if the oldest
+    /// is still inside the window, the threshold has been reached.
     stamps: [u32; AUTH_ATTEMPTS_TO_BLOCK as usize],
     len: u8,
     next: u8,
 }
 
 impl AuthAbuse {
-    /// Registra uma tentativa autenticada e diz se o limiar foi atingido.
+    /// Records an authenticated attempt and reports whether the threshold was reached.
     pub fn attempt(&mut self, now: u32) -> (u32, bool) {
         self.stamps[self.next as usize] = now;
         self.next = (self.next + 1) % AUTH_ATTEMPTS_TO_BLOCK as u8;
@@ -272,7 +272,7 @@ fn matches_sig(ua: &str, sig: &str, kind: Match) -> bool {
     }
 }
 
-/// Parte de usuário de uma URI SIP em minúsculas, para a checagem de `;`.
+/// Lower-cased user part of a SIP URI, for the `;` check.
 fn user_part(uri: &str) -> Option<&str> {
     let start = uri
         .find("sip:")
@@ -288,7 +288,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pega_os_scanners_classicos() {
+    fn catches_the_classic_scanners() {
         let mut f = NoiseFilter::new();
         for ua in [
             "friendly-scanner",
@@ -298,12 +298,12 @@ mod tests {
             "Nmap NSE",
             "VaxSIPUserAgent/3.0",
         ] {
-            assert!(f.is_noise(Some(ua)).is_some(), "deveria pegar {ua}");
+            assert!(f.is_noise(Some(ua)).is_some(), "should catch {ua}");
         }
     }
 
     #[test]
-    fn nao_pega_user_agent_legitimo() {
+    fn does_not_catch_a_legitimate_user_agent() {
         let mut f = NoiseFilter::new();
         for ua in [
             "Grandstream GXP2140 1.0.9.14",
@@ -313,14 +313,14 @@ mod tests {
             "Cisco-SIPGateway/IOS-12.x",
             "FPBX-2.8.1(1.8.20.0)",
         ] {
-            assert!(f.is_noise(Some(ua)).is_none(), "falso positivo em {ua}");
+            assert!(f.is_noise(Some(ua)).is_none(), "false positive on {ua}");
         }
     }
 
     #[test]
-    fn ancora_dupla_evita_falso_positivo_em_pbx_real() {
+    fn double_anchoring_avoids_a_false_positive_on_a_real_pbx() {
         let mut f = NoiseFilter::new();
-        // `^PBX$` do TFPS 2023: só o UA que é exatamente "PBX" é scanner.
+        // `^PBX$` from the 2023 TFPS: only a UA that is exactly "PBX" is a scanner.
         assert!(f.is_noise(Some("PBX")).is_some());
         assert!(f.is_noise(Some("PBX Asterisk 18")).is_none());
         assert!(f.is_noise(Some("opensip")).is_some());
@@ -328,9 +328,9 @@ mod tests {
     }
 
     #[test]
-    fn ausencia_de_user_agent_nao_e_ruido() {
-        // O TFPS Java viu 6.843 INVITEs legítimos sem user-agent. Tratar ausência
-        // como ruído descartaria tráfego bom — e envenenaria a medição de volume.
+    fn a_missing_user_agent_is_not_noise() {
+        // The Java-era TFPS saw 6,843 legitimate INVITEs with no user-agent. Treating
+        // absence as noise would discard good traffic — and poison the volume measurement.
         let mut f = NoiseFilter::new();
         assert!(f.is_noise(None).is_none());
         assert!(f.is_noise(Some("")).is_none());
@@ -338,14 +338,14 @@ mod tests {
     }
 
     #[test]
-    fn maiusculas_nao_importam() {
+    fn case_does_not_matter() {
         let mut f = NoiseFilter::new();
         assert!(f.is_noise(Some("SIPVICIOUS")).is_some());
         assert!(f.is_noise(Some("SiVuS")).is_some());
     }
 
     #[test]
-    fn pega_injecao_em_uri() {
+    fn catches_injection_in_a_uri() {
         let mut f = NoiseFilter::new();
         for uri in [
             "sip:1001'@pbx.com",
@@ -357,14 +357,14 @@ mod tests {
         ] {
             assert!(
                 f.injection_in_uri(&[Some(uri)]).is_some(),
-                "deveria pegar injeção em {uri}"
+                "should catch injection in {uri}"
             );
         }
         assert_eq!(f.injections(), 6);
     }
 
     #[test]
-    fn nao_pega_uri_legitima() {
+    fn does_not_catch_a_legitimate_uri() {
         let mut f = NoiseFilter::new();
         for uri in [
             "sip:1001@pbx.example.com",
@@ -375,15 +375,15 @@ mod tests {
         ] {
             assert!(
                 f.injection_in_uri(&[Some(uri)]).is_none(),
-                "falso positivo em {uri}"
+                "false positive on {uri}"
             );
         }
     }
 
     #[test]
-    fn ponto_e_virgula_de_parametro_nao_e_injecao() {
-        // `;tag=`, `;transport=` e `;user=phone` são legítimos e frequentes. Só conta
-        // quando o `;` está na parte de usuário, antes do `@`.
+    fn a_parameter_semicolon_is_not_injection() {
+        // `;tag=`, `;transport=` and `;user=phone` are legitimate and frequent. It only
+        // counts when the `;` sits in the user part, before the `@`.
         let mut f = NoiseFilter::new();
         assert!(f
             .injection_in_uri(&[Some("sip:200@pbx.com;transport=tcp")])
@@ -392,31 +392,31 @@ mod tests {
     }
 
     #[test]
-    fn arquivo_acrescenta_e_nunca_substitui() {
+    fn a_file_adds_and_never_replaces() {
         let mut f = NoiseFilter::new();
-        f.add_signature("MeuScannerLocal");
+        f.add_signature("MyLocalScanner");
         f.add_signature("=ExatoAssim");
-        f.add_signature("# comentário ignorado");
+        f.add_signature("# ignored comment");
         f.add_signature("   ");
 
-        // A nova funciona…
-        assert!(f.is_noise(Some("MeuScannerLocal/2.0")).is_some());
+        // The new one works…
+        assert!(f.is_noise(Some("MyLocalScanner/2.0")).is_some());
         assert!(f.is_noise(Some("ExatoAssim")).is_some());
         assert!(
             f.is_noise(Some("ExatoAssim e mais")).is_none(),
-            "= é âncora dupla"
+            "= is double-anchored"
         );
-        // …e as embutidas continuam valendo. É o ponto: acrescenta, não substitui.
+        // …and the built-ins still apply. That is the point: it adds, it does not replace.
         assert!(f.is_noise(Some("friendly-scanner")).is_some());
         assert_eq!(
             f.signature_count(),
             (18, 2),
-            "comentário e vazio não entram"
+            "comments and blanks do not count"
         );
     }
 
     #[test]
-    fn injecao_do_arquivo_tambem_acrescenta() {
+    fn file_injection_patterns_also_add() {
         let mut f = NoiseFilter::new();
         f.add_injection("xp_cmdshell");
         assert!(f
@@ -424,58 +424,58 @@ mod tests {
             .is_some());
         assert!(
             f.injection_in_uri(&[Some("sip:1001'@x")]).is_some(),
-            "embutido segue"
+            "the built-in still fires"
         );
         assert_eq!(f.injection_count(), (11, 1));
     }
 
     #[test]
-    fn o_desafio_digest_legitimo_nao_dispara() {
-        // Um telefone registra a cada 300 s. Mesmo em uma hora inteira, não chega perto.
+    fn the_legitimate_digest_challenge_does_not_fire() {
+        // A phone registers every 300 s. Even across a full hour it comes nowhere close.
         let mut a = AuthAbuse::default();
-        for ciclo in 0..12u32 {
-            let (_, bloqueia) = a.attempt(ciclo * 300);
-            assert!(!bloqueia, "registro periódico legítimo nunca pode bloquear");
+        for cycle in 0..12u32 {
+            let (_, blocks) = a.attempt(cycle * 300);
+            assert!(!blocks, "periodic legitimate registration must never block");
         }
     }
 
     #[test]
-    fn forca_bruta_dispara() {
+    fn brute_force_fires() {
         let mut a = AuthAbuse::default();
-        let mut bloqueou = false;
+        let mut fired = false;
         for i in 0..AUTH_ATTEMPTS_TO_BLOCK {
-            let (_, b) = a.attempt(1000 + i); // uma por segundo
-            bloqueou = b;
+            let (_, b) = a.attempt(1000 + i); // one per second
+            fired = b;
         }
-        assert!(bloqueou, "20 tentativas em 20 s tem de bloquear");
+        assert!(fired, "20 attempts in 20 s must block");
     }
 
     #[test]
-    fn a_janela_desliza_em_vez_de_zerar() {
+    fn the_window_slides_instead_of_resetting() {
         let mut a = AuthAbuse::default();
-        // 19 tentativas, insuficiente.
+        // 19 attempts, not enough.
         for i in 0..(AUTH_ATTEMPTS_TO_BLOCK - 1) {
             assert!(!a.attempt(1000 + i).1);
         }
-        // Muito depois, uma tentativa isolada não pode somar com as antigas.
-        let (n, bloqueia) = a.attempt(1000 + AUTH_WINDOW_SECS * 3);
+        // Much later, an isolated attempt must not add up with the old ones.
+        let (n, blocks) = a.attempt(1000 + AUTH_WINDOW_SECS * 3);
         assert_eq!(n, 1);
-        assert!(!bloqueia);
+        assert!(!blocks);
     }
 
     #[test]
-    fn conta_por_assinatura_e_denuncia_as_frias() {
+    fn counts_per_signature_and_reports_the_cold_ones() {
         let mut f = NoiseFilter::new();
         f.is_noise(Some("friendly-scanner"));
         f.is_noise(Some("friendly-scanner"));
         f.is_noise(Some("sipcli/v1.8"));
 
-        let quentes: Vec<_> = f.hits().filter(|(_, n)| *n > 0).collect();
-        assert_eq!(quentes.len(), 2);
-        assert!(quentes.contains(&("friendly", 2)));
-        assert!(quentes.contains(&("sipcli", 1)));
+        let hot: Vec<_> = f.hits().filter(|(_, n)| *n > 0).collect();
+        assert_eq!(hot.len(), 2);
+        assert!(hot.contains(&("friendly", 2)));
+        assert!(hot.contains(&("sipcli", 1)));
 
-        // As demais nunca casaram — é isto que o relatório precisa dizer.
+        // The rest never matched — that is what the report needs to say.
         assert!(f.cold_signatures().contains(&"pplsip"));
         assert!(!f.cold_signatures().contains(&"friendly"));
     }

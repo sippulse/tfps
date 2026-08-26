@@ -1,18 +1,19 @@
-// Programa XDP do TFPS — descarta tráfego SIP de origens já condenadas.
+// TFPS XDP program — drops SIP traffic from sources already condemned.
 //
-// Este é o programa que faz o lixo **sumir do sngrep**, e a razão é a ordem no kernel:
-// o XDP roda em `netif_receive_skb_internal`, antes de `__netif_receive_skb_core`
-// entregar o pacote aos taps `ptype_all` — que é onde o libpcap (logo o sngrep, o
-// tcpdump e o tshark) engata. Pacote descartado aqui nunca chega ao tap.
+// This is the program that makes the garbage **vanish from sngrep**, and the reason is
+// the ordering inside the kernel: XDP runs in `netif_receive_skb_internal`, before
+// `__netif_receive_skb_core` hands the packet to the `ptype_all` taps — which is where
+// libpcap (hence sngrep, tcpdump and tshark) hooks in. A packet dropped here never
+// reaches the tap.
 //
-// É por isso que o `nftables` não serviria: o drop dele acontece em netfilter, depois
-// do tap, e a captura continuaria poluída.
+// That is why `nftables` would not do: its drop happens in netfilter, after the tap, and
+// the capture would stay polluted.
 //
-// Escrito em C e não em Rust porque só o lado kernel precisa de LLVM/clang, e mantê-lo
-// em C dispensa o `bpf-linker` na máquina de desenvolvimento. O lado userspace é Rust
-// com `aya`, que é Rust puro.
+// Written in C rather than Rust because only the kernel side needs LLVM/clang, and
+// keeping it in C means no `bpf-linker` on the development machine. The userspace side is
+// Rust with `aya`, which is pure Rust.
 //
-// Compilar (no alvo, com o vmlinux.h gerado do BTF):
+// Build (on the target, with vmlinux.h generated from BTF):
 //   clang -O2 -g -target bpf -c tfps_xdp.c -o tfps_xdp.o
 
 #include "vmlinux.h"
@@ -22,16 +23,16 @@
 #define ETH_P_IP 0x0800
 #define IPPROTO_UDP_ 17
 
-// Teto de origens bloqueadas simultaneamente. `LRU_HASH` despeja a entrada menos usada
-// quando enche, o que dá um limite de memória rígido — o programa nunca cresce sem fim,
-// ao contrário do que o lado userspace fazia antes desta revisão.
+// Ceiling on simultaneously blocked sources. `LRU_HASH` evicts the least recently used
+// entry when it fills up, which gives a hard memory bound — the program never grows
+// without limit, unlike what the userspace side did before this revision.
 #define MAX_BLOCKED 65536
 
-// Origens condenadas: IPv4 em ordem de rede -> instante de expiração em ns monotônicos.
-// Valor 0 significa "sem expiração".
+// Condemned sources: IPv4 in network order -> expiry instant in monotonic ns.
+// A value of 0 means "never expires".
 //
-// A expiração existe porque bloqueio errado precisa se desfazer sozinho: ninguém vai
-// estar acordado às 3h da manhã para desbloquear um cliente legítimo.
+// Expiry exists because a wrong block has to undo itself: nobody will be awake at 3am to
+// unblock a legitimate customer.
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, MAX_BLOCKED);
@@ -39,11 +40,11 @@ struct {
     __type(value, __u64);
 } blocked SEC(".maps");
 
-// Portas SIP observadas. Só o tráfego para/de estas portas é descartado.
+// Watched SIP ports. Only traffic to/from these ports is dropped.
 //
-// **Limitar o raio de dano é deliberado**: um IP atrás de CGNAT pode hospedar um scanner
-// e um usuário legítimo ao mesmo tempo. Descartar tudo daquele endereço derrubaria o SSH
-// e a web de quem não fez nada. Aqui o dano fica contido ao SIP.
+// **Limiting the blast radius is deliberate**: an IP behind CGNAT can host a scanner and
+// a legitimate user at the same time. Dropping everything from that address would take
+// down SSH and the web for people who did nothing. Here the damage stays confined to SIP.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 16);
@@ -51,7 +52,7 @@ struct {
     __type(value, __u8);
 } sip_ports SEC(".maps");
 
-// Contadores: [0] descartados, [1] observados, [2] expirados.
+// Counters: [0] dropped, [1] seen, [2] expired.
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 3);
@@ -86,7 +87,7 @@ int tfps_filter(struct xdp_md *ctx)
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
     if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return XDP_PASS; // IPv6 e o resto passam — ver a limitação registrada no README
+        return XDP_PASS; // IPv6 and the rest pass — see the limitation recorded in the README
 
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
@@ -94,8 +95,8 @@ int tfps_filter(struct xdp_md *ctx)
     if (ip->protocol != IPPROTO_UDP_)
         return XDP_PASS;
 
-    // O IHL vem em palavras de 32 bits e é controlado pelo remetente; o verifier exige
-    // que o limite seja checado depois de calculá-lo.
+    // IHL comes in 32-bit words and is controlled by the sender; the verifier demands the
+    // bound be checked after computing it.
     __u32 ihl = ip->ihl * 4;
     if (ihl < sizeof(struct iphdr))
         return XDP_PASS;
@@ -116,8 +117,8 @@ int tfps_filter(struct xdp_md *ctx)
         return XDP_PASS;
 
     if (*until != 0 && bpf_ktime_get_ns() > *until) {
-        // Expirou: remove e deixa passar. O desbloqueio acontece sozinho, sem varredura
-        // em segundo plano e sem ninguém precisar intervir.
+        // Expired: remove it and let it through. Unblocking happens on its own, with no
+        // background sweep and nobody having to intervene.
         bpf_map_delete_elem(&blocked, &src);
         bump(C_EXPIRED);
         return XDP_PASS;

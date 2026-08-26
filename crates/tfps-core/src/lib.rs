@@ -1,10 +1,10 @@
-//! Núcleo do TFPS — sistema de prevenção de fraude IRSF para redes SIP.
+//! TFPS core — IRSF fraud prevention for SIP networks.
 //!
-//! Este crate contém o domínio e **nenhum I/O**: nem rede, nem disco, nem kernel.
-//! A fonte dos eventos (captura hoje, XDP depois) fica fora daqui, o que mantém tudo
-//! aqui determinístico e testável sem privilégio nem hardware.
+//! This crate holds the domain and **no I/O**: no network, no disk, no kernel. The event
+//! source (packet capture today, XDP later) lives outside, which keeps everything here
+//! deterministic and testable without privileges or hardware.
 //!
-//! Arquitetura em `SPEC.md`, vocabulário normativo em `CONTEXT.md`.
+//! Architecture in `SPEC.md`, normative vocabulary in `CONTEXT.md`.
 
 pub mod country;
 pub mod dialplan;

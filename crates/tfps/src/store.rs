@@ -1,25 +1,25 @@
-//! Armazenamento durável em SQLite.
+//! Durable storage in SQLite.
 //!
-//! **Um arquivo. Sem servidor, sem daemon, sem credencial, sem porta.** É zero
-//! configuração de verdade — o TFPS de 2023 tinha senha de MySQL em texto claro em seis
-//! pontos do `.cfg` gerado.
+//! **One file. No server, no daemon, no credentials, no port.** That is genuine zero
+//! configuration — the 2023 TFPS had a plaintext MySQL password in six places of its
+//! generated `.cfg`.
 //!
-//! E o operador **consegue abrir e ver o que o sistema aprendeu**:
+//! And the operator **can open it and see what the system learned**:
 //!
 //! ```sh
 //! sqlite3 /var/lib/tfps/tfps.db "select * from block_log order by ts desc limit 20"
 //! ```
 //!
-//! Num produto silencioso por desenho, poder auditar o estado é o que separa "confio
-//! nisso" de "não sei se está funcionando".
+//! In a product that is silent by design, being able to audit the state is what separates
+//! "I trust this" from "I have no idea whether it works".
 //!
-//! **É armazenamento durável, não caminho quente** (`SPEC.md` §10). O conjunto de
-//! trabalho vive em memória; aqui só acontecem a carga do boot e o checkpoint periódico.
-//! Consultar SQL por INVITE seria gargalo de escrita no alvo wholesale.
+//! **This is durable storage, not the hot path** (`SPEC.md` §10). The working set lives in
+//! memory; only the boot load and the periodic checkpoint happen here. Querying SQL per
+//! INVITE would be a write bottleneck at the wholesale target.
 //!
-//! A divisão de estado importa: o de **perímetro** morre com o processo e se reconstrói
-//! em minutos do próprio tráfego — coerente com o fail-open por não fixar o programa
-//! eBPF. O **comportamental**, de 45 a 90 dias, é o que precisa sobreviver.
+//! The split of state matters: **perimeter** state dies with the process and rebuilds in
+//! minutes from traffic — consistent with fail-open by not pinning the eBPF program. The
+//! **behavioural** state, 45 to 90 days of it, is what has to survive.
 
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -29,8 +29,9 @@ use tfps_core::engine::{Engine, PairRecord, PeerCountryRecord};
 
 pub const DEFAULT_PATH: &str = "/var/lib/tfps/tfps.db";
 
-/// Versão do esquema. Mudança incompatível recria as tabelas em vez de corromper —
-/// perder linha de base é recuperável em dias; ler bitmap com semântica errada não é.
+/// Schema version. An incompatible change recreates the tables rather than corrupting —
+/// losing a baseline is recoverable in days; reading a bitmap with the wrong semantics is
+/// not.
 const SCHEMA: i64 = 1;
 
 pub struct Store {
@@ -40,14 +41,14 @@ pub struct Store {
 impl Store {
     pub fn open(path: &Path) -> Result<Self, String> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("criando {}: {e}", dir.display()))?;
+            std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
         }
         let conn =
-            Connection::open(path).map_err(|e| format!("abrindo {}: {e}", path.display()))?;
+            Connection::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
 
-        // WAL: leitura concorrente enquanto o checkpoint escreve, e menos fsync.
-        // `synchronous=NORMAL` é o par usual de WAL — perder os últimos segundos num
-        // corte de energia custa segundos de aprendizado, não a base.
+        // WAL: concurrent reads while the checkpoint writes, and fewer fsyncs.
+        // `synchronous=NORMAL` is WAL's usual companion — losing the last few seconds to a
+        // power cut costs seconds of learning, not the database.
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| format!("WAL: {e}"))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
@@ -64,7 +65,7 @@ impl Store {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
         if found != 0 && found != SCHEMA {
-            // Esquema incompatível: recomeça. Ver a nota em `SCHEMA`.
+            // Incompatible schema: start over. See the note on `SCHEMA`.
             for t in ["pair", "peer_country", "meta", "block_log"] {
                 let _ = self.conn.execute(&format!("DROP TABLE IF EXISTS {t}"), []);
             }
@@ -90,8 +91,8 @@ impl Store {
                      calls   INTEGER NOT NULL,
                      PRIMARY KEY (peer, country)
                  );
-                 -- Auditoria: todo bloqueio registra o porquê, legível por humano.
-                 -- `SPEC.md` §12 exige que o operador possa reconstruir a decisão.
+                 -- Audit: every block records why, in human-readable form.
+                 -- `SPEC.md` §12 requires the operator to be able to reconstruct it.
                  CREATE TABLE IF NOT EXISTS block_log (
                      ts     INTEGER NOT NULL,
                      ip     TEXT    NOT NULL,
@@ -100,17 +101,17 @@ impl Store {
                  );
                  CREATE INDEX IF NOT EXISTS block_log_ts ON block_log (ts);",
             )
-            .map_err(|e| format!("criando esquema: {e}"))?;
+            .map_err(|e| format!("creating schema: {e}"))?;
         self.conn
             .pragma_update(None, "user_version", SCHEMA)
             .map_err(|e| format!("user_version: {e}"))
     }
 
-    /// Instante em que o aprendizado começou, gravado na primeira execução.
+    /// The instant learning began, written on the first run.
     ///
-    /// **É o que dá sentido ao modo de aprendizado.** Sem persistir isto, cada restart
-    /// reiniciaria os 30 dias e a contagem regressiva prometeria algo que um
-    /// `systemctl restart` apagaria.
+    /// **This is what makes learning mode mean anything.** Without persisting it, every
+    /// restart would reset the 30 days and the countdown would promise something a
+    /// `systemctl restart` erases.
     pub fn learning_started(&self, default_now: u32) -> u32 {
         if let Ok(v) =
             self.conn
@@ -136,20 +137,20 @@ impl Store {
         );
     }
 
-    /// Apaga auditoria antiga. Sem isto o arquivo cresce para sempre — foi o que
-    /// produziu o `/var/log/opensips.log` de 477 MB que o `fail2ban` varre linha a linha.
+    /// Deletes old audit rows. Without this the file grows forever — which is what
+    /// produced the 477 MB `/var/log/opensips.log` that `fail2ban` scans line by line.
     pub fn prune_log(&self, older_than: u32) -> usize {
         self.conn
             .execute("DELETE FROM block_log WHERE ts < ?1", params![older_than])
             .unwrap_or(0)
     }
 
-    /// Grava o estado de aprendizado. Chamado no checkpoint, nunca por pacote.
+    /// Writes the learning state. Called at checkpoint time, never per packet.
     pub fn checkpoint(&mut self, engine: &Engine) -> Result<(usize, usize), String> {
         let tx = self
             .conn
             .transaction()
-            .map_err(|e| format!("transação: {e}"))?;
+            .map_err(|e| format!("transaction: {e}"))?;
         let mut pairs = 0usize;
         let mut countries = 0usize;
         {
@@ -159,7 +160,7 @@ impl Store {
                      (peer, a_number, cur, prev, period, last_seen)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )
-                .map_err(|e| format!("preparando pair: {e}"))?;
+                .map_err(|e| format!("preparing pair: {e}"))?;
             for r in engine.export_pairs() {
                 ins.execute(params![
                     r.peer.to_string(),
@@ -169,7 +170,7 @@ impl Store {
                     r.period,
                     r.last_seen
                 ])
-                .map_err(|e| format!("gravando par: {e}"))?;
+                .map_err(|e| format!("writing pair: {e}"))?;
                 pairs += 1;
             }
             let mut insc = tx
@@ -177,10 +178,10 @@ impl Store {
                     "INSERT OR REPLACE INTO peer_country (peer, country, calls)
                      VALUES (?1, ?2, ?3)",
                 )
-                .map_err(|e| format!("preparando peer_country: {e}"))?;
+                .map_err(|e| format!("preparing peer_country: {e}"))?;
             for r in engine.export_peer_countries() {
                 insc.execute(params![r.peer.to_string(), r.country, r.calls])
-                    .map_err(|e| format!("gravando país: {e}"))?;
+                    .map_err(|e| format!("writing country: {e}"))?;
                 countries += 1;
             }
         }
@@ -188,14 +189,14 @@ impl Store {
         Ok((pairs, countries))
     }
 
-    /// Carrega o estado no boot. Erro aqui **não é fatal** — o sistema recomeça o
-    /// aprendizado, o que é ruim mas recuperável; não subir seria pior.
+    /// Loads the state at boot. An error here is **not fatal** — the system restarts
+    /// learning, which is bad but recoverable; refusing to start would be worse.
     pub fn load_into(&self, engine: &mut Engine) -> Result<(usize, usize), String> {
         let mut pairs = 0usize;
         let mut st = self
             .conn
             .prepare("SELECT peer, a_number, cur, prev, period, last_seen FROM pair")
-            .map_err(|e| format!("lendo pair: {e}"))?;
+            .map_err(|e| format!("reading pair: {e}"))?;
         let rows = st
             .query_map([], |r| {
                 Ok((
@@ -207,7 +208,7 @@ impl Store {
                     r.get::<_, u32>(5)?,
                 ))
             })
-            .map_err(|e| format!("iterando pair: {e}"))?;
+            .map_err(|e| format!("iterating pair: {e}"))?;
         for row in rows.flatten() {
             let (peer, a_number, cur, prev, period, last_seen) = row;
             let (Ok(peer), Some(cur), Some(prev)) = (
@@ -215,7 +216,7 @@ impl Store {
                 blob_to_words(&cur),
                 blob_to_words(&prev),
             ) else {
-                continue; // linha corrompida: ignora uma, não perde a base inteira
+                continue; // corrupt row: skip one, do not lose the whole database
             };
             engine.import_pair(PairRecord {
                 peer,
@@ -232,7 +233,7 @@ impl Store {
         let mut st = self
             .conn
             .prepare("SELECT peer, country, calls FROM peer_country")
-            .map_err(|e| format!("lendo peer_country: {e}"))?;
+            .map_err(|e| format!("reading peer_country: {e}"))?;
         let rows = st
             .query_map([], |r| {
                 Ok((
@@ -241,7 +242,7 @@ impl Store {
                     r.get::<_, u32>(2)?,
                 ))
             })
-            .map_err(|e| format!("iterando peer_country: {e}"))?;
+            .map_err(|e| format!("iterating peer_country: {e}"))?;
         for (peer, country, calls) in rows.flatten() {
             if let Ok(peer) = peer.parse::<Ipv4Addr>() {
                 engine.import_peer_country(PeerCountryRecord {
@@ -256,8 +257,8 @@ impl Store {
     }
 }
 
-/// Bitmap como 32 bytes little-endian. Formato explícito para que o arquivo seja legível
-/// por outra ferramenta, e não dependa da ordem de bytes da máquina que gravou.
+/// The bitmap as 32 little-endian bytes. An explicit format so the file is readable by
+/// other tools and does not depend on the byte order of the machine that wrote it.
 fn words_to_blob(w: &[u64; 4]) -> Vec<u8> {
     w.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
@@ -294,9 +295,9 @@ mod tests {
     }
 
     #[test]
-    fn o_bitmap_sobrevive_a_um_restart() {
-        // A propriedade que dá sentido ao modo de aprendizado: sem isto, um
-        // `systemctl restart` apagaria 30 dias de linha de base em silêncio.
+    fn the_bitmap_survives_a_restart() {
+        // The property that makes learning mode meaningful: without it a
+        // `systemctl restart` would silently erase 30 days of baseline.
         let path = tmp();
         let _ = std::fs::remove_file(&path);
         let peer = Ipv4Addr::new(10, 0, 0, 5);
@@ -308,15 +309,15 @@ mod tests {
 
         let mut s = Store::open(&path).unwrap();
         let (p, c) = s.checkpoint(&e1).unwrap();
-        assert_eq!(p, 1, "um par");
-        assert!(c >= 2, "dois países");
+        assert_eq!(p, 1, "one pair");
+        assert!(c >= 2, "two countries");
 
-        // Processo novo, memória zerada.
+        // A fresh process, memory wiped.
         let mut e2 = Engine::new(DialPlan::new(["00"]), Mode::Active);
         let s2 = Store::open(&path).unwrap();
         s2.load_into(&mut e2).unwrap();
 
-        // O que já era conhecido continua conhecido — não vira novidade de novo.
+        // What was already known stays known — it does not become novel again.
         let dec = e2.observe(peer, &invite("200", "00551199998888"), t);
         assert_eq!(
             dec,
@@ -324,50 +325,50 @@ mod tests {
                 country: "BR",
                 novel: false
             },
-            "Brasil já era conhecido antes do restart"
+            "Brazil was already known before the restart"
         );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn o_inicio_do_aprendizado_nao_reinicia_a_cada_boot() {
+    fn the_learning_start_does_not_reset_on_every_boot() {
         let path = tmp().with_extension("learn.db");
         let _ = std::fs::remove_file(&path);
         let s = Store::open(&path).unwrap();
-        let primeiro = s.learning_started(1000);
-        assert_eq!(primeiro, 1000);
-        // Um "restart" depois, com relógio bem mais adiante.
+        let first = s.learning_started(1000);
+        assert_eq!(first, 1000);
+        // A "restart" later, with the clock much further along.
         let s2 = Store::open(&path).unwrap();
         assert_eq!(
             s2.learning_started(9_999_999),
             1000,
-            "reiniciar não pode empurrar o fim do aprendizado para frente"
+            "restarting must not push the end of learning further out"
         );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn auditoria_grava_e_poda() {
+    fn the_audit_log_writes_and_prunes() {
         let path = tmp().with_extension("log.db");
         let _ = std::fs::remove_file(&path);
         let s = Store::open(&path).unwrap();
         s.log_block(100, Ipv4Addr::new(1, 2, 3, 4), "user-agent", "pplsip");
-        s.log_block(200, Ipv4Addr::new(5, 6, 7, 8), "injeção", "'");
-        assert_eq!(s.prune_log(150), 1, "só o mais antigo sai");
-        let restantes: i64 = s
+        s.log_block(200, Ipv4Addr::new(5, 6, 7, 8), "injection", "'");
+        assert_eq!(s.prune_log(150), 1, "only the oldest one goes");
+        let remaining: i64 = s
             .conn
             .query_row("SELECT count(*) FROM block_log", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(restantes, 1);
+        assert_eq!(remaining, 1);
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn blob_corrompido_nao_derruba_a_carga() {
+    fn a_corrupt_blob_does_not_break_loading() {
         assert!(blob_to_words(&[0u8; 31]).is_none());
         assert!(blob_to_words(&[]).is_none());
         assert!(blob_to_words(&[0u8; 32]).is_some());
-        // Ida e volta preserva.
+        // Round-trip preserves the value.
         let w = [1u64, 2, 3, 4];
         assert_eq!(blob_to_words(&words_to_blob(&w)), Some(w));
     }
