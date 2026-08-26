@@ -15,6 +15,7 @@
 //!   "peers": { "10.0.0.5": { "intl_prefixes": ["9011"], "bare_e164": false } },
 //!   "signatures": ["MyLocalScanner", "=sipsak"],
 //!   "injection": ["xp_cmdshell"],
+//!   "ignore": ["10.0.0.0/8", "203.0.113.7"],
 //!   "apiban_key": "...",
 //!   "learn_days": 30,
 //!   "block_ttl": 3600
@@ -65,6 +66,12 @@ pub struct Config {
     /// URI injection patterns that add to the built-in ones.
     #[serde(default)]
     pub injection: Vec<String>,
+    /// Addresses and networks that must never be blocked, e.g. `["10.0.0.0/8"]`.
+    ///
+    /// The host's own addresses are always exempt and need no entry here. This is for
+    /// trusted carriers and management ranges — the equivalent of `fail2ban`'s `ignoreip`.
+    #[serde(default)]
+    pub ignore: Vec<String>,
     pub apiban_key: Option<String>,
     pub learn_days: Option<u32>,
     pub block_ttl: Option<u64>,
@@ -127,6 +134,7 @@ mod tests {
               "peers": { "10.0.0.5": { "intl_prefixes": ["9011"], "bare_e164": false } },
               "signatures": ["MyLocalScanner", "=sipsak"],
               "injection": ["xp_cmdshell"],
+              "ignore": ["10.0.0.0/8"],
               "apiban_key": "abc",
               "learn_days": 30,
               "block_ttl": 3600
@@ -136,6 +144,7 @@ mod tests {
         assert_eq!(c.ports.as_deref(), Some(&[5060u16, 5061][..]));
         assert_eq!(c.peers["10.0.0.5"].intl_prefixes, ["9011"]);
         assert_eq!(c.signatures.len(), 2);
+        assert_eq!(c.ignore, ["10.0.0.0/8"]);
         assert_eq!(c.apiban_key.as_deref(), Some("abc"));
     }
 

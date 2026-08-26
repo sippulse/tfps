@@ -1,0 +1,71 @@
+//! Measures the decision path: parse, perimeter, dial plan, country, novelty, verdict.
+//!
+//! No network and no disk — this is the cost of deciding about one INVITE, which is the
+//! number that bounds everything else. Run with:
+//!
+//! ```sh
+//! cargo run --release -p tfps-core --example decision_throughput
+//! ```
+//!
+//! Two workloads, because they exercise different costs: a settled customer reuses one
+//! A-number and hits the fast path, whereas an attacker rotating A-numbers forces a new
+//! pair per call — allocation, hashing, and eventually the pruning ceiling.
+
+use std::net::Ipv4Addr;
+use std::time::Instant;
+
+use tfps_core::dialplan::DialPlan;
+use tfps_core::engine::{Engine, Mode};
+use tfps_core::novelty::Timestamp;
+
+fn invite(from: &str, dialed: &str) -> Vec<u8> {
+    format!(
+        "INVITE sip:{dialed}@pbx.example.com SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 10.0.0.5:5060;branch=z9hG4bK776asdhds\r\n\
+         Max-Forwards: 70\r\n\
+         From: \"Desk\" <sip:{from}@pbx.example.com>;tag=1928301774\r\n\
+         To: <sip:{dialed}@pbx.example.com>\r\n\
+         Call-ID: a84b4c76e66710@pc33.example.com\r\n\
+         CSeq: 314159 INVITE\r\n\
+         Contact: <sip:{from}@10.0.0.5:5060>\r\n\
+         User-Agent: Grandstream GXP2170 1.0.9.135\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: 0\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+fn run(label: &str, n: usize, rotate_a_number: bool) {
+    let mut engine = Engine::new(DialPlan::new(["+", "00", "011", "9011"]), Mode::Active);
+    let peer = Ipv4Addr::new(10, 0, 0, 5);
+    // Build the payloads first: this measures deciding, not formatting strings.
+    let payloads: Vec<Vec<u8>> = (0..n)
+        .map(|i| {
+            let from = if rotate_a_number {
+                format!("{}", 1000 + i)
+            } else {
+                "1001".to_string()
+            };
+            invite(&from, "004420399677 96")
+        })
+        .collect();
+
+    let t0 = Instant::now();
+    for (i, p) in payloads.iter().enumerate() {
+        engine.observe(peer, p, Timestamp(1_800_000_000 + (i / 100) as u32));
+    }
+    let dt = t0.elapsed();
+    let per = dt.as_nanos() as f64 / n as f64;
+    println!(
+        "{label:<28} {n:>9} INVITEs in {:>7.3}s  {:>8.0} ns each  {:>10.0} INVITEs/s/core",
+        dt.as_secs_f64(),
+        per,
+        1e9 / per
+    );
+}
+
+fn main() {
+    println!("decision path only — no capture, no disk, single core\n");
+    run("settled customer", 1_000_000, false);
+    run("A-number rotation attack", 1_000_000, true);
+}

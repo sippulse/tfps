@@ -397,6 +397,55 @@ impl Blocklist {
     }
 }
 
+/// Reads the XDP counters from outside the daemon, for `tfps_ctl stats`.
+///
+/// These are the only **live** numbers a second process can obtain: they live in a kernel
+/// map, whereas everything the daemon counts in userspace lives in its own memory and
+/// reaches the control tool through the database at checkpoint time.
+pub fn live_counters() -> Result<Counters, String> {
+    let id = aya::maps::loaded_maps()
+        .filter_map(Result::ok)
+        .find(|i| i.name_as_str() == Some("counters"))
+        .map(|i| i.id())
+        .ok_or("no loaded eBPF map called `counters` — is tfps running with enforcement?")?;
+    let data = MapData::from_id(id).map_err(|e| format!("opening counters map: {e}"))?;
+    let arr = Array::<_, u64>::try_from(Map::Array(data))
+        .map_err(|e| format!("counters is not an array<u64>: {e}"))?;
+    Ok(Counters {
+        dropped: arr.get(&C_DROPPED, 0).unwrap_or(0),
+        seen: arr.get(&C_SEEN, 0).unwrap_or(0),
+        expired: arr.get(&C_EXPIRED, 0).unwrap_or(0),
+    })
+}
+
+/// Every IPv4 address configured on this host.
+///
+/// Read from `/proc/net/fib_trie`, whose `LOCAL` host routes are exactly the set of
+/// addresses the kernel answers for. The alternative is `getifaddrs`, which means `libc`
+/// and `unsafe`; the workspace forbids the second and this needs neither.
+///
+/// It exists so the system cannot condemn the machine it is defending.
+pub fn local_addresses() -> Vec<Ipv4Addr> {
+    let Ok(text) = std::fs::read_to_string("/proc/net/fib_trie") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut pending: Option<Ipv4Addr> = None;
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("|-- ") {
+            pending = rest.trim().parse().ok();
+        } else if t.contains("32 host LOCAL") {
+            if let Some(ip) = pending.take() {
+                if !out.contains(&ip) {
+                    out.push(ip);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Finds the default-route interface, so the operator need not declare it.
 ///
 /// Consistent with the rest of the product: it discovers on its own, announces what it

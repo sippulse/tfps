@@ -9,6 +9,7 @@
 pub mod country;
 pub mod dialplan;
 pub mod engine;
+pub mod ignore;
 pub mod net;
 pub mod novelty;
 pub mod perimeter;

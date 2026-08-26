@@ -127,6 +127,21 @@ not blocked by their next slip.
 Because it is failures and not volume, **a large NAT is not a problem**: a hundred phones
 behind one address all succeed, and successes do not accumulate.
 
+### APIBAN
+
+Set `apiban_key` and the feed is synced **on a background thread**, never queried per
+INVITE — that synchronous `rest_get()` is what capped the 2023 system at ~26 calls/s and
+froze every decision whenever apiban.org was slow.
+
+Two properties that matter more than they sound:
+
+- **The cursor is persisted.** The feed is consumed by a forward-only ID, so a restart that
+  forgot it would refetch the entire history; one that remembered it but forgot the
+  addresses would come back protecting nothing while looking perfectly healthy. TFPS stores
+  both, re-applies the last 7 days at startup, and says so: `APIBAN restored: 2140
+  addresses`.
+- **The feed respects the ignore list.** A curated third-party list is still not yours.
+
 ### The backstop, and why it has to exist
 
 The rule above needs the softswitch's answer. There are real deployments where it never
@@ -299,6 +314,27 @@ broader policy, and then the blast radius becomes theirs.
 
 ---
 
+### Addresses that are never blocked
+
+The host's **own addresses are always exempt**, with no configuration. This is not
+paranoia: during development a brute-force test fired from the softswitch host itself and
+TFPS condemned the machine it was defending. The blast radius was small — inbound packets
+carry the attacker's source, not yours — but a defence that can shoot its own host will
+eventually do so at three in the morning.
+
+`"ignore": ["10.0.0.0/8", "203.0.113.7"]` adds trusted carriers and management ranges, the
+equivalent of `fail2ban`'s `ignoreip`. Also available as `--ignore CIDR`, repeatable.
+
+An exempt source is still **judged and reported**, only never enforced:
+
+```
+EXEMPT peer=209.38.75.252 reason=auth-failed detail=rejected (ignore list)
+```
+
+Silently skipping the evaluation would hide a compromised trusted peer, which is the case
+where an operator most needs to be told. The exemption also applies to the APIBAN feed: a
+third-party list is curated, but it is not yours.
+
 ## Controlling it — `tfps_ctl`
 
 The counterpart to `fail2ban-client`, and it exists for the same reason: a defence nobody
@@ -308,6 +344,7 @@ that act has to be one command rather than a database session.
 
 ```
 tfps_ctl status                       what is running, what is blocked, how fresh the state is
+tfps_ctl stats                        every counter: kernel drops, traffic mix, blocks by reason
 tfps_ctl banned [--why]               condemned sources, with time left and the reason
 tfps_ctl unban <ip>... | --all        lift a block — takes effect on the next packet
 tfps_ctl ban <ip> [--ttl N]           condemn by hand (default 3600s, 0 = no expiry)
@@ -339,6 +376,22 @@ SOURCE           EXPIRES IN  REASON
 PEER               PAIRS      LAST  TOP COUNTRIES
 149.50.107.48         60        1m  NANP:174 SS:58
 149.50.107.47         59        1m  GB:171
+```
+
+```console
+# tfps_ctl stats
+KERNEL  (live)
+  seen on SIP ports : 21486
+  dropped by XDP    : 9042 (42.1% — gone before sngrep)
+  condemned now     : 2140 (2140 permanent, e.g. the APIBAN feed)
+
+TRAFFIC  (as of the last checkpoint, 2m ago)
+  packets              1879   sip                   768
+  keepalive            1110   not_sip                 1
+  ...
+
+BLOCKS BY REASON
+  last day               48  user-agent:47 auth-failed:1
 ```
 
 **Two sources of truth, and the tool never blurs them.** Blocks live in the kernel map and

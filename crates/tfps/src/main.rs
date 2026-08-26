@@ -21,8 +21,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use socket2::{Domain, Protocol, Socket, Type};
 use tfps_core::dialplan::DialPlan;
 use tfps_core::engine::{Decision, Engine, Mode};
+use tfps_core::ignore::IgnoreList;
 use tfps_core::net::{classify_other, parse_ipv4_udp, tcp_ports, NotUdp};
 use tfps_core::novelty::Timestamp;
+
+/// Where the APIBAN resume point is kept between runs.
+const APIBAN_ID_KEY: &str = "apiban_id";
+
+/// How long a feed address stays applied. APIBAN is a rolling list of hotspots, not a
+/// permanent verdict, and an address that left the feed a week ago has probably been
+/// cleaned up or reassigned.
+const APIBAN_RETENTION_SECS: u32 = 7 * 24 * 3600;
 
 /// `AF_PACKET` on Linux. `socket2` exposes no constant for this family, so the value goes
 /// in directly — it has been stable in the Linux ABI forever.
@@ -49,6 +58,7 @@ struct Args {
     db: PathBuf,
     checkpoint_every: u64,
     apiban_key: Option<String>,
+    ignore: Vec<String>,
     signatures: Option<PathBuf>,
     config: PathBuf,
     /// Per-peer dial plan from the file. Declaring beats learning because it holds on
@@ -80,6 +90,7 @@ impl Default for Args {
             // and checkpointing per packet would be a write bottleneck.
             checkpoint_every: 300,
             apiban_key: None,
+            ignore: Vec::new(),
             signatures: None,
             config: PathBuf::from(config::DEFAULT_PATH),
             peer_plans: Vec::new(),
@@ -110,6 +121,7 @@ USAGE: tfps [options]
       --no-db              do not persist (learning dies on restart)
       --checkpoint-every N seconds between writes      (default: 300)
       --apiban-key KEY     enable APIBAN (optional, in the background)
+      --ignore CIDR        never block this address or network (repeatable)
       --signatures PATH    file that ADDS signatures to the built-in ones
       --config PATH        configuration               (default: /etc/tfps/config.json)
   -h, --help               this help
@@ -166,6 +178,7 @@ fn parse_args() -> Result<Args, String> {
             "--db" => a.db = PathBuf::from(next("--db")?),
             "--no-db" => a.db = PathBuf::new(),
             "--apiban-key" => a.apiban_key = Some(next("--apiban-key")?),
+            "--ignore" => a.ignore.push(next("--ignore")?),
             "--signatures" => a.signatures = Some(PathBuf::from(next("--signatures")?)),
             "--config" => a.config = PathBuf::from(next("--config")?),
             "--checkpoint-every" => {
@@ -208,6 +221,9 @@ fn apply_config(a: &mut Args, c: &config::Config) {
     if !a.given.contains("--iface") && c.iface.is_some() {
         a.iface = c.iface.clone();
     }
+    // The file adds to the command line here rather than replacing it: both are the
+    // operator's own words, and dropping either would be a surprise.
+    a.ignore.extend(c.ignore.iter().cloned());
     if !a.given.contains("--apiban-key") && c.apiban_key.is_some() {
         a.apiban_key = c.apiban_key.clone();
     }
@@ -405,6 +421,25 @@ fn main() -> ExitCode {
          {inj_int} injection patterns (+{inj_ext})"
     );
 
+    // Never condemn the machine we are defending. This is not configurable, because the
+    // one time it happened during development it was a test firing from the host itself —
+    // and no operator would have guessed to switch it on beforehand.
+    let mut ignore = IgnoreList::new();
+    let local = xdp::local_addresses();
+    for ip in &local {
+        let _ = ignore.add(&ip.to_string());
+    }
+    for entry in &args.ignore {
+        if let Err(e) = ignore.add(entry) {
+            eprintln!("WARNING: ignoring malformed ignore entry — {e}");
+        }
+    }
+    say!(
+        "  never blocked     : {} local address(es) + {} declared",
+        local.len(),
+        ignore.len() - local.len()
+    );
+
     let sock = match Socket::new(
         Domain::from(AF_PACKET),
         Type::DGRAM,
@@ -436,12 +471,41 @@ fn main() -> ExitCode {
     // APIBAN on its own thread: HTTP never touches the packet path. It was the synchronous
     // `rest_get()` per INVITE that capped the 2023 TFPS at ~26 calls/s.
     let apiban_rx = args.apiban_key.as_ref().map(|k| {
-        say!("  APIBAN            : enabled, syncing in the background");
-        apiban::spawn(k.clone(), None)
+        // Resume where the last run stopped. Without this the whole feed is refetched on
+        // every restart — the module documents the resume, so not wiring it up would have
+        // been a promise kept only in a comment.
+        let resume = db.as_ref().and_then(|s| s.meta_get(APIBAN_ID_KEY));
+        match &resume {
+            Some(id) => say!("  APIBAN            : enabled, resuming from id {id}"),
+            None => say!("  APIBAN            : enabled, first sync (whole feed)"),
+        }
+        apiban::spawn(k.clone(), resume)
     });
 
-    let mut nothing_seen_warned = false;
+    // Re-apply what the feed already gave us. The map died with the previous process and
+    // the feed cursor only moves forward, so without this the integration would come back
+    // up protecting nothing — and would look perfectly healthy while doing it.
     let mut apiban_total = 0u64;
+    if args.apiban_key.is_some() {
+        if let (Some(s), Some(e)) = (db.as_ref(), enforcer.as_mut()) {
+            match s.apiban_since(start.0.saturating_sub(APIBAN_RETENTION_SECS)) {
+                Ok(ips) if !ips.is_empty() => {
+                    for ip in ips.iter().filter(|ip| !ignore.contains(**ip)) {
+                        let _ = e.block(*ip, 0);
+                    }
+                    apiban_total = ips.len() as u64;
+                    say!(
+                        "  APIBAN restored   : {} addresses from the last 7 days",
+                        ips.len()
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => eprintln!("WARNING: could not restore the APIBAN list: {err}"),
+            }
+        }
+    }
+
+    let mut nothing_seen_warned = false;
     let mut db = db;
     let mut last_checkpoint = start.0;
     // Blind spots: counted so they can become a warning. Ignoring them silently would
@@ -505,7 +569,11 @@ fn main() -> ExitCode {
                         Decision::AuthAbuse { .. } => Some(("auth-volume", "no-answer")),
                         _ => None,
                     };
-                    if let (Some((kind, detail)), Some(e)) = (reason, enforcer.as_mut()) {
+                    if let (Some((kind, detail)), true) = (reason, ignore.contains(subject)) {
+                        // Judged, reported, not enforced. Staying silent here would hide a
+                        // compromised trusted peer, which is when it matters most.
+                        say!("EXEMPT peer={subject} reason={kind} detail={detail} (ignore list)");
+                    } else if let (Some((kind, detail)), Some(e)) = (reason, enforcer.as_mut()) {
                         match e.block(subject, args.block_ttl) {
                             Ok(()) => {
                                 say!(
@@ -555,7 +623,23 @@ fn main() -> ExitCode {
         if let (Some(rx), Some(e)) = (apiban_rx.as_ref(), enforcer.as_mut()) {
             while let Ok(batch) = rx.try_recv() {
                 let n = batch.ips.len();
+                // Persist the resume point before the addresses: refetching a batch is
+                // harmless, whereas losing the id means starting the feed over.
+                if let (Some(id), Some(s)) = (&batch.next_id, db.as_ref()) {
+                    s.meta_set(APIBAN_ID_KEY, id);
+                }
+                if let Some(s) = db.as_mut() {
+                    if let Err(err) = s.apiban_add(&batch.ips, t.0) {
+                        eprintln!("WARNING: could not persist the APIBAN batch: {err}");
+                    }
+                }
                 for ip in batch.ips {
+                    // A third-party feed listing your own range is exactly what the ignore
+                    // list is for: it is curated, but it is not yours.
+                    if ignore.contains(ip) {
+                        say!("APIBAN: {ip} is on the ignore list, not blocked");
+                        continue;
+                    }
                     // No expiry: the APIBAN list is curated, and re-applying it hourly
                     // would only generate pointless writes.
                     let _ = e.block(ip, 0);
@@ -571,11 +655,18 @@ fn main() -> ExitCode {
         if let Some(s) = db.as_mut() {
             if t.0.saturating_sub(last_checkpoint) >= args.checkpoint_every.max(30) as u32 {
                 last_checkpoint = t.0;
+                // The control tool runs in another process and cannot read these
+                // counters from memory. Writing them at checkpoint is what lets
+                // `tfps_ctl stats` show the whole picture instead of only the kernel half.
+                s.meta_set("stats", &counter_line(&engine.stats));
+                s.meta_set("stats_ts", &t.0.to_string());
+                s.meta_set("started_at", &start.0.to_string());
                 match s.checkpoint(&engine) {
                     Ok((p, _)) => {
                         // A 90-day audit window — more than twice the bitmap ageing
                         // window, and enough to investigate.
                         s.prune_log(t.0.saturating_sub(90 * 24 * 3600));
+                        s.apiban_prune(t.0.saturating_sub(APIBAN_RETENTION_SECS));
                         if args.verbose {
                             say!("    checkpoint: {p} pairs written");
                         }
@@ -695,6 +786,39 @@ fn report(dec: &Decision, peer: Ipv4Addr, verbose: bool) {
         }
         _ => {}
     }
+}
+
+/// The userspace counters as `key=value` pairs, for the database.
+///
+/// Hand-rolled rather than serialised: the reader is one function in `tfps_ctl`, the format
+/// is greppable by eye in `sqlite3`, and a new counter costs one line here.
+fn counter_line(s: &tfps_core::engine::Stats) -> String {
+    [
+        ("packets", s.packets),
+        ("sip", s.sip_parsed),
+        ("responses", s.responses),
+        ("keepalive", s.keepalives),
+        ("not_sip", s.not_sip),
+        ("noise", s.noise),
+        ("injection", s.injections),
+        ("auth_att", s.auth_attempts),
+        ("auth_fail", s.auth_failures),
+        ("auth_ok", s.auth_ok),
+        ("auth_chal", s.digest_challenges),
+        ("auth_volume", s.auth_abuse),
+        ("invites", s.invites),
+        ("intl", s.international),
+        ("unknown_country", s.unknown_country),
+        ("first_time", s.novel),
+        ("blocks", s.blocks),
+        ("would_block", s.would_block),
+        ("pairs_dropped", s.pairs_dropped),
+        ("peers_dropped", s.peers_dropped),
+    ]
+    .iter()
+    .map(|(k, v)| format!("{k}={v}"))
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode) {

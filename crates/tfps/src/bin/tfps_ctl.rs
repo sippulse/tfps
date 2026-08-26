@@ -30,6 +30,7 @@ fn usage() -> String {
 USAGE: tfps_ctl <command> [options]
 
   status                       what is running, what is blocked, how fresh the state is
+  stats                        every counter: kernel drops, traffic mix, what got blocked
   banned [--why]               list condemned sources, with time left
   unban <ip>... | --all        lift a block. The precision measure of this product
   ban <ip> [--ttl N]           condemn a source by hand (default ttl: 3600s, 0 = forever)
@@ -141,6 +142,7 @@ fn main() -> ExitCode {
 
     let r = match args.command.as_str() {
         "status" => status(&args),
+        "stats" => stats(&args),
         "banned" => banned(&args),
         "unban" => unban(&args),
         "ban" => ban(&args),
@@ -191,6 +193,90 @@ fn status(args: &Args) -> Result<(), String> {
             say!("enforcement       : unreachable — {e}");
             say!("                    (learned state above is still readable)");
         }
+    }
+    Ok(())
+}
+
+/// The whole picture, from the two places it lives.
+///
+/// **The kernel half is live; the userspace half is a snapshot.** They are printed apart,
+/// with the snapshot's age stated, because presenting a five-minute-old packet count beside
+/// a current drop count as if both were now would be the kind of quiet inaccuracy this
+/// project exists to avoid.
+fn stats(args: &Args) -> Result<(), String> {
+    match tfps::xdp::live_counters() {
+        Ok(c) => {
+            let share = if c.seen > 0 {
+                100.0 * c.dropped as f64 / c.seen as f64
+            } else {
+                0.0
+            };
+            say!("KERNEL  (live)");
+            say!("  seen on SIP ports : {}", c.seen);
+            say!(
+                "  dropped by XDP    : {} ({share:.1}% — gone before sngrep)",
+                c.dropped
+            );
+            say!("  blocks expired    : {}", c.expired);
+        }
+        Err(e) => say!("KERNEL  (live)\n  unavailable — {e}"),
+    }
+    if let Ok(b) = Blocklist::open(args.map.as_deref()) {
+        let e = b.entries();
+        say!(
+            "  condemned now     : {} ({} permanent, e.g. the APIBAN feed)",
+            e.len(),
+            e.iter().filter(|(_, u)| *u == 0).count()
+        );
+    }
+
+    let s = Store::open_readonly(&args.db)?;
+    let now = now();
+    match (s.meta_get("stats"), s.meta_get("stats_ts")) {
+        (Some(line), ts) => {
+            let age = ts
+                .and_then(|t| t.parse::<u32>().ok())
+                .map(|t| ago(now.saturating_sub(t)))
+                .unwrap_or_else(|| "unknown".into());
+            say!("\nTRAFFIC  (as of the last checkpoint, {age} ago)");
+            // Two columns, so twenty counters stay readable in a terminal.
+            let pairs: Vec<(&str, &str)> = line
+                .split_whitespace()
+                .filter_map(|kv| kv.split_once('='))
+                .collect();
+            for row in pairs.chunks(2) {
+                let cell = |(k, v): &(&str, &str)| format!("{k:<16} {v:>10}");
+                say!(
+                    "  {}   {}",
+                    cell(&row[0]),
+                    row.get(1).map(cell).unwrap_or_default()
+                );
+            }
+        }
+        _ => say!("\nTRAFFIC\n  no checkpoint yet — the daemon writes these every 5 minutes"),
+    }
+    if let Some(t) = s.meta_get("started_at").and_then(|v| v.parse::<u32>().ok()) {
+        say!("  {:<16} {:>10}", "running for", ago(now.saturating_sub(t)));
+    }
+
+    let (pairs, peers, _) = s.totals()?;
+    let (countries, calls) = s.country_spread()?;
+    say!("\nLEARNED");
+    say!("  {:<16} {:>10}", "pairs", pairs);
+    say!("  {:<16} {:>10}", "peers", peers);
+    say!("  {:<16} {:>10}", "countries", countries);
+    say!("  {:<16} {:>10}", "intl calls", calls);
+
+    say!("\nBLOCKS BY REASON");
+    for (label, since) in [
+        ("last hour", 3600u32),
+        ("last day", 86400),
+        ("last week", 604_800),
+    ] {
+        let rows = s.blocks_by_reason(now.saturating_sub(since))?;
+        let total: u32 = rows.iter().map(|(_, n)| n).sum();
+        let detail: Vec<String> = rows.iter().map(|(r, n)| format!("{r}:{n}")).collect();
+        say!("  {label:<16} {total:>10}  {}", detail.join(" "));
     }
     Ok(())
 }

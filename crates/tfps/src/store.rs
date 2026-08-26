@@ -169,7 +169,16 @@ impl Store {
                      reason TEXT    NOT NULL,
                      detail TEXT    NOT NULL
                  );
-                 CREATE INDEX IF NOT EXISTS block_log_ts ON block_log (ts);",
+                 CREATE INDEX IF NOT EXISTS block_log_ts ON block_log (ts);
+                 -- The APIBAN feed, kept because it cannot rebuild itself from traffic.
+                 -- Perimeter state normally dies with the process and is relearned in
+                 -- minutes (`SPEC.md` 10); this is the exception, since the feed is
+                 -- consumed through a forward-only cursor. Losing it would mean the
+                 -- integration silently protects nothing after a restart.
+                 CREATE TABLE IF NOT EXISTS apiban_ip (
+                     ip TEXT PRIMARY KEY,
+                     ts INTEGER NOT NULL
+                 );",
             )
             .map_err(|e| format!("creating schema: {e}"))?;
         self.conn
@@ -198,6 +207,63 @@ impl Store {
             params![default_now.to_string()],
         );
         default_now
+    }
+
+    /// Records addresses from the feed, so they can be re-applied after a restart.
+    pub fn apiban_add(&mut self, ips: &[Ipv4Addr], ts: u32) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("transaction: {e}"))?;
+        {
+            let mut ins = tx
+                .prepare_cached("INSERT OR REPLACE INTO apiban_ip (ip, ts) VALUES (?1, ?2)")
+                .map_err(|e| format!("preparing apiban_ip: {e}"))?;
+            for ip in ips {
+                ins.execute(params![ip.to_string(), ts])
+                    .map_err(|e| format!("writing apiban_ip: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| format!("commit: {e}"))
+    }
+
+    /// The feed addresses still worth applying. `since` bounds how stale an entry may be —
+    /// APIBAN is a rolling list of hotspots, not a permanent verdict on an address.
+    pub fn apiban_since(&self, since: u32) -> Result<Vec<Ipv4Addr>, String> {
+        let mut st = self
+            .conn
+            .prepare("SELECT ip FROM apiban_ip WHERE ts >= ?1")
+            .map_err(|e| format!("reading apiban_ip: {e}"))?;
+        let rows = st
+            .query_map(params![since], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("iterating apiban_ip: {e}"))?;
+        Ok(rows.flatten().filter_map(|s| s.parse().ok()).collect())
+    }
+
+    /// Drops feed entries older than the retention window.
+    pub fn apiban_prune(&self, older_than: u32) -> usize {
+        self.conn
+            .execute("DELETE FROM apiban_ip WHERE ts < ?1", params![older_than])
+            .unwrap_or(0)
+    }
+
+    /// Reads a small named value. Used for anything that has to survive a restart but is
+    /// not learning state — the APIBAN resume point, for instance.
+    pub fn meta_get(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row("SELECT v FROM meta WHERE k = ?1", params![key], |r| {
+                r.get(0)
+            })
+            .ok()
+    }
+
+    /// Writes one. Failure is not fatal: the worst case is refetching a feed from the
+    /// start, which costs bandwidth, not correctness.
+    pub fn meta_set(&self, key: &str, value: &str) {
+        let _ = self.conn.execute(
+            "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, ?2)",
+            params![key, value],
+        );
     }
 
     pub fn log_block(&self, ts: u32, ip: Ipv4Addr, reason: &str, detail: &str) {
@@ -317,6 +383,33 @@ impl Store {
             })
             .map_err(|e| format!("iterating block_log: {e}"))?;
         Ok(rows.flatten().collect())
+    }
+
+    /// How many blocks happened since `ts`, grouped by reason. The shape of what the
+    /// perimeter is actually catching, which one line of the periodic report cannot show.
+    pub fn blocks_by_reason(&self, since: u32) -> Result<Vec<(String, u32)>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT reason, COUNT(*) FROM block_log WHERE ts >= ?1
+                 GROUP BY reason ORDER BY COUNT(*) DESC",
+            )
+            .map_err(|e| format!("reading block_log: {e}"))?;
+        let rows = st
+            .query_map(params![since], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| format!("iterating block_log: {e}"))?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Distinct destination countries across every peer — the breadth of the baseline.
+    pub fn country_spread(&self) -> Result<(u32, u32), String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(DISTINCT country), COALESCE(SUM(calls), 0) FROM peer_country",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| format!("reading peer_country: {e}"))
     }
 
     /// Totals for the status line: pairs, peers, and the newest thing the file knows about
@@ -500,6 +593,61 @@ mod tests {
     fn invite(from: &str, dialed: &str) -> Vec<u8> {
         format!("INVITE sip:{dialed}@pbx SIP/2.0\r\nFrom: <sip:{from}@pbx>;tag=t\r\n\r\n")
             .into_bytes()
+    }
+
+    #[test]
+    fn the_apiban_list_survives_a_restart_and_ages_out() {
+        // The feed is consumed through a forward-only cursor, so what it already gave us
+        // cannot be fetched again. Losing it on restart would leave the integration
+        // looking healthy while protecting nothing.
+        let dir = std::env::temp_dir().join(format!("tfps-apiban-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("t.db");
+        let day = 86_400u32;
+        let now = 100 * day;
+        {
+            let mut s = Store::open(&path).unwrap();
+            s.apiban_add(&[Ipv4Addr::new(45, 134, 144, 130)], now - 2 * day)
+                .unwrap();
+            s.apiban_add(&[Ipv4Addr::new(185, 243, 5, 75)], now - 30 * day)
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let fresh = s.apiban_since(now - 7 * day).unwrap();
+        assert_eq!(
+            fresh,
+            vec![Ipv4Addr::new(45, 134, 144, 130)],
+            "stale entries stay out"
+        );
+        assert_eq!(
+            s.apiban_since(0).unwrap().len(),
+            2,
+            "but they are still on file"
+        );
+        assert_eq!(s.apiban_prune(now - 7 * day), 1);
+        assert_eq!(
+            s.apiban_since(0).unwrap().len(),
+            1,
+            "pruning removed the old one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn meta_survives_a_reopen() {
+        // The APIBAN resume point lives here. Losing it means refetching the whole feed on
+        // every restart, which is what this replaced.
+        let dir = std::env::temp_dir().join(format!("tfps-meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("t.db");
+        {
+            let s = Store::open(&path).unwrap();
+            assert_eq!(s.meta_get("apiban_id"), None, "absent before it is written");
+            s.meta_set("apiban_id", "1698425647");
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.meta_get("apiban_id").as_deref(), Some("1698425647"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
