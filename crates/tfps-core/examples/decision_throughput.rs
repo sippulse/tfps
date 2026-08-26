@@ -35,11 +35,19 @@ fn invite(from: &str, dialed: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Distinct payloads held at once.
+///
+/// Bounded deliberately: an earlier version built one payload per iteration and was
+/// OOM-killed on a 1 vCPU droplet, which is exactly the class of machine this is supposed
+/// to run on. The pool still exceeds the 50,000 pairs-per-peer ceiling, so the rotation
+/// workload reaches the pruning path it is meant to exercise.
+const POOL: usize = 65_536;
+
 fn run(label: &str, n: usize, rotate_a_number: bool) {
     let mut engine = Engine::new(DialPlan::new(["+", "00", "011", "9011"]), Mode::Active);
     let peer = Ipv4Addr::new(10, 0, 0, 5);
     // Build the payloads first: this measures deciding, not formatting strings.
-    let payloads: Vec<Vec<u8>> = (0..n)
+    let payloads: Vec<Vec<u8>> = (0..POOL.min(n))
         .map(|i| {
             let from = if rotate_a_number {
                 format!("{}", 1000 + i)
@@ -51,7 +59,8 @@ fn run(label: &str, n: usize, rotate_a_number: bool) {
         .collect();
 
     let t0 = Instant::now();
-    for (i, p) in payloads.iter().enumerate() {
+    for i in 0..n {
+        let p = &payloads[i % payloads.len()];
         engine.observe(peer, p, Timestamp(1_800_000_000 + (i / 100) as u32));
     }
     let dt = t0.elapsed();
