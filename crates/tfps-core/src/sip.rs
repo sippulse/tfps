@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn non_sip_is_rejected_without_panicking() {
-        assert!(parse_request(b"lixo binario \xff\xfe").is_none());
+        assert!(parse_request(b"binary junk \xff\xfe").is_none());
         assert!(parse_request(b"GET / HTTP/1.1\r\n\r\n").is_none());
         assert!(parse_request(b"").is_none());
         assert!(parse_request(b"INVITE\r\n").is_none());

@@ -34,6 +34,76 @@ pub const DEFAULT_PATH: &str = "/var/lib/tfps/tfps.db";
 /// not.
 const SCHEMA: i64 = 1;
 
+/// A learned pair, as stored.
+pub struct PairRow {
+    pub peer: String,
+    pub a_number: String,
+    pub cur: Vec<u8>,
+    pub prev: Vec<u8>,
+    pub period: u32,
+    pub last_seen: u32,
+}
+
+impl PairRow {
+    /// The countries this pair has called, as labels.
+    pub fn countries(&self) -> Vec<&'static str> {
+        match (blob_to_words(&self.cur), blob_to_words(&self.prev)) {
+            (Some(c), Some(p)) => tfps_core::country::decode_bitmap(c, p),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// One audit row.
+pub struct BlockRow {
+    pub ts: u32,
+    pub ip: String,
+    pub reason: String,
+    pub detail: String,
+}
+
+/// How an operator narrows a search.
+pub struct PairFilter<'a> {
+    pub peer: Option<&'a str>,
+    /// Substring of the A-number, because an operator searching for an extension rarely
+    /// knows the exact string that was in the `From` header.
+    pub a_number: Option<&'a str>,
+    /// Only pairs that have called this country (ISO label, case-insensitive).
+    pub country: Option<&'a str>,
+    pub limit: usize,
+}
+
+impl Default for PairFilter<'_> {
+    fn default() -> Self {
+        Self {
+            peer: None,
+            a_number: None,
+            country: None,
+            limit: 50,
+        }
+    }
+}
+
+impl PairFilter<'_> {
+    fn matches(&self, r: &PairRow) -> bool {
+        if self.peer.is_some_and(|p| r.peer != p) {
+            return false;
+        }
+        if self
+            .a_number
+            .is_some_and(|a| !r.a_number.to_lowercase().contains(&a.to_lowercase()))
+        {
+            return false;
+        }
+        if let Some(c) = self.country {
+            if !r.countries().iter().any(|x| x.eq_ignore_ascii_case(c)) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -143,6 +213,144 @@ impl Store {
         self.conn
             .execute("DELETE FROM block_log WHERE ts < ?1", params![older_than])
             .unwrap_or(0)
+    }
+
+    /// Opens the database **read-only**, for the control tool.
+    ///
+    /// Read-only on purpose: `tfps_ctl` inspecting state must not be able to corrupt what
+    /// the daemon is writing, and WAL lets it read while a checkpoint is in flight.
+    pub fn open_readonly(path: &Path) -> Result<Self, String> {
+        use rusqlite::OpenFlags;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| format!("opening {} read-only: {e}", path.display()))?;
+        Ok(Self { conn })
+    }
+
+    /// Learned pairs, filtered the way an operator searches: by peer, by A-number
+    /// substring, or by a country the pair has called.
+    pub fn find_pairs(&self, f: &PairFilter<'_>) -> Result<Vec<PairRow>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT peer, a_number, cur, prev, period, last_seen FROM pair
+                 ORDER BY last_seen DESC",
+            )
+            .map_err(|e| format!("reading pair: {e}"))?;
+        let rows = st
+            .query_map([], |r| {
+                Ok(PairRow {
+                    peer: r.get(0)?,
+                    a_number: r.get(1)?,
+                    cur: r.get::<_, Vec<u8>>(2)?,
+                    prev: r.get::<_, Vec<u8>>(3)?,
+                    period: r.get(4)?,
+                    last_seen: r.get(5)?,
+                })
+            })
+            .map_err(|e| format!("iterating pair: {e}"))?;
+        Ok(rows
+            .flatten()
+            .filter(|r| f.matches(r))
+            .take(f.limit)
+            .collect())
+    }
+
+    /// Per-peer totals: how many pairs, and when it was last heard from.
+    pub fn peers(&self) -> Result<Vec<(String, u32, u32)>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT peer, COUNT(*), MAX(last_seen) FROM pair
+                 GROUP BY peer ORDER BY COUNT(*) DESC",
+            )
+            .map_err(|e| format!("reading peers: {e}"))?;
+        let rows = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| format!("iterating peers: {e}"))?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// A peer's country frequencies — the prior a new pair inherits, and the most direct
+    /// answer to "where does this customer actually call?".
+    pub fn peer_countries(&self, peer: &str) -> Result<Vec<(u16, u32)>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT country, calls FROM peer_country WHERE peer = ?1
+                 ORDER BY calls DESC",
+            )
+            .map_err(|e| format!("reading peer_country: {e}"))?;
+        let rows = st
+            .query_map(params![peer], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| format!("iterating peer_country: {e}"))?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// The block audit log, newest first.
+    pub fn blocks(&self, limit: usize, ip: Option<&str>) -> Result<Vec<BlockRow>, String> {
+        let (sql, args): (&str, Vec<String>) = match ip {
+            Some(v) => (
+                "SELECT ts, ip, reason, detail FROM block_log WHERE ip = ?1
+                 ORDER BY ts DESC LIMIT ?2",
+                vec![v.to_string(), limit.to_string()],
+            ),
+            None => (
+                "SELECT ts, ip, reason, detail FROM block_log ORDER BY ts DESC LIMIT ?1",
+                vec![limit.to_string()],
+            ),
+        };
+        let mut st = self
+            .conn
+            .prepare(sql)
+            .map_err(|e| format!("reading block_log: {e}"))?;
+        let rows = st
+            .query_map(rusqlite::params_from_iter(args), |r| {
+                Ok(BlockRow {
+                    ts: r.get(0)?,
+                    ip: r.get(1)?,
+                    reason: r.get(2)?,
+                    detail: r.get(3)?,
+                })
+            })
+            .map_err(|e| format!("iterating block_log: {e}"))?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Totals for the status line: pairs, peers, and the newest thing the file knows about
+    /// — which is how stale the snapshot is.
+    pub fn totals(&self) -> Result<(u32, u32, u32), String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT peer), COALESCE(MAX(last_seen), 0) FROM pair",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|e| format!("reading totals: {e}"))
+    }
+
+    /// Forgets learned state for a peer, or for one pair of it.
+    ///
+    /// **Only meaningful with the daemon stopped.** A running process holds the working set
+    /// in memory and would write it straight back at the next checkpoint, so the caller has
+    /// to establish that before offering this.
+    pub fn forget(&self, peer: &str, a_number: Option<&str>) -> Result<usize, String> {
+        let n = match a_number {
+            Some(a) => self.conn.execute(
+                "DELETE FROM pair WHERE peer = ?1 AND a_number = ?2",
+                params![peer, a],
+            ),
+            None => {
+                let _ = self
+                    .conn
+                    .execute("DELETE FROM peer_country WHERE peer = ?1", params![peer]);
+                self.conn
+                    .execute("DELETE FROM pair WHERE peer = ?1", params![peer])
+            }
+        };
+        n.map_err(|e| format!("deleting: {e}"))
     }
 
     /// Writes the learning state. Called at checkpoint time, never per packet.

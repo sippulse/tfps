@@ -299,6 +299,65 @@ broader policy, and then the blast radius becomes theirs.
 
 ---
 
+## Controlling it — `tfps_ctl`
+
+The counterpart to `fail2ban-client`, and it exists for the same reason: a defence nobody
+can inspect is a defence nobody trusts. It also serves a requirement — with no labelled
+data, **how often an operator unbans is the only measure of precision this system has**, so
+that act has to be one command rather than a database session.
+
+```
+tfps_ctl status                       what is running, what is blocked, how fresh the state is
+tfps_ctl banned [--why]               condemned sources, with time left and the reason
+tfps_ctl unban <ip>... | --all        lift a block — takes effect on the next packet
+tfps_ctl ban <ip> [--ttl N]           condemn by hand (default 3600s, 0 = no expiry)
+tfps_ctl pairs [filters]              search learned (peer, A-number) pairs
+tfps_ctl pair <peer> <a-number>       everything known about one pair
+tfps_ctl peers                        peers, pair counts, and where they call
+tfps_ctl countries <peer>             that peer's destinations by volume
+tfps_ctl log [--limit N] [--ip IP]    the block audit log, newest first
+tfps_ctl forget <peer> [--a NUMBER]   erase learned state (requires tfps stopped)
+```
+
+Filters for `pairs`: `--peer IP`, `--a TEXT` (substring of the A-number), `--country ISO`,
+`--limit N`.
+
+```console
+# tfps_ctl status
+database          : /var/lib/tfps/tfps.db
+learned state     : 293 pairs across 8 peers
+last checkpoint   : 35s ago (state is a snapshot, not live)
+enforcement       : own map id 7478
+blocked now       : 3 (0 without expiry)
+
+# tfps_ctl banned --why
+SOURCE           EXPIRES IN  REASON
+51.75.106.116           49m  user-agent (pplsip)
+162.217.103.70          51m  user-agent (friendly)
+
+# tfps_ctl peers
+PEER               PAIRS      LAST  TOP COUNTRIES
+149.50.107.48         60        1m  NANP:174 SS:58
+149.50.107.47         59        1m  GB:171
+```
+
+**Two sources of truth, and the tool never blurs them.** Blocks live in the kernel map and
+are read and written directly, so an unban applies immediately. Learned state lives in
+SQLite and is written at checkpoint, so `status` reports **how old that snapshot is**
+instead of letting anyone draw conclusions from stale rows.
+
+Three deliberate refusals:
+
+- Unbanning an address that was not blocked says exactly that, rather than reporting
+  success — otherwise an operator who mistypes stops looking for the real block.
+- If two loaded eBPF maps share the name, it names the ambiguity instead of picking one:
+  guessing would edit somebody else's enforcement plane.
+- `forget` refuses while the daemon is running, because the in-memory working set would be
+  written straight back at the next checkpoint and quietly undo it.
+
+Reading blocks needs `CAP_BPF` (run as root); reading learned state only needs the
+database file.
+
 ## Reading the report
 
 ```
@@ -395,6 +454,7 @@ signal fires.
 
 - [`SPEC.md`](SPEC.md) — the architecture and the decisions, with the reasoning behind each
 - [`DETECTION.md`](DETECTION.md) — how a packet is examined: every test, in the order the code applies them
+- `tfps_ctl --help` — the control tool, above
 - [`CONTEXT.md`](CONTEXT.md) — the vocabulary, normative for code and documentation
 
 ## License

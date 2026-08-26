@@ -831,7 +831,7 @@ mod tests {
             e.observe(peer(), &invite(&format!("r{i}"), "00551199998888"), t(0));
         }
         assert!(e.approx_state_bytes() > 0);
-        // O teto absoluto precisa caber no MemoryMax=192M da unidade systemd.
+        // The absolute ceiling has to fit inside the unit's MemoryMax=192M.
         let ceiling = MAX_PEERS * 256 + MAX_PEERS * MAX_PAIRS_PER_PEER * 160;
         assert!(ceiling > 0); // documents that the theoretical worst case is huge:
                               // which is why the pair ceiling is PER PEER and the peer ceiling is low — in

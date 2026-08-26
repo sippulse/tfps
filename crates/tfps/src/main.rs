@@ -9,10 +9,7 @@
 //!
 //! Needs `CAP_NET_RAW` (capture), plus `CAP_BPF` and `CAP_NET_ADMIN` (XDP).
 
-mod apiban;
-mod config;
-mod store;
-mod xdp;
+use tfps::{apiban, config, say, store, xdp};
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -130,7 +127,7 @@ fn parse_args() -> Result<Args, String> {
         let mut next = |name: &str| it.next().ok_or_else(|| format!("{name} requires a value"));
         match arg.as_str() {
             "-h" | "--help" => {
-                print!("{}", usage());
+                say!("{}", usage().trim_end());
                 std::process::exit(0);
             }
             "--ports" => {
@@ -262,7 +259,7 @@ fn main() -> ExitCode {
     match config::load(&args.config) {
         config::Loaded::File(c, path) => {
             apply_config(&mut args, &c);
-            println!("  configuration     : {}", path.display());
+            say!("  configuration     : {}", path.display());
             // File signatures are applied after the engine exists; kept here until then.
             extra_signatures = c.signatures.clone();
             extra_injection = c.injection.clone();
@@ -321,7 +318,7 @@ fn main() -> ExitCode {
         engine.declare_dial_plan(*ip, plan.clone());
     }
     if !args.peer_plans.is_empty() {
-        println!("  declared plans    : {} peers", args.peer_plans.len());
+        say!("  declared plans    : {} peers", args.peer_plans.len());
     }
     if let Some(path) = args.signatures.as_ref() {
         match std::fs::read_to_string(path) {
@@ -340,7 +337,7 @@ fn main() -> ExitCode {
                         }
                     }
                 }
-                println!(
+                say!(
                     "  extra signatures  : {ua} user-agent, {inj} injection ({})",
                     path.display()
                 );
@@ -354,21 +351,21 @@ fn main() -> ExitCode {
     if let Some(d) = db.as_ref() {
         match d.load_into(&mut engine) {
             Ok((p, c)) if p > 0 || c > 0 => {
-                println!("  state restored    : {p} pairs, {c} peer-country rows");
+                say!("  state restored    : {p} pairs, {c} peer-country rows");
             }
-            Ok(_) => println!("  state restored    : empty database (first run)"),
+            Ok(_) => say!("  state restored    : empty database (first run)"),
             Err(e) => eprintln!("WARNING: could not restore state: {e}"),
         }
     }
 
-    println!("tfps {} — starting", env!("CARGO_PKG_VERSION"));
-    println!("  watched ports     : {:?}", args.ports);
-    println!("  intl prefixes     : {:?}", args.intl_prefixes);
+    say!("tfps {} — starting", env!("CARGO_PKG_VERSION"));
+    say!("  watched ports     : {:?}", args.ports);
+    say!("  intl prefixes     : {:?}", args.intl_prefixes);
     match mode {
         // The mode is announced loudly and repeated in reports: this project's stated
         // difference from fail2ban is that the incumbent fails silently (`SPEC.md` §12).
-        Mode::Active => println!("  mode              : ACTIVE — would block right away"),
-        Mode::Learning { until } => println!(
+        Mode::Active => say!("  mode              : ACTIVE — would block right away"),
+        Mode::Learning { until } => say!(
             "  mode              : LEARNING for {} days (until {}), does NOT block",
             args.learn_secs / 86400,
             until.0
@@ -376,7 +373,7 @@ fn main() -> ExitCode {
     }
     // Enforcement: load XDP, or say so loudly and carry on observing. Never pretend.
     let mut enforcer = if args.no_enforce {
-        println!("  enforcement       : OFF via --no-enforce (observe only)");
+        say!("  enforcement       : OFF via --no-enforce (observe only)");
         None
     } else {
         let iface = args
@@ -386,11 +383,11 @@ fn main() -> ExitCode {
             .unwrap_or_else(|| "eth0".to_string());
         match xdp::Enforcer::attach(&args.shared_map, &args.xdp_obj, &iface, &args.ports) {
             Ok(e) => {
-                println!(
+                say!(
                     "  enforcement       : {} — garbage vanishes from sngrep",
                     e.mode
                 );
-                println!("  block expires in  : {}s", args.block_ttl);
+                say!("  block expires in  : {}s", args.block_ttl);
                 Some(e)
             }
             Err(err) => {
@@ -398,12 +395,12 @@ fn main() -> ExitCode {
                 // without protecting is exactly this project's criticism of the incumbent.
                 eprintln!("ALARM: enforcement INACTIVE — {err}");
                 eprintln!("       the system will OBSERVE but will NOT block anything.");
-                println!("  enforcement       : INACTIVE (see the alarm above)");
+                say!("  enforcement       : INACTIVE (see the alarm above)");
                 None
             }
         }
     };
-    println!(
+    say!(
         "  perimeter         : {ua_int} user-agents (+{ua_ext} from file), \
          {inj_int} injection patterns (+{inj_ext})"
     );
@@ -439,7 +436,7 @@ fn main() -> ExitCode {
     // APIBAN on its own thread: HTTP never touches the packet path. It was the synchronous
     // `rest_get()` per INVITE that capped the 2023 TFPS at ~26 calls/s.
     let apiban_rx = args.apiban_key.as_ref().map(|k| {
-        println!("  APIBAN            : enabled, syncing in the background");
+        say!("  APIBAN            : enabled, syncing in the background");
         apiban::spawn(k.clone(), None)
     });
 
@@ -511,7 +508,7 @@ fn main() -> ExitCode {
                     if let (Some((kind, detail)), Some(e)) = (reason, enforcer.as_mut()) {
                         match e.block(subject, args.block_ttl) {
                             Ok(()) => {
-                                println!(
+                                say!(
                                     "BLOCKED peer={subject} reason={kind} detail={detail} ttl={}s",
                                     args.block_ttl
                                 );
@@ -540,7 +537,7 @@ fn main() -> ExitCode {
                                 }
                             })
                             .collect();
-                        println!(
+                        say!(
                             "NOT-SIP peer={} {}:{}->{} len={} [{preview}]",
                             d.src,
                             d.src,
@@ -565,7 +562,7 @@ fn main() -> ExitCode {
                 }
                 if n > 0 {
                     apiban_total += n as u64;
-                    println!("APIBAN: {n} addresses condemned (total {apiban_total})");
+                    say!("APIBAN: {n} addresses condemned (total {apiban_total})");
                 }
             }
         }
@@ -580,7 +577,7 @@ fn main() -> ExitCode {
                         // window, and enough to investigate.
                         s.prune_log(t.0.saturating_sub(90 * 24 * 3600));
                         if args.verbose {
-                            println!("    checkpoint: {p} pairs written");
+                            say!("    checkpoint: {p} pairs written");
                         }
                     }
                     Err(e) => eprintln!("ALARM: checkpoint failed — {e}"),
@@ -594,7 +591,7 @@ fn main() -> ExitCode {
             if let Some(e) = enforcer.as_ref() {
                 if e.has_own_counters() {
                     let c = e.counters();
-                    println!(
+                    say!(
                         "    XDP: dropped={} seen={} expired={} in_map={} blocked_by_us={}",
                         c.dropped,
                         c.seen,
@@ -605,7 +602,7 @@ fn main() -> ExitCode {
                 } else {
                     // A third-party map: the total is mostly theirs. Only what this
                     // process wrote can be claimed as ours.
-                    println!(
+                    say!(
                         "    XDP: in_map={} (shared) blocked_by_us={}",
                         e.blocked_count(),
                         e.blocked_by_us
@@ -624,7 +621,7 @@ fn main() -> ExitCode {
             // A signature that never matches is rotten and the operator needs to know —
             // exactly what fail2ban never did (`SPEC.md` §12).
             if n_ipv6 + n_tcp > 0 {
-                println!("    blind spots: ipv6={n_ipv6} tcp={n_tcp} fragments={n_frag}");
+                say!("    blind spots: ipv6={n_ipv6} tcp={n_tcp} fragments={n_frag}");
                 if !blind_warned {
                     eprintln!(
                         "WARNING: there is SIP this system does NOT analyse on ports {:?} — \
@@ -668,33 +665,33 @@ fn main() -> ExitCode {
 
 fn report(dec: &Decision, peer: Ipv4Addr, verbose: bool) {
     match dec {
-        Decision::Block { country, novel_in_window } => println!(
+        Decision::Block { country, novel_in_window } => say!(
             "BLOCK peer={peer} country={country} first_time_in_window={novel_in_window}"
         ),
-        Decision::WouldBlock { country, novel_in_window } => println!(
+        Decision::WouldBlock { country, novel_in_window } => say!(
             "WOULD BLOCK (learning) peer={peer} country={country} first_time_in_window={novel_in_window}"
         ),
         Decision::Noise { signature } if verbose => {
-            println!("noise peer={peer} signature={signature}")
+            say!("noise peer={peer} signature={signature}")
         }
         Decision::Injection { pattern } if verbose => {
-            println!("injection peer={peer} pattern={pattern}")
+            say!("injection peer={peer} pattern={pattern}")
         }
         Decision::AuthFailure { failures } => {
             // Always visible: a run of rejected credentials is the precursor of Chain A.
-            println!("AUTH FAILURES peer={peer} rejected_credentials_in_window={failures}")
+            say!("AUTH FAILURES peer={peer} rejected_credentials_in_window={failures}")
         }
         Decision::AuthAbuse { attempts } => {
             // The backstop fired, which also says the softswitch never answered.
-            println!("AUTH VOLUME peer={peer} authenticated_attempts_unanswered={attempts}")
+            say!("AUTH VOLUME peer={peer} authenticated_attempts_unanswered={attempts}")
         }
         Decision::UnknownCountry(digits) => {
             // Always visible, even without -v: it is a symptom of a wrong dial plan, and a
             // wrong dial plan means international calls escaping the system entirely.
-            println!("UNKNOWN COUNTRY peer={peer} digits={digits}")
+            say!("UNKNOWN COUNTRY peer={peer} digits={digits}")
         }
         Decision::Pass { country, novel } if verbose => {
-            println!("pass peer={peer} country={country} first_time={novel}")
+            say!("pass peer={peer} country={country} first_time={novel}")
         }
         _ => {}
     }
@@ -713,7 +710,7 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
             )
         }
     };
-    println!(
+    say!(
         "--- mode={mode_label} packets={} sip={} responses={} keepalive={} not_sip={} noise={} ({}%) injection={} auth_att={} auth_fail={} auth_ok={} auth_chal={} auth_volume={} invites={} intl={} \
          unknown_country={} first_time={} blocks={} would_block={} peers={} pairs={} ports={:?}",
         s.packets,

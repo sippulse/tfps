@@ -107,7 +107,10 @@ impl Enforcer {
         })
     }
 
-    fn open_pinned(path: &Path, lru: bool) -> Result<BpfHashMap<MapData, u32, u64>, String> {
+    pub(crate) fn open_pinned(
+        path: &Path,
+        lru: bool,
+    ) -> Result<BpfHashMap<MapData, u32, u64>, String> {
         let data = MapData::from_pin(path).map_err(|e| format!("opening pin: {e}"))?;
         let wrapped = if lru {
             Map::LruHashMap(data)
@@ -249,13 +252,149 @@ impl Enforcer {
 ///
 /// Read from `/proc/uptime` to avoid needing `unsafe` or `libc` directly — 10 ms precision
 /// is irrelevant for TTLs measured in minutes.
-fn monotonic_ns() -> u64 {
+pub fn monotonic_ns() -> u64 {
     std::fs::read_to_string("/proc/uptime")
         .ok()
         .and_then(|s| s.split_whitespace().next().map(str::to_string))
         .and_then(|s| s.parse::<f64>().ok())
         .map(|secs| (secs * 1_000_000_000.0) as u64)
         .unwrap_or(0)
+}
+
+/// The live block map, opened from **outside** the running daemon — what `tfps_ctl`
+/// operates on.
+///
+/// It has to find a map the daemon deliberately does not pin. Not pinning is what makes
+/// enforcement fail open by construction (`SPEC.md` §2), so the control tool works around
+/// it the other way: the kernel can enumerate its loaded maps, and ours is found by name.
+/// That keeps the safety property and still allows an operator to unban somebody.
+pub struct Blocklist {
+    map: BpfHashMap<MapData, u32, u64>,
+    /// Key encoding. A third party's pinned map stores the address big-endian; our own
+    /// stores the raw `ip->saddr`. **This is the reason `tfps_ctl` shares this module
+    /// instead of reimplementing it**: two copies would drift, and the symptom would be an
+    /// unban that silently removes nothing.
+    big_endian: bool,
+    /// Where it was found, for the operator to see which plane they are editing.
+    pub source: String,
+}
+
+impl Blocklist {
+    /// Opens the map the daemon is actually using: an explicit path, else a third party's
+    /// pin, else our own by name — the same order of preference the daemon itself applies.
+    pub fn open(explicit: Option<&Path>) -> Result<Self, String> {
+        if let Some(p) = explicit {
+            let map = Self::open_pin(p)?;
+            return Ok(Self {
+                map,
+                big_endian: p != Path::new(""),
+                source: format!("pinned map {}", p.display()),
+            });
+        }
+        let shared = Path::new(SIPVAULT_DROP_MAP);
+        if shared.exists() {
+            if let Ok(map) = Self::open_pin(shared) {
+                return Ok(Self {
+                    map,
+                    big_endian: true,
+                    source: format!("shared map {}", shared.display()),
+                });
+            }
+        }
+        let (id, map) = Self::open_by_name("blocked")?;
+        Ok(Self {
+            map,
+            big_endian: false,
+            source: format!("own map id {id}"),
+        })
+    }
+
+    fn open_pin(p: &Path) -> Result<BpfHashMap<MapData, u32, u64>, String> {
+        Enforcer::open_pinned(p, true)
+            .or_else(|_| Enforcer::open_pinned(p, false))
+            .map_err(|e| format!("opening {}: {e}", p.display()))
+    }
+
+    /// Finds a loaded map by name. Needs `CAP_BPF`, like everything else that touches the
+    /// enforcement plane.
+    fn open_by_name(name: &str) -> Result<(u32, BpfHashMap<MapData, u32, u64>), String> {
+        let ids: Vec<u32> = aya::maps::loaded_maps()
+            .filter_map(Result::ok)
+            .filter(|i| i.name_as_str() == Some(name))
+            .map(|i| i.id())
+            .collect();
+        match ids.len() {
+            0 => Err(format!(
+                "no loaded eBPF map called `{name}` — is tfps running, and are you root?"
+            )),
+            1 => {
+                let data = MapData::from_id(ids[0])
+                    .map_err(|e| format!("opening map id {}: {e}", ids[0]))?;
+                let m = BpfHashMap::try_from(Map::LruHashMap(data))
+                    .map_err(|e| format!("map id {} is not a hash<u32,u64>: {e}", ids[0]))?;
+                Ok((ids[0], m))
+            }
+            // Ambiguity is reported rather than guessed at: picking the wrong map would
+            // edit somebody else's enforcement.
+            _ => Err(format!(
+                "several loaded maps are called `{name}` (ids {ids:?}); name one with --map-id"
+            )),
+        }
+    }
+
+    fn key(&self, ip: Ipv4Addr) -> u32 {
+        if self.big_endian {
+            u32::from_be_bytes(ip.octets())
+        } else {
+            u32::from_ne_bytes(ip.octets())
+        }
+    }
+
+    fn addr(&self, key: u32) -> Ipv4Addr {
+        Ipv4Addr::from(if self.big_endian {
+            key.to_be_bytes()
+        } else {
+            key.to_ne_bytes()
+        })
+    }
+
+    /// Every condemned source, with the instant its block expires in monotonic ns
+    /// (`0` = never).
+    pub fn entries(&self) -> Vec<(Ipv4Addr, u64)> {
+        let mut out: Vec<(Ipv4Addr, u64)> = self
+            .map
+            .keys()
+            .filter_map(Result::ok)
+            .map(|k| (self.addr(k), self.map.get(&k, 0).unwrap_or(0)))
+            .collect();
+        out.sort_by_key(|(ip, _)| *ip);
+        out
+    }
+
+    /// Lifts a block. Returns whether the address was there — an operator who typos an
+    /// address must be told nothing happened, not left believing they unbanned someone.
+    pub fn remove(&mut self, ip: Ipv4Addr) -> Result<bool, String> {
+        let k = self.key(ip);
+        if self.map.get(&k, 0).is_err() {
+            return Ok(false);
+        }
+        self.map
+            .remove(&k)
+            .map(|()| true)
+            .map_err(|e| format!("removing {ip}: {e}"))
+    }
+
+    /// Condemns a source by hand, with the same TTL semantics the daemon uses.
+    pub fn insert(&mut self, ip: Ipv4Addr, ttl_secs: u64) -> Result<(), String> {
+        let until = if ttl_secs == 0 {
+            0
+        } else {
+            monotonic_ns().saturating_add(ttl_secs.saturating_mul(1_000_000_000))
+        };
+        self.map
+            .insert(self.key(ip), until, 0)
+            .map_err(|e| format!("blocking {ip}: {e}"))
+    }
 }
 
 /// Finds the default-route interface, so the operator need not declare it.

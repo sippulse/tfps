@@ -310,6 +310,30 @@ pub fn resolve(digits: &InternationalDigits) -> Option<Country> {
     })
 }
 
+/// The label for a stored index, for anything that has to render a bitmap back into
+/// countries — the control tool, and the day-31 summary.
+///
+/// A linear scan: the table has 240 entries and this is never on the packet path.
+pub fn iso_for_index(index: u16) -> Option<&'static str> {
+    CODES
+        .iter()
+        .find(|(_, _, i)| *i == index)
+        .map(|(_, iso, _)| *iso)
+}
+
+/// Every country a bitmap pair holds, as labels, sorted for stable output.
+pub fn decode_bitmap(cur: [u64; 4], prev: [u64; 4]) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = (0..256u16)
+        .filter(|i| {
+            let (w, b) = (*i as usize / 64, *i as usize % 64);
+            (cur[w] | prev[w]) & (1u64 << b) != 0
+        })
+        .filter_map(iso_for_index)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
 /// Intrinsically risky ranges — satellite and non-geographic network services.
 ///
 /// This **does not block on its own** (`SPEC.md` §6): measurement put structure at 0.4% of
@@ -325,6 +349,31 @@ mod tests {
 
     fn dig(s: &str) -> InternationalDigits {
         InternationalDigits(s.to_string())
+    }
+
+    #[test]
+    fn every_index_maps_back_to_its_label() {
+        // The control tool renders stored bitmaps through this. A hole here would print
+        // the wrong country for a real block, which is worse than printing nothing.
+        for (_, iso, idx) in CODES {
+            assert_eq!(
+                iso_for_index(*idx),
+                Some(*iso),
+                "index {idx} lost its label"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bitmap_decodes_to_the_countries_it_holds() {
+        let gb = resolve(&dig("442039967796")).unwrap().index.0;
+        let ss = resolve(&dig("211123456789")).unwrap().index.0;
+        let mut cur = [0u64; 4];
+        let mut prev = [0u64; 4];
+        cur[gb as usize / 64] |= 1 << (gb % 64);
+        prev[ss as usize / 64] |= 1 << (ss % 64);
+        // The union of both periods, which is what "has ever seen" means.
+        assert_eq!(decode_bitmap(cur, prev), vec!["GB", "SS"]);
     }
 
     #[test]
