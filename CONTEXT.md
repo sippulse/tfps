@@ -90,6 +90,20 @@ accident. *Burst* (call rate) was measured as marginal: it varies 30× across re
 with three of four real fraud cases falling below it. The fraudster **repeats** a few
 destinations with long calls, because the revenue is per minute.
 
+**Digest challenge** — a `401` or `407` demanding credentials (RFC 3261 §22). **Not a
+synonym for Challenge**, which is a verdict this system issues; a digest challenge is
+something the *softswitch* sends, and it is the normal, expected first step of every
+legitimate registration. The two must never share a word.
+
+**Authenticated attempt** — a request that carried an `Authorization` or
+`Proxy-Authorization` header. A credential was presented; whether it was accepted is not
+yet known.
+
+**Failed authentication** — an authenticated attempt answered with a digest challenge
+instead of a success. **This is the brute-force signal**, and it is evidence rather than
+inference. Counting digest challenges alone would count every legitimate registration on
+the network.
+
 **Chain A** — the attack that breaks in: a burst of `401`/`407`, then a successful
 `REGISTER` from a new IP, then a first-time international destination.
 

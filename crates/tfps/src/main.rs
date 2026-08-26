@@ -451,6 +451,7 @@ fn main() -> ExitCode {
     // repeat the very failure this project uses as its difference from fail2ban.
     let (mut n_ipv6, mut n_tcp, mut n_frag) = (0u64, 0u64, 0u64);
     let mut blind_warned = false;
+    let mut auth_blind_warned = false;
 
     loop {
         let n = match sock.read(&mut buf) {
@@ -494,29 +495,33 @@ fn main() -> ExitCode {
                 let on_port = args.ports.contains(&d.dst_port) || args.ports.contains(&d.src_port);
                 if on_port {
                     *seen_ports.entry(d.dst_port).or_insert(0) += 1;
-                    let dec = engine.observe(d.src, d.payload, t);
+                    // Both addresses go in: a request is judged on its sender, but a
+                    // `401` is evidence about whoever is *receiving* it. The engine returns
+                    // the subject so the block lands on the right party.
+                    let (subject, dec) = engine.observe_packet(d.src, d.dst, d.payload, t);
                     // Perimeter noise condemns the source: its next packets die at XDP,
                     // before the libpcap tap, and vanish from sngrep.
                     let reason = match &dec {
                         Decision::Noise { signature } => Some(("user-agent", *signature)),
                         Decision::Injection { pattern } => Some(("injection", *pattern)),
-                        Decision::AuthAbuse { .. } => Some(("brute-force", "auth")),
+                        Decision::AuthFailure { .. } => Some(("auth-failed", "rejected")),
+                        Decision::AuthAbuse { .. } => Some(("auth-volume", "no-answer")),
                         _ => None,
                     };
                     if let (Some((kind, detail)), Some(e)) = (reason, enforcer.as_mut()) {
-                        match e.block(d.src, args.block_ttl) {
+                        match e.block(subject, args.block_ttl) {
                             Ok(()) => {
                                 println!(
-                                    "BLOCKED peer={} reason={kind} detail={detail} ttl={}s",
-                                    d.src, args.block_ttl
+                                    "BLOCKED peer={subject} reason={kind} detail={detail} ttl={}s",
+                                    args.block_ttl
                                 );
                                 // Durable audit: the operator must be able to reconstruct
                                 // the decision later, without relying on the journal.
                                 if let Some(s) = db.as_ref() {
-                                    s.log_block(t.0, d.src, kind, detail);
+                                    s.log_block(t.0, subject, kind, detail);
                                 }
                             }
-                            Err(err) => eprintln!("ALARM: could not block {}: {err}", d.src),
+                            Err(err) => eprintln!("ALARM: could not block {subject}: {err}"),
                         }
                     }
                     if args.debug_unparsed
@@ -544,7 +549,7 @@ fn main() -> ExitCode {
                             d.payload.len()
                         );
                     }
-                    report(&dec, d.src, args.verbose);
+                    report(&dec, subject, args.verbose);
                 }
             }
         }
@@ -630,6 +635,23 @@ fn main() -> ExitCode {
                     blind_warned = true;
                 }
             }
+            // The failure rule needs the softswitch's answer. Where none is ever seen it
+            // cannot fire, and saying nothing about that would be the exact blindness this
+            // project condemns in fail2ban — a rule that structurally cannot match.
+            if engine.stats.auth_attempts > 0
+                && engine.stats.digest_challenges == 0
+                && !auth_blind_warned
+            {
+                eprintln!(
+                    "WARNING: {} credentials presented and not one digest challenge seen on \
+                     ports {:?}. \
+                     Failed-authentication blocking cannot fire — only the volume backstop \
+                     can. Either the softswitch answers on a path this capture does not see, \
+                     or it drops these requests without challenging them.",
+                    engine.stats.auth_attempts, args.ports
+                );
+                auth_blind_warned = true;
+            }
             let total = engine.noise_filter.hits().count();
             if engine.noise_filter.cold_signatures().len() == total
                 && engine.stats.sip_parsed > 1000
@@ -658,9 +680,13 @@ fn report(dec: &Decision, peer: Ipv4Addr, verbose: bool) {
         Decision::Injection { pattern } if verbose => {
             println!("injection peer={peer} pattern={pattern}")
         }
+        Decision::AuthFailure { failures } => {
+            // Always visible: a run of rejected credentials is the precursor of Chain A.
+            println!("AUTH FAILURES peer={peer} rejected_credentials_in_window={failures}")
+        }
         Decision::AuthAbuse { attempts } => {
-            // Always visible: credential brute force is the precursor of Chain A.
-            println!("BRUTE FORCE peer={peer} authenticated_attempts_in_window={attempts}")
+            // The backstop fired, which also says the softswitch never answered.
+            println!("AUTH VOLUME peer={peer} authenticated_attempts_unanswered={attempts}")
         }
         Decision::UnknownCountry(digits) => {
             // Always visible, even without -v: it is a symptom of a wrong dial plan, and a
@@ -688,7 +714,7 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
         }
     };
     println!(
-        "--- mode={mode_label} packets={} sip={} responses={} keepalive={} not_sip={} noise={} ({}%) injection={} auth_att={} auth_abuse={} invites={} intl={} \
+        "--- mode={mode_label} packets={} sip={} responses={} keepalive={} not_sip={} noise={} ({}%) injection={} auth_att={} auth_fail={} auth_ok={} auth_chal={} auth_volume={} invites={} intl={} \
          unknown_country={} first_time={} blocks={} would_block={} peers={} pairs={} ports={:?}",
         s.packets,
         s.sip_parsed,
@@ -702,6 +728,9 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
             .unwrap_or(0),
         s.injections,
         s.auth_attempts,
+        s.auth_failures,
+        s.auth_ok,
+        s.digest_challenges,
         s.auth_abuse,
         s.invites,
         s.international,

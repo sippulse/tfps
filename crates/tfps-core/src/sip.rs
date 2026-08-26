@@ -79,6 +79,15 @@ impl<'a> Request<'a> {
     pub fn via_branch(&self) -> Option<&'a str> {
         self.via.and_then(|v| param(v, "branch"))
     }
+
+    /// Did this request carry a credential?
+    ///
+    /// **This is the whole authentication signal.** A request without one that receives a
+    /// `401` is the normal digest handshake; a request *with* one that receives a `401` is
+    /// a rejected password.
+    pub fn is_authenticated_attempt(&self) -> bool {
+        self.authorization.is_some()
+    }
 }
 
 /// Extracts the user part from a SIP URI embedded in a header value.
@@ -128,13 +137,63 @@ fn header_is(name: &str, long: &str, compact: Option<&str>) -> bool {
     name.eq_ignore_ascii_case(long) || compact.is_some_and(|c| name.eq_ignore_ascii_case(c))
 }
 
-/// A SIP response. The decision path does not use it; the **learning** path does — the
-/// `200 OK` says whether the call was answered, and duration comes from the matching
-/// `BYE`.
+/// A SIP response.
+///
+/// It carries `via`, `call_id` and `cseq` because a response has to be **matched back to
+/// the request that provoked it**: a `401` only means "the credential was wrong" if the
+/// request it answers actually carried one. Without that pairing, the challenge every
+/// legitimate registration receives is indistinguishable from a failed password.
 #[derive(Debug, Clone, Copy)]
 pub struct Response<'a> {
     pub status: u16,
     pub call_id: Option<&'a str>,
+    /// Topmost `Via`, copied verbatim from the request by the responder.
+    pub via: Option<&'a str>,
+    pub cseq: Option<&'a str>,
+}
+
+impl<'a> Response<'a> {
+    /// The `branch` of the topmost `Via` — the transaction identifier of RFC 3261 §17.1.3.
+    pub fn via_branch(&self) -> Option<&'a str> {
+        self.via.and_then(|v| param(v, "branch"))
+    }
+
+    /// Is this a **digest challenge** — `401` from a registrar, `407` from a proxy?
+    ///
+    /// Named in full because `CONTEXT.md` reserves plain "challenge" for a verdict that
+    /// diverts a suspicious call to voice verification. Two different things; one word
+    /// between them would be a silent bug.
+    pub fn is_digest_challenge(&self) -> bool {
+        self.status == 401 || self.status == 407
+    }
+
+    /// Did the request succeed? Any `2xx`.
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
+/// Identifies the transaction a request and its responses share.
+///
+/// The `branch` of the topmost `Via` is the exact identifier (RFC 3261 §17.1.3) and the
+/// responder copies it verbatim, so it matches without ambiguity. `Call-ID` + `CSeq` is the
+/// fallback for the pre-3261 stacks that still appear in the wild.
+///
+/// **`CSeq` is part of the key on purpose**: a client retrying a password keeps one
+/// `Call-ID` and increments `CSeq`, so keying on `Call-ID` alone would collapse an entire
+/// guessing run into a single countable failure.
+pub fn transaction_key(
+    branch: Option<&str>,
+    call_id: Option<&str>,
+    cseq: Option<&str>,
+) -> Option<String> {
+    if let Some(b) = branch {
+        if !b.is_empty() {
+            return Some(b.to_string());
+        }
+    }
+    let c = call_id?;
+    Some(format!("{c}|{}", cseq.unwrap_or("")))
 }
 
 /// A SIP message is either a request or a response. The distinction matters for
@@ -174,19 +233,30 @@ fn parse_response(text: &str) -> Option<Response<'_>> {
     let _version = parts.next()?;
     let status: u16 = parts.next()?.parse().ok()?;
 
-    let mut call_id = None;
+    let (mut call_id, mut via, mut cseq) = (None, None, None);
     for line in lines {
         if line.is_empty() {
             break;
         }
-        if let Some((name, value)) = line.split_once(':') {
-            if header_is(name.trim(), "Call-ID", Some("i")) {
-                call_id = Some(value.trim());
-                break;
-            }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (name, value) = (name.trim(), value.trim());
+        // Only the topmost Via: it is the one the responder copied from the request.
+        if via.is_none() && header_is(name, "Via", Some("v")) {
+            via = Some(value);
+        } else if header_is(name, "Call-ID", Some("i")) {
+            call_id = Some(value);
+        } else if header_is(name, "CSeq", None) {
+            cseq = Some(value);
         }
     }
-    Some(Response { status, call_id })
+    Some(Response {
+        status,
+        call_id,
+        via,
+        cseq,
+    })
 }
 
 /// Parses a SIP datagram.

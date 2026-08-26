@@ -31,10 +31,11 @@ every worked example at the end is real traffic captured on the test server on
        ▼
   1. IPv4/UDP decode ....... net::parse_ipv4_udp      → else count a blind spot, stop
   2. port gate ............. main.rs, args.ports      → else stop (not counted at all)
-  3. SIP recognition ....... sip::parse               → keepalive / response / not SIP
+  3. SIP recognition ....... sip::parse               → keepalive / not SIP
+       └─ a response goes to the authentication path, judged against its own request
   4. perimeter: user-agent . perimeter::is_noise      → BLOCK (condemn source)
   5. perimeter: injection .. perimeter::injection_in_uri → BLOCK (condemn source)
-  6. perimeter: brute force  perimeter::AuthAbuse     → BLOCK (condemn source)
+  6. perimeter: failed auth  engine::observe_response → BLOCK (condemn source)
   7. method gate ........... engine::observe          → non-INVITE stops here
   8. dial plan ............. dialplan::to_international → domestic stops here
   9. country ............... country::resolve         → unknown country stops here
@@ -159,10 +160,12 @@ On a public 5060 with residential phones **this is most of the traffic** — in 
 sample below, 1,110 of 1,879 packets. Counting it as "not SIP" would make an operator
 conclude they were capturing the wrong interface.
 
-**Response** — payload starts with `SIP/`. The status code and `Call-ID` are extracted and
-the packet leaves the decision path: a response is post-facto and belongs to the learning
-path (the `200 OK` says whether the call was answered). It is counted separately as
-`responses`.
+**Response** — payload starts with `SIP/`. Status, `Via`, `Call-ID` and `CSeq` are
+extracted and the packet goes to the **authentication path** (stage 6), which is the only
+place a *failed* authentication can be recognised: a `401` only means "wrong password" if
+the request it answers actually carried one. Responses are counted separately as
+`responses`, and the `200 OK` also belongs to the learning path, which is where duration
+and outcome come from.
 
 **Request** — everything else is put through `parse_request` (`sip.rs:197`):
 
@@ -261,30 +264,75 @@ This is a *higher*-confidence signal than the user-agent list: a scanner can tri
 forge a normal UA, but no real telephone puts a single quote or `--` in a `From` header.
 There is no innocent explanation.
 
-### 5.3 Authentication brute force (`AuthAbuse`, perimeter.rs:232)
+### 5.3 Failed authentication (`observe_response`, engine.rs)
 
-The signal is **a `REGISTER` carrying an `Authorization` header**, never a bare `401`.
+The signal is **a request that carried a credential and was answered with a digest
+challenge anyway**. Not a bare `401`, and not the mere presence of `Authorization`.
 
-This distinction is the difference between a working defence and knocking every customer
-offline. Digest authentication *is* a two-step flow: every legitimate `REGISTER` receives
-a `401` with a nonce and is resent with credentials. Counting challenges would count every
-normal registration on the network.
+That distinction is the difference between a working defence and knocking every customer
+offline, and it follows directly from how digest works:
+
+```
+REGISTER (no Authorization)  →  401 + nonce     the normal handshake. Ignored.
+REGISTER (Authorization)     →  200 OK          accepted. The count is cleared.
+REGISTER (Authorization)     →  401 again       a rejected password. THIS is the signal.
+```
+
+The first request never carries a credential; the second one does. So a `401` is only
+evidence of anything once you know which of the two it answered — which means the response
+has to be **matched back to its request**.
+
+#### Matching a response to its request
+
+| key | source | why |
+|---|---|---|
+| `Via` branch | copied verbatim by the responder | the transaction identifier of RFC 3261 §17.1.3 — exact, unambiguous |
+| `Call-ID` + `CSeq` | fallback | for pre-3261 stacks still in the wild |
+
+`CSeq` is part of the fallback key **on purpose**: a client retrying a password keeps one
+`Call-ID` and increments `CSeq`, so keying on `Call-ID` alone would collapse an entire
+guessing run into a single countable failure.
+
+Only requests **carrying a credential** are remembered — a request without one is of no
+interest, because the `401` it receives is the normal challenge. Each peer holds at most 64
+pending transactions, pruned after 32 seconds (RFC 3261 Timer B/F, 64×T1, after which no
+response can still be matched). The entry is **claimed on the first matching response**, so
+a retransmitted `401` counts once.
+
+#### The subject of the decision
+
+A request is judged on whoever **sent** it. A `401` is evidence about whoever is
+**receiving** it. The engine therefore returns the subject alongside the decision, and the
+block lands on the party being challenged — never on the softswitch for having answered.
 
 | constant | value | basis |
 |---|---|---|
-| `AUTH_ATTEMPTS_TO_BLOCK` | 20 | a legitimate phone sends one per registration cycle (typically 300 s); a credential test sends many per second |
-| `AUTH_WINDOW_SECS` | 60 | measured on the reference server: 2 challenges in 45 s of legitimate traffic (~2.7/min), leaving ~7× headroom |
+| `AUTH_FAILURES_TO_BLOCK` | 5 | the `maxretry` default of the `fail2ban` Asterisk jail |
+| `AUTH_FAILURE_WINDOW_SECS` | 600 | its `findtime` default — a decade of field use behind both |
 
-The counter is a ring of exactly 20 timestamps per source. On each attempt the current
-time is written, then the entries still inside the 60-second window are counted; if the
-oldest of 20 is still inside, the threshold has been reached. No response correlation, no
-dialog state, constant memory per peer.
+An accepted credential **clears the count**: someone who fixes a mistyped password is not
+condemned by their next slip. Only an uninterrupted run is an attack.
 
-**Honest limitation**: a large NAT aggregating many phones behind one address can approach
-the threshold. That is the same limitation `fail2ban` has, and precisely why the block
-carries a TTL (default 3,600 s) and expires on its own.
+Because it counts failures rather than volume, **a large NAT is not a problem** — a hundred
+phones behind one address all succeed, and successes do not accumulate. That was a real
+limitation of the rate-based rule this replaced.
 
----
+#### The backstop, and why it must exist
+
+The rule above needs the softswitch's answer, and there are deployments where it never
+comes. Measured on the reference server: opensips drops requests addressed to a domain it
+does not serve **without challenging them** — 1 outbound packet in 45 seconds against
+hundreds inbound. A probe with a correctly addressed `REGISTER` was challenged immediately,
+so the silence is a policy, not a fault.
+
+There, the failure counter structurally cannot rise. So a volume backstop remains: **20
+authenticated attempts in 60 s**, from the measured baseline of 2 challenges in 45 s of
+legitimate traffic (~2.7/min, roughly 7× headroom). It is looser because it cannot tell
+success from failure, only volume.
+
+And when that condition is detected — credentials presented, not one digest challenge seen
+— TFPS **says so on the report**. A rule that structurally cannot match, sitting silent, is
+the exact `fail2ban` blindness this project exists to avoid.
 
 ## 6. Stage 7 — the method gate
 
@@ -466,7 +514,8 @@ Three decisions condemn the source (`main.rs:500`):
 |---|---|---|
 | `Noise` | `user-agent` | the signature that matched |
 | `Injection` | `injection` | the pattern that matched |
-| `AuthAbuse` | `brute-force` | `auth` |
+| `AuthFailure` | `auth-failed` | `rejected` |
+| `AuthAbuse` | `auth-volume` | `no-answer` |
 
 Condemning writes the source IP into an eBPF map with an expiry, prints a `BLOCKED` line
 and appends a row to the SQLite audit log so the decision can be reconstructed later
@@ -527,7 +576,11 @@ Every counter exists to answer a question an operator would otherwise have to gu
 | `not_sip` | **should be ≈ 0.** Anything else means a traffic family is not understood |
 | `noise (%)` | how much of the wire is scanning — the number that predicts a clean sngrep |
 | `injection` | attacks with no innocent explanation |
-| `auth_att` / `auth_abuse` | brute-force denominator and numerator |
+| `auth_att` | requests that carried a credential |
+| `auth_fail` | credentials **rejected** — the brute-force signal |
+| `auth_ok` | credentials accepted; a run of failures is cleared by one of these |
+| `auth_chal` | digest challenges seen. **Zero with a non-zero `auth_att`** means the softswitch is not answering, so only the backstop can fire — and that is warned about |
+| `auth_volume` | sources condemned by the volume backstop |
 | `invites` / `intl` | the fraction of calls that reach the expensive path |
 | `unknown_country` | **a wrong dial plan, or evasion by padding** — see the worked examples |
 | `first_time` | country debuts; the measured reference is 0.85% of calls |
@@ -575,6 +628,21 @@ digits beginning `211`, which is South Sudan's real calling code, so the call re
 not, however, an escape: a country the pair has never called is a *debut*, so a padded
 destination feeds the accumulation predicate rather than avoiding it. What is corrupted is
 the label in the audit log, not the defence.
+
+### The authentication rule, verified against a live softswitch
+
+Five `REGISTER`s carrying a deliberately wrong credential, sent to the reference server's
+opensips, which challenged each one. Observed by a second TFPS instance running
+`--no-enforce`, so nothing was actually blocked:
+
+```
+AUTH FAILURES peer=209.38.75.252 rejected_credentials_in_window=5
+```
+
+The same server, on its live internet traffic, reports `auth_att=5 auth_fail=0 auth_ok=0
+auth_chal=0` — credentials presented, not one challenge answered — and warns that failed
+authentication blocking cannot fire there. Both facts are true at once, and the report says
+so rather than implying protection it does not have.
 
 For contrast, the same period's perimeter activity:
 
@@ -627,8 +695,8 @@ that fails quietly.
 | capture socket, main loop | `crates/tfps/src/main.rs` | `main`, line 411 and 455 |
 | IPv4/UDP decode | `crates/tfps-core/src/net.rs` | `parse_ipv4_udp:85`, `classify_other:59`, `tcp_ports:44` |
 | SIP parse | `crates/tfps-core/src/sip.rs` | `parse:158`, `parse_request:197`, `parse_response:170` |
-| perimeter | `crates/tfps-core/src/perimeter.rs` | `is_noise:105`, `injection_in_uri:181`, `AuthAbuse::attempt:254` |
-| orchestration and verdict | `crates/tfps-core/src/engine.rs` | `observe:277`, `decide:374` |
+| perimeter | `crates/tfps-core/src/perimeter.rs` | `is_noise`, `injection_in_uri`, `SlidingCount::record` |
+| orchestration and verdict | `crates/tfps-core/src/engine.rs` | `observe_packet`, `observe_response`, `decide` |
 | dial plan | `crates/tfps-core/src/dialplan.rs` | `to_international:70` |
 | country | `crates/tfps-core/src/country.rs` | `resolve:298` |
 | novelty | `crates/tfps-core/src/novelty.rs` | `PairState::observe:192`, `RotatingBitmap::rotate_to:80` |

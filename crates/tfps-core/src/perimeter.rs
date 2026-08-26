@@ -219,51 +219,103 @@ impl NoiseFilter {
     }
 }
 
-/// How many authenticated attempts within a window constitute brute force.
+/// How many **failed** authentications within the window condemn a source.
 ///
-/// **A bare `401` is never counted**, and that is the difference between working and
-/// knocking every customer offline: the digest challenge is the normal flow — every
-/// legitimate `REGISTER` gets a `401` with a nonce before resending with `Authorization`.
-/// Counting challenges would block everyone.
+/// A failure is a request that **carried a credential** and was answered with another
+/// `401`/`407`. That pairing is the whole signal, and it is what separates this from
+/// counting challenges: every legitimate `REGISTER` receives a `401` with a nonce before
+/// being resent with `Authorization`, so counting challenges would block every customer on
+/// the network. A phone with the right password is challenged once and then succeeds; one
+/// with the wrong password is challenged again, and again.
 ///
-/// What is counted is a **`REGISTER` carrying `Authorization`**: a legitimate phone sends
-/// one per registration cycle (typically every 300 s), while someone testing credentials
-/// sends many per second. No response correlation is needed, and no dialog state.
-pub const AUTH_ATTEMPTS_TO_BLOCK: u32 = 20;
+/// Five in ten minutes matches the `maxretry`/`findtime` defaults of the `fail2ban`
+/// Asterisk jail — deliberately, since that threshold has a decade of field use behind it.
+/// The difference is where the evidence comes from: the wire, immediately, instead of a log
+/// file that the softswitch may not even be writing.
+pub const AUTH_FAILURES_TO_BLOCK: usize = 5;
 
-/// Window for the counter above, in seconds.
+/// Window for the failure counter, in seconds.
+pub const AUTH_FAILURE_WINDOW_SECS: u32 = 600;
+
+/// Backstop: how many authenticated attempts within a short window condemn a source even
+/// when **no response is ever observed**.
+///
+/// This exists because the failure rule needs to see the softswitch's `401`, and there are
+/// real deployments where it never appears: a proxy that drops junk before authenticating
+/// it (measured on the reference server: 1 outbound packet in 45 seconds, against hundreds
+/// inbound), or a response path over TLS. Without this backstop, a credential-stuffing run
+/// against such a server would meet a counter that structurally cannot rise — which is
+/// precisely the silent blindness this project exists to avoid.
+///
+/// It is looser than the failure rule because it cannot tell success from failure, only
+/// volume: a legitimate phone sends one per registration cycle, typically every 300 s.
+pub const AUTH_ATTEMPTS_TO_BLOCK: usize = 20;
+
+/// Window for the backstop above, in seconds.
 ///
 /// Measured on the reference server: **2 challenges in 45 s** of legitimate traffic, about
-/// 2.7/min. Twenty per minute leaves roughly 7× headroom. **Honest caveat**: a large NAT
-/// aggregates many phones behind one IP and may approach the threshold — the same
-/// limitation `fail2ban` has, and precisely why the block is temporary.
+/// 2.7/min. Twenty per minute leaves roughly 7× headroom. A large NAT aggregating many
+/// phones can still approach it — which the failure rule above does not suffer from, and
+/// which is why the block is temporary either way.
 pub const AUTH_WINDOW_SECS: u32 = 60;
 
-/// Per-source counter of authenticated attempts, over a sliding window.
-#[derive(Debug, Clone, Default)]
-pub struct AuthAbuse {
-    /// Timestamps of recent attempts. A ring sized exactly to the threshold: if the oldest
-    /// is still inside the window, the threshold has been reached.
-    stamps: [u32; AUTH_ATTEMPTS_TO_BLOCK as usize],
+/// A sliding count of the last `N` events, sized exactly to the threshold it serves.
+///
+/// If the oldest of `N` timestamps is still inside the window, the threshold has been
+/// reached — so nothing older than the last `N` events ever needs storing. Constant memory
+/// per source, no allocation, and no background sweep.
+#[derive(Debug, Clone)]
+pub struct SlidingCount<const N: usize> {
+    stamps: [u32; N],
     len: u8,
     next: u8,
 }
 
-impl AuthAbuse {
-    /// Records an authenticated attempt and reports whether the threshold was reached.
-    pub fn attempt(&mut self, now: u32) -> (u32, bool) {
-        self.stamps[self.next as usize] = now;
-        self.next = (self.next + 1) % AUTH_ATTEMPTS_TO_BLOCK as u8;
-        if (self.len as u32) < AUTH_ATTEMPTS_TO_BLOCK {
-            self.len += 1;
+impl<const N: usize> Default for SlidingCount<N> {
+    fn default() -> Self {
+        Self {
+            stamps: [0; N],
+            len: 0,
+            next: 0,
         }
-        let n = self.stamps[..self.len as usize]
-            .iter()
-            .filter(|s| now.saturating_sub(**s) < AUTH_WINDOW_SECS)
-            .count() as u32;
-        (n, n >= AUTH_ATTEMPTS_TO_BLOCK)
     }
 }
+
+impl<const N: usize> SlidingCount<N> {
+    /// Records an event and reports how many fall inside `span`, and whether that reached
+    /// `N`.
+    pub fn record(&mut self, now: u32, span: u32) -> (u32, bool) {
+        self.stamps[self.next as usize] = now;
+        self.next = ((self.next as usize + 1) % N) as u8;
+        if (self.len as usize) < N {
+            self.len += 1;
+        }
+        let n = self.count_within(now, span);
+        (n, n as usize >= N)
+    }
+
+    /// How many events fall inside `span`, without recording one.
+    pub fn count_within(&self, now: u32, span: u32) -> u32 {
+        self.stamps[..self.len as usize]
+            .iter()
+            .filter(|s| now.saturating_sub(**s) < span)
+            .count() as u32
+    }
+
+    /// Forgets everything. Called when a credential is **accepted**: a success means the
+    /// earlier rejections were someone typing a password wrong, not an attack.
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.next = 0;
+    }
+}
+
+/// Failed authentications for one source — requests that carried a credential and were
+/// rejected.
+pub type AuthFailures = SlidingCount<AUTH_FAILURES_TO_BLOCK>;
+
+/// Authenticated attempts for one source, regardless of outcome. The volume backstop.
+pub type AuthAttempts = SlidingCount<AUTH_ATTEMPTS_TO_BLOCK>;
 
 fn matches_sig(ua: &str, sig: &str, kind: Match) -> bool {
     match kind {
@@ -431,34 +483,63 @@ mod tests {
 
     #[test]
     fn the_legitimate_digest_challenge_does_not_fire() {
-        // A phone registers every 300 s. Even across a full hour it comes nowhere close.
-        let mut a = AuthAbuse::default();
+        // A phone registers every 300 s. Even across a full hour it comes nowhere close to
+        // the volume backstop.
+        let mut a = AuthAttempts::default();
         for cycle in 0..12u32 {
-            let (_, blocks) = a.attempt(cycle * 300);
+            let (_, blocks) = a.record(cycle * 300, AUTH_WINDOW_SECS);
             assert!(!blocks, "periodic legitimate registration must never block");
         }
     }
 
     #[test]
-    fn brute_force_fires() {
-        let mut a = AuthAbuse::default();
+    fn the_volume_backstop_fires() {
+        let mut a = AuthAttempts::default();
         let mut fired = false;
-        for i in 0..AUTH_ATTEMPTS_TO_BLOCK {
-            let (_, b) = a.attempt(1000 + i); // one per second
+        for i in 0..AUTH_ATTEMPTS_TO_BLOCK as u32 {
+            let (_, b) = a.record(1000 + i, AUTH_WINDOW_SECS); // one per second
             fired = b;
         }
         assert!(fired, "20 attempts in 20 s must block");
     }
 
     #[test]
+    fn five_rejected_credentials_condemn_the_source() {
+        // The rule that matters: rejections, not challenges. Five in ten minutes is the
+        // fail2ban default, and a run of guesses reaches it easily.
+        let mut f = AuthFailures::default();
+        let mut fired = false;
+        for i in 0..AUTH_FAILURES_TO_BLOCK as u32 {
+            let (_, b) = f.record(1000 + i * 30, AUTH_FAILURE_WINDOW_SECS);
+            fired = b;
+        }
+        assert!(fired, "5 rejected credentials in 10 minutes must block");
+    }
+
+    #[test]
+    fn an_accepted_credential_forgets_the_earlier_rejections() {
+        // Someone mistyping a password four times and then getting it right must not be
+        // blocked by their next mistake an hour later. Only a *run* of failures is an
+        // attack.
+        let mut f = AuthFailures::default();
+        for i in 0..(AUTH_FAILURES_TO_BLOCK as u32 - 1) {
+            assert!(!f.record(1000 + i, AUTH_FAILURE_WINDOW_SECS).1);
+        }
+        f.clear();
+        let (n, blocks) = f.record(1100, AUTH_FAILURE_WINDOW_SECS);
+        assert_eq!(n, 1, "the successful login wiped the slate");
+        assert!(!blocks);
+    }
+
+    #[test]
     fn the_window_slides_instead_of_resetting() {
-        let mut a = AuthAbuse::default();
+        let mut a = AuthAttempts::default();
         // 19 attempts, not enough.
-        for i in 0..(AUTH_ATTEMPTS_TO_BLOCK - 1) {
-            assert!(!a.attempt(1000 + i).1);
+        for i in 0..(AUTH_ATTEMPTS_TO_BLOCK as u32 - 1) {
+            assert!(!a.record(1000 + i, AUTH_WINDOW_SECS).1);
         }
         // Much later, an isolated attempt must not add up with the old ones.
-        let (n, blocks) = a.attempt(1000 + AUTH_WINDOW_SECS * 3);
+        let (n, blocks) = a.record(1000 + AUTH_WINDOW_SECS * 3, AUTH_WINDOW_SECS);
         assert_eq!(n, 1);
         assert!(!blocks);
     }

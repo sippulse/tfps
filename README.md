@@ -93,22 +93,55 @@ Three families, at different confidence levels:
 - **URI injection** (`'`, `%27`, `--`, `%24`, `%60`, `==`, `?=?`, `union`, `select`, and
   `;` inside the user part). **Higher** confidence: no real phone puts a single quote in
   the `From` header.
-- **Credential brute force** — 20 authenticated attempts in 60 s.
+- **Failed authentication** — 5 rejected credentials in 10 minutes, with a volume backstop
+  of 20 authenticated attempts in 60 s for softswitches that never answer.
 
-### What is *not* counted as brute force
+### What counts as a failed authentication, and what does not
 
 **A bare `401` means nothing.** The digest challenge is the normal flow: every legitimate
 `REGISTER` gets a `401` with a nonce before resending with `Authorization`. Counting
 challenges would block all of your customers within a minute.
 
-What is counted is a **`REGISTER` carrying `Authorization`** — an actual password attempt.
-A legitimate phone sends one per registration cycle (typically every 300 s); someone
-testing credentials sends many per second. No response correlation, no dialog state.
+What counts is a **request that carried a credential and was answered `401`/`407` anyway**:
 
-Measured on the reference server: **2 challenges in 45 s** of legitimate traffic. A
-threshold of 20/min leaves roughly 7× headroom. **Caveat**: a large NAT aggregates many
-phones behind one IP and could approach the threshold — the same limitation `fail2ban` has,
-and precisely why the block is temporary.
+```
+REGISTER (no Authorization)  →  401 + nonce        the normal handshake, ignored
+REGISTER (Authorization)     →  200 OK             accepted — the slate is wiped
+REGISTER (Authorization)     →  401 again          a rejected password. This is the signal.
+```
+
+Five rejections in ten minutes condemn the source — the `maxretry`/`findtime` defaults of
+the `fail2ban` Asterisk jail, deliberately, since that threshold has a decade of field use
+behind it. The difference is where the evidence comes from: **the wire, immediately**,
+instead of a log file the softswitch may not be writing. The method is irrelevant —
+`REGISTER` is where a password is stolen and `INVITE` is where it is spent, and both are
+challenged the same way.
+
+Requests are matched to their responses by the `Via` branch (RFC 3261 §17.1.3), falling
+back to `Call-ID` + `CSeq`. `CSeq` is part of the key on purpose: a client retrying a
+password keeps one `Call-ID` and increments `CSeq`, so keying on `Call-ID` alone would
+collapse a whole guessing run into one countable failure. A retransmitted `401` counts
+once. An accepted credential clears the count, so someone who fixes a mistyped password is
+not blocked by their next slip.
+
+Because it is failures and not volume, **a large NAT is not a problem**: a hundred phones
+behind one address all succeed, and successes do not accumulate.
+
+### The backstop, and why it has to exist
+
+The rule above needs the softswitch's answer. There are real deployments where it never
+comes — measured on the reference server, where opensips drops requests addressed to a
+domain it does not serve **without challenging them**: 1 outbound packet in 45 seconds
+against hundreds inbound.
+
+There, the failure counter structurally cannot rise. So a volume backstop remains: **20
+authenticated attempts in 60 s** with no answer observed. It is looser, because it cannot
+tell success from failure — only volume. A legitimate phone sends one per registration
+cycle, typically every 300 s.
+
+And when that situation is detected — credentials presented, not one challenge seen — TFPS
+**says so on the report**, because a rule that structurally cannot match is exactly the
+`fail2ban` blindness this project exists to avoid.
 
 ---
 
@@ -270,7 +303,8 @@ broader policy, and then the blast radius becomes theirs.
 
 ```
 --- mode=LEARNING (29d 23h left) packets=330 sip=98 responses=0 keepalive=232
-    not_sip=0 noise=12 (12%) injection=0 auth_att=142 auth_abuse=1 invites=62
+    not_sip=0 noise=12 (12%) injection=0 auth_att=142 auth_fail=5 auth_ok=97
+    auth_chal=104 auth_volume=0 invites=62
     intl=62 unknown_country=20 first_time=21 blocks=0 would_block=0
     peers=3 pairs=14 ports={5060: 330}
     XDP: dropped=1840 seen=2100 expired=3 in_map=7 blocked_by_us=7
@@ -284,8 +318,11 @@ broader policy, and then the blast radius becomes theirs.
 | `noise (%)` | how much the perimeter removed — the number that measures a clean sngrep |
 | `unknown_country` | international by shape, no recognisable country: a symptom of a wrong dial plan, and in practice it also catches prefix-padding evasion |
 | `first_time` | country debuts; the measured reference is 0.85% of calls |
-| `auth_att` | authenticated attempts seen (the denominator for brute force) |
-| `auth_abuse` | sources condemned for brute force |
+| `auth_att` | requests that carried a credential |
+| `auth_fail` | credentials **rejected** — the brute-force signal |
+| `auth_ok` | credentials accepted |
+| `auth_chal` | digest challenges (`401`/`407`) seen. **Zero here with a non-zero `auth_att` means the softswitch is not answering**, so only the backstop can fire — and TFPS warns about it |
+| `auth_volume` | sources condemned by the volume backstop |
 | `would_block` | would have blocked if it were not still learning |
 | `blocked_by_us` | sources **this** process condemned |
 
