@@ -221,15 +221,27 @@ fn stats(args: &Args) -> Result<(), String> {
     }
     let s = Store::open_readonly(&args.db)?;
     let apiban = s.apiban_all().unwrap_or_default();
+    // A perimeter block often lands on an IP that is also on the feed; attribute it to the
+    // reason we condemned it (the audit log), not to the feed it happens to appear on.
+    let audit: std::collections::HashSet<String> = s
+        .blocks(1_000_000, None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.ip)
+        .collect();
     if let Ok(b) = Blocklist::open(args.map.as_deref()) {
         let e = b.entries();
-        let from_apiban = e
+        let perimeter = e
             .iter()
-            .filter(|(ip, _)| apiban.contains(&ip.to_string()))
+            .filter(|(ip, _)| audit.contains(&ip.to_string()))
+            .count();
+        let feed = e
+            .iter()
+            .filter(|(ip, _)| !audit.contains(&ip.to_string()) && apiban.contains(&ip.to_string()))
             .count();
         say!("  condemned now     : {}", e.len());
-        say!("    from APIBAN feed : {from_apiban}");
-        say!("    perimeter/manual : {}", e.len() - from_apiban);
+        say!("    perimeter/manual : {perimeter}");
+        say!("    APIBAN feed only : {feed}");
     }
 
     let now = now();
@@ -314,15 +326,27 @@ fn banned(args: &Args) -> Result<(), String> {
         say!("nothing is blocked");
         return Ok(());
     }
-    // The audit log says *why* for perimeter blocks; the APIBAN feed is a separate record,
-    // since its thousands of addresses are not written to the audit log. Load both once.
+    // Attribute each block once, block_log winning over the APIBAN feed — a scanner is
+    // often on both (APIBAN's honeypots catch the same tools), and the *reason* we
+    // condemned it is the perimeter one, not the feed. Load both sets once.
     let store = Store::open_readonly(&args.db).ok();
     let apiban = store
         .as_ref()
         .and_then(|s| s.apiban_all().ok())
         .unwrap_or_default();
+    // ip -> (reason, detail), most recent block per ip (rows come newest-first).
+    let mut audit: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    if let Some(s) = store.as_ref() {
+        if let Ok(rows) = s.blocks(1_000_000, None) {
+            for r in rows {
+                audit.entry(r.ip).or_insert((r.reason, r.detail));
+            }
+        }
+    }
+
     let now_ns = monotonic_ns();
-    let mut apiban_count = 0usize;
+    let (mut n_perimeter, mut n_apiban, mut n_unknown) = (0usize, 0usize, 0usize);
     say!("{:<16} {:>10}  REASON", "SOURCE", "EXPIRES IN");
     for (ip, until) in &entries {
         let left = if *until == 0 {
@@ -331,26 +355,31 @@ fn banned(args: &Args) -> Result<(), String> {
             ago(((*until).saturating_sub(now_ns) / 1_000_000_000) as u32)
         };
         let ip_s = ip.to_string();
-        let from_apiban = apiban.contains(&ip_s);
-        if from_apiban {
-            apiban_count += 1;
-        }
-        let why = match (args.why, store.as_ref()) {
-            (true, Some(s)) => s
-                .blocks(1, Some(&ip_s))
-                .ok()
-                .and_then(|v| v.into_iter().next())
-                .map(|r| format!("{} ({})", r.reason, r.detail))
-                .or_else(|| from_apiban.then(|| "apiban (feed)".to_string()))
-                .unwrap_or_else(|| "not in this audit log".to_string()),
-            _ => String::new(),
+        // block_log reason wins; then the feed; then unknown.
+        let why = if let Some((reason, detail)) = audit.get(&ip_s) {
+            n_perimeter += 1;
+            format!("{reason} ({detail})")
+        } else if apiban.contains(&ip_s) {
+            n_apiban += 1;
+            "apiban (feed)".to_string()
+        } else {
+            n_unknown += 1;
+            "not in this audit log".to_string()
         };
-        say!("{ip_s:<16} {left:>10}  {why}");
+        if args.why {
+            say!("{ip_s:<16} {left:>10}  {why}");
+        } else {
+            say!("{ip_s:<16} {left:>10}");
+        }
     }
     say!(
-        "\n{} blocked ({apiban_count} from the APIBAN feed, {} from the perimeter/manual)",
+        "\n{} blocked — {n_perimeter} perimeter/manual, {n_apiban} APIBAN feed{}",
         entries.len(),
-        entries.len() - apiban_count
+        if n_unknown > 0 {
+            format!(", {n_unknown} unattributed")
+        } else {
+            String::new()
+        }
     );
     Ok(())
 }
