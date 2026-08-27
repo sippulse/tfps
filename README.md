@@ -121,13 +121,17 @@ its next packets die at XDP and vanish from the capture.
   Censys announces itself as `censysinspect@censys.io`, and there are Shodan, LeakIX and the
   rest, plus tool/service domains like `sip5060.net`. A real caller is never `@censys.io`.
   Extend the built-in list with `scanners` in the config.
-- **Registration scanning** — a source that makes many `REGISTER` attempts and **never
-  completes a registration** (no `2xx`). This catches extension enumeration and slow
-  credential probing that the failed-auth rule misses: the attacker spreads a few attempts
-  across many extensions, or sends no credential at all, so no single extension crosses the
-  brute-force threshold — but from one source, six REGISTERs with zero successes is a scan.
-  A legitimate phone or gateway registers successfully, which exempts it however many
-  attempts it makes, so a NAT with many phones is safe.
+- **Registration scanning** — a source that probes **many different extensions** with
+  `REGISTER` and **completes none** (no `2xx`). This catches extension enumeration and the
+  no-credential probing the failed-auth rule can't see: the attacker spreads a few tries per
+  extension across the dial plan, so no single extension crosses the brute-force threshold —
+  but one source touching several distinct extensions with zero successful registrations is
+  a scan. The count is of *distinct extensions*, not raw attempts, and that is deliberately
+  the safe design: a real phone registers its own one extension (a multi-line device its own
+  few) however many times it retransmits or re-registers, and whether or not its responses
+  are captured, so it never climbs; and any single successful registration exempts the source
+  outright. The threshold sits well above any plausible legitimate device, so a NAT or
+  gateway behind one IP is never caught — only a source spraying the dial plan is.
 - **Failed authentication** — see below.
 - **APIBAN** — the collaborative bad-IP list, if a key is configured.
 

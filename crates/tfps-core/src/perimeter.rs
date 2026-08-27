@@ -410,6 +410,70 @@ impl<const N: usize> SlidingCount<N> {
     }
 }
 
+/// The distinct extensions (AORs) one source has probed with REGISTER inside a window,
+/// tracked by a hash of the target user with capacity `N`.
+///
+/// The count is of *distinct* extensions, not raw attempts, and that is the whole safety
+/// argument: a legitimate endpoint registers its own one — or, for a multi-line device, its
+/// own few — AOR(s), so it never climbs however many times it retransmits or re-registers,
+/// and whether or not its responses are ever captured. Only a source spraying REGISTERs
+/// across many *different* extensions rises, which is the definition of enumeration.
+#[derive(Debug)]
+pub struct RegProbes<const N: usize> {
+    ids: [u64; N],
+    stamps: [u32; N],
+    len: u8,
+    next: u8,
+}
+
+impl<const N: usize> Default for RegProbes<N> {
+    fn default() -> Self {
+        Self {
+            ids: [0; N],
+            stamps: [0; N],
+            len: 0,
+            next: 0,
+        }
+    }
+}
+
+impl<const N: usize> RegProbes<N> {
+    /// Records a probe against extension `id` (a hash of the AOR) at `now`, and returns how
+    /// many *distinct* extensions fall inside `span`. A repeat of an extension already inside
+    /// the window refreshes it without growing the count — so retransmissions and periodic
+    /// re-registrations of the same AOR never accumulate.
+    pub fn record(&mut self, id: u64, now: u32, span: u32) -> u32 {
+        for i in 0..self.len as usize {
+            if self.ids[i] == id && now.saturating_sub(self.stamps[i]) < span {
+                self.stamps[i] = now;
+                return self.count_within(now, span);
+            }
+        }
+        self.ids[self.next as usize] = id;
+        self.stamps[self.next as usize] = now;
+        self.next = ((self.next as usize + 1) % N) as u8;
+        if (self.len as usize) < N {
+            self.len += 1;
+        }
+        self.count_within(now, span)
+    }
+
+    /// How many distinct extensions fall inside `span`, without recording one.
+    pub fn count_within(&self, now: u32, span: u32) -> u32 {
+        self.stamps[..self.len as usize]
+            .iter()
+            .filter(|s| now.saturating_sub(**s) < span)
+            .count() as u32
+    }
+
+    /// Forgets everything. Called when a registration is **accepted**: a source that has
+    /// logged in even once is not an enumerator.
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.next = 0;
+    }
+}
+
 /// Failed authentications for one source — requests that carried a credential and were
 /// rejected.
 pub type AuthFailures = SlidingCount<AUTH_FAILURES_TO_BLOCK>;

@@ -952,9 +952,9 @@ fn report(dec: &Decision, peer: Ipv4Addr, verbose: bool) {
             // Always visible: a run of rejected credentials is the precursor of Chain A.
             say!("AUTH FAILURES peer={peer} rejected_credentials_in_window={failures}")
         }
-        Decision::RegScan { attempts } => {
+        Decision::RegScan { extensions } => {
             // Always visible: registration scanning / extension enumeration.
-            say!("REG SCAN peer={peer} register_attempts_no_success={attempts}")
+            say!("REG SCAN peer={peer} distinct_extensions_no_success={extensions}")
         }
         Decision::AuthAbuse { attempts } => {
             // The backstop fired, which also says the softswitch never answered.

@@ -20,8 +20,7 @@ use crate::country::{self, Country};
 use crate::dialplan::DialPlan;
 use crate::novelty::Timestamp;
 use crate::perimeter::{
-    AuthAttempts, AuthFailures, NoiseFilter, SlidingCount, AUTH_FAILURE_WINDOW_SECS,
-    AUTH_WINDOW_SECS,
+    AuthAttempts, AuthFailures, NoiseFilter, RegProbes, AUTH_FAILURE_WINDOW_SECS, AUTH_WINDOW_SECS,
 };
 use crate::sip::{self, Message, Method};
 
@@ -77,9 +76,9 @@ pub enum Decision {
     /// `--` in the `From` header.
     Injection { pattern: &'static str },
     /// Registration scanning: many REGISTER attempts, none succeeding — enumerating
-    /// extensions or probing without ever logging in. Caught even with no credential
-    /// presented, which the auth-failure rule cannot see.
-    RegScan { attempts: u32 },
+    /// extensions without ever logging in. Carries the number of distinct extensions probed.
+    /// Caught even with no credential presented, which the auth-failure rule cannot see.
+    RegScan { extensions: u32 },
     /// Too many **rejected** credentials in the window — a password being guessed.
     ///
     /// This is the on-the-wire equivalent of what `fail2ban` reads out of a log file, and
@@ -162,14 +161,31 @@ pub struct Stats {
 const MAX_PEERS: usize = 10_000;
 
 /// REGISTER attempts from one source, with **no successful registration**, that mark it a
-/// registration scanner — enumerating extensions or brute-forcing without ever logging in.
-/// The "no success" gate is what spares a NAT or gateway behind one IP: a legitimate source
-/// registers at least one extension, an enumerator registers none. Catches the no-credential
-/// probe the auth-failure rule (which needs a credential) misses.
-pub const REG_SCAN_ATTEMPTS: usize = 6;
+/// registration scanner — enumerating extensions without ever logging in. Counted as the
+/// number of **distinct extensions** one source probes, so the rule is safe by construction:
+/// a legitimate phone registers its own single AOR (a multi-line device its own few), which
+/// never reaches this many; only a source spraying REGISTERs across many different extensions
+/// does. Set well above any plausible legitimate device so no real endpoint is ever banned;
+/// a real enumeration ("a few tries per extension, across the dial plan") sails past it.
+/// Catches the no-credential probe the auth-failure rule (which needs a credential) misses.
+pub const REG_SCAN_EXTENSIONS: usize = 5;
+
+/// Per-source capacity for the distinct-extension tracker; ≥ `REG_SCAN_EXTENSIONS`.
+const REG_PROBE_CAPACITY: usize = 8;
 
 /// Window for the registration-scan counter.
 pub const REG_SCAN_WINDOW_SECS: u32 = 600;
+
+/// FNV-1a hash of an extension (AOR), so the distinct-extension tracker holds a `u64` rather
+/// than borrowing the packet. Case-folded, since extensions are compared for identity only.
+fn ext_id(aor: &str) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in aor.bytes() {
+        h ^= b.to_ascii_lowercase() as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
 
 /// Ceiling on remembered known-good peers, to bound memory.
 const MAX_KNOWN_PEERS: usize = 50_000;
@@ -204,11 +220,11 @@ struct PeerState {
     /// International INVITEs still waiting for a final response, so the completion arm can
     /// be fed when one arrives.
     pending_intl: PendingAuth,
-    /// REGISTER attempts in the window — the registration-scan counter.
-    reg_attempts: SlidingCount<REG_SCAN_ATTEMPTS>,
-    /// When this source last completed a registration (a `2xx` to a REGISTER). A source with
-    /// a recent success is not an enumerator.
-    last_reg_success: u32,
+    /// Distinct extensions this source has probed with REGISTER — the enumeration counter.
+    reg_probes: RegProbes<REG_PROBE_CAPACITY>,
+    /// When this source last completed a registration (a `2xx` to a REGISTER); `None` until
+    /// it does. A source that has logged in even once is not an enumerator.
+    last_reg_success: Option<u32>,
 }
 
 /// How many authenticated transactions per peer can be awaiting a response.
@@ -552,7 +568,8 @@ impl Engine {
             && r.cseq
                 .is_some_and(|c| c.to_ascii_uppercase().contains("REGISTER"))
         {
-            st.last_reg_success = now.0;
+            st.last_reg_success = Some(now.0);
+            st.reg_probes.clear();
         }
 
         // Authentication path: a response to a REGISTER we recorded as an authenticated
@@ -655,31 +672,42 @@ impl Engine {
             return Decision::Scanner { id };
         }
 
-        // A credential was presented. The method is irrelevant — `REGISTER` is where a
-        // password is stolen and `INVITE` is where it is spent, and both are challenged the
-        // same way. What is recorded here is only the *attempt*; whether it was rejected is
-        // decided when the response arrives, in `observe_response`.
-        if req.method == Method::Register
+        // A credential is stolen at `REGISTER` and spent at `INVITE`, and both are challenged
+        // the same way, so the credential path below runs for **any** authenticated request;
+        // the enumeration counter is REGISTER-only. What either records is the *attempt*;
+        // whether it was rejected is decided when the response arrives, in `observe_response`.
+        let is_register = req.method == Method::Register;
+        let credentialed = req.is_authenticated_attempt();
+        if (is_register || credentialed)
             && (self.peers.len() < MAX_PEERS || self.peers.contains_key(&peer))
         {
             let plan = self.default_plan.clone();
             let params = self.params.clone();
-            let credentialed = req.is_authenticated_attempt();
             let st = self.peers.entry(peer).or_insert_with(|| PeerState {
                 dial_plan: plan,
                 anomaly: SourceAnomaly::new(&params),
                 ..Default::default()
             });
 
-            // Registration scanning: count every REGISTER, block once the source has made
-            // too many with no registration succeeding in the window. A source that logged
-            // in even once is not an enumerator.
-            let (rn, reg_exceeded) = st.reg_attempts.record(now.0, REG_SCAN_WINDOW_SECS);
-            let succeeded_recently = st.last_reg_success != 0
-                && now.0.saturating_sub(st.last_reg_success) < REG_SCAN_WINDOW_SECS;
-            if reg_exceeded && !succeeded_recently {
-                self.stats.reg_scans += 1;
-                return Decision::RegScan { attempts: rn };
+            // Registration scanning: an enumerator sprays REGISTERs across many *different*
+            // extensions and completes none. Counting distinct target extensions — not raw
+            // attempts — is what keeps a legitimate endpoint safe: a phone registers its own
+            // one (a device its few) AOR(s) however many times it retransmits, so it never
+            // climbs, and a source that has logged in even once is exempt outright.
+            if is_register {
+                let aor = req.to_user().or(req.request_user).unwrap_or("");
+                let distinct = st
+                    .reg_probes
+                    .record(ext_id(aor), now.0, REG_SCAN_WINDOW_SECS);
+                let succeeded = st
+                    .last_reg_success
+                    .is_some_and(|t| now.0.saturating_sub(t) < REG_SCAN_WINDOW_SECS);
+                if distinct as usize >= REG_SCAN_EXTENSIONS && !succeeded {
+                    self.stats.reg_scans += 1;
+                    return Decision::RegScan {
+                        extensions: distinct,
+                    };
+                }
             }
 
             if credentialed {
@@ -1126,32 +1154,80 @@ mod tests {
             Decision::Pass { country: "BR", .. }
         ));
     }
+    // A no-credential REGISTER probe against extension `ext` — the enumeration the
+    // auth-failure rule (which needs a credential) cannot see.
+    fn reg_probe(seq: u32, ext: &str) -> Vec<u8> {
+        format!(
+            "REGISTER sip:pbx SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z{seq}\r\n\
+             From: <sip:{ext}@pbx>;tag=t\r\nTo: <sip:{ext}@pbx>\r\n\
+             Call-ID: c{seq}\r\nCSeq: {seq} REGISTER\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
     #[test]
     fn registration_scanning_across_extensions_is_caught() {
-        // The user's case: an IP probes ext A four times (401), then ext B four times, never
-        // authenticating. Eight REGISTERs, no success -> registration scan.
+        // The user's case: an IP sprays a few REGISTERs per extension across the dial plan,
+        // never authenticating. Counting distinct extensions, the scan is caught once it has
+        // reached across enough of them, with no registration ever succeeding.
         let mut e = engine();
         let mut fired = false;
-        for i in 0..8u32 {
-            let ext = if i < 4 { "1001" } else { "1002" };
-            // no-credential REGISTER probes (the enumeration the auth rule misses)
-            let reg = format!(
-                "REGISTER sip:pbx SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z{i}\r\n\
-                 From: <sip:{ext}@pbx>;tag=t\r\nTo: <sip:{ext}@pbx>\r\n\
-                 Call-ID: c{i}\r\nCSeq: {i} REGISTER\r\n\r\n"
-            );
-            if matches!(
-                e.observe(peer(), reg.as_bytes(), t(i * 10)),
-                Decision::RegScan { .. }
-            ) {
-                fired = true;
+        let mut seq = 0u32;
+        for ext in 1000..1006 {
+            // a few tries per extension, as a real scanner paces it
+            for _ in 0..4 {
+                let reg = reg_probe(seq, &ext.to_string());
+                fired |= matches!(
+                    e.observe(peer(), &reg, t(seq * 5)),
+                    Decision::RegScan { .. }
+                );
+                seq += 1;
             }
         }
         assert!(
             fired,
-            "an IP probing extensions without ever registering must be caught"
+            "an IP probing many extensions without ever registering must be caught"
         );
         assert!(e.stats.reg_scans >= 1);
+    }
+
+    #[test]
+    fn a_phone_retransmitting_its_one_registration_is_never_a_reg_scanner() {
+        // The worst-case false positive: a legitimate phone on a lossy link retransmitting
+        // its single REGISTER many times before it has ever succeeded, in a deployment where
+        // no response is captured at all. One extension, so it must never be flagged.
+        let mut e = engine();
+        for seq in 0..30u32 {
+            let reg = reg_probe(seq, "2001");
+            assert!(
+                !matches!(e.observe(peer(), &reg, t(seq)), Decision::RegScan { .. }),
+                "a source touching only its own extension is not enumerating"
+            );
+        }
+        assert_eq!(e.stats.reg_scans, 0);
+    }
+
+    #[test]
+    fn a_multi_line_device_below_the_threshold_is_never_a_reg_scanner() {
+        // A multi-line device (a few AORs) that has not yet succeeded — e.g. it registers all
+        // its lines before any response returns — stays under the distinct-extension
+        // threshold and is never flagged.
+        let mut e = engine();
+        let mut seq = 0u32;
+        for round in 0..8 {
+            for line in 0..(REG_SCAN_EXTENSIONS as u32 - 1) {
+                let ext = format!("30{line:02}");
+                assert!(
+                    !matches!(
+                        e.observe(peer(), &reg_probe(seq, &ext), t(round)),
+                        Decision::RegScan { .. }
+                    ),
+                    "fewer than REG_SCAN_EXTENSIONS distinct AORs must never be flagged"
+                );
+                seq += 1;
+            }
+        }
+        assert_eq!(e.stats.reg_scans, 0);
     }
 
     #[test]
@@ -1294,9 +1370,10 @@ mod tests {
     #[test]
     fn a_register_flood_with_no_success_is_stopped() {
         // Authenticated REGISTERs from one source that never complete — whether the
-        // softswitch answers 401 or (as on the reference server) drops them silently. The
-        // registration-scan rule catches it on "no success", without needing to see a
-        // response, and sooner than any volume backstop.
+        // softswitch answers 401 or (as on the reference server) drops them silently. A flood
+        // against a single extension is not enumeration, so the auth-volume backstop stops it;
+        // a flood spread across extensions is caught by the registration-scan rule. Either
+        // verdict is a stop, and neither needs a response to be seen.
         let mut e = engine();
         let mut caught = false;
         for n in 0..20 {

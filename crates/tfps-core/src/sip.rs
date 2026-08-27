@@ -70,6 +70,12 @@ impl<'a> Request<'a> {
         self.from.and_then(uri_user)
     }
 
+    /// User part of `To` — for a REGISTER, the extension (AOR) being registered. The
+    /// registration-scan rule counts how many *distinct* ones a single source probes.
+    pub fn to_user(&self) -> Option<&'a str> {
+        self.to.and_then(uri_user)
+    }
+
     /// The `From` tag, needed to match a forged response.
     pub fn from_tag(&self) -> Option<&'a str> {
         self.from.and_then(|v| param(v, "tag"))
