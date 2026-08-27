@@ -52,6 +52,7 @@ static CODES: &[(&str, &str, u16)] = &[
     ("1441", "BM", 8),
     ("1473", "GD", 9),
     ("1649", "TC", 10),
+    ("1658", "JM", 240), // Jamaica overlay (876 is index 24)
     ("1664", "MS", 11),
     ("1670", "MP", 12),
     ("1671", "GU", 13),
@@ -60,6 +61,7 @@ static CODES: &[(&str, &str, u16)] = &[
     ("1758", "LC", 16),
     ("1767", "DM", 17),
     ("1784", "VC", 18),
+    ("1787", "PR", 241), // Puerto Rico (939 is index 25)
     ("1809", "DO", 19),
     ("1829", "DO", 20),
     ("1849", "DO", 21),
@@ -358,6 +360,27 @@ mod tests {
 
     fn dig(s: &str) -> InternationalDigits {
         InternationalDigits(s.to_string())
+    }
+
+    #[test]
+    fn caribbean_plus_one_is_its_own_country_not_nanp() {
+        // Caribbean +1 numbers are international to the US and are IPRN hotspots. They must
+        // resolve to the real country, never fall back to NANP. Dual area codes share the
+        // country's index.
+        for (digits, iso) in [
+            ("17671234567", "DM"), // Dominica
+            ("14731234567", "GD"), // Grenada
+            ("18761234567", "JM"), // Jamaica (876)
+            ("16581234567", "JM"), // Jamaica (658 overlay)
+            ("17871234567", "PR"), // Puerto Rico (787)
+            ("19391234567", "PR"), // Puerto Rico (939 overlay)
+            ("12681234567", "AG"), // Antigua
+        ] {
+            assert_eq!(resolve(&dig(digits)).unwrap().iso, iso, "{digits}");
+        }
+        // Only geographic US/Canada lands on NANP.
+        assert_eq!(resolve(&dig("12125551234")).unwrap().iso, "NANP");
+        assert_eq!(resolve(&dig("14165551234")).unwrap().iso, "NANP");
     }
 
     #[test]

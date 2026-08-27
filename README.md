@@ -271,6 +271,27 @@ a country** without correct prefix stripping. `bare_e164` says the PBX sends pla
 no prefix — common in wholesale; it is an explicit field because the semantics are
 dangerous: with it on, `2125551234` is Morocco; with it off, a domestic US number.
 
+### NANPA (+1) — the Caribbean is international
+
+`+1` is not one country. The US and Canada share it with ~30 Caribbean and territory nations
+— Dominica (+1-767), Grenada (+1-473), Jamaica (+1-876), Antigua (+1-268)… — and several are
+**IPRN hotspots**: fraud that looks like a domestic `+1` call but routes internationally to a
+premium range. TFPS breaks `+1` into all of them; only geographic US/Canada resolves to
+`NANP`.
+
+To catch it as a NANPA operator, two settings:
+
+```json
+{ "peers": { "10.0.0.5": { "bare_e164": true } }, "home_countries": ["NANP"] }
+```
+
+- **`bare_e164`** (or the `+` prefix) so a `+1XXX` number keeps its country code and resolves
+  to the real country — **never a stripped `"1"` prefix**: stripping the `1` turns 1-212 into
+  `212` (Morocco) and 1-767 into `767…` (Russia). TFPS warns at startup if it sees `"1"`
+  configured as a prefix.
+- **`home_countries: ["NANP"]`** so geographic US/Canada is national, while the Caribbean +1
+  countries — separate entries — are judged as international, which is what they are.
+
 ### `signatures` and `injection` — they add, never replace
 
 The seeds are compiled into the binary and work with no file. What you list is **added** to

@@ -128,6 +128,33 @@ fn strip_visual_separators(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::country;
+
+    #[test]
+    fn nanpa_bare_e164_keeps_the_country_code_stripping_1_would_not() {
+        // For a NANPA operator, +1 numbers must resolve as +1XXX — keeping the leading 1,
+        // which is the country code. Stripping a bare "1" as if it were a dialling prefix
+        // is catastrophic: the remaining area code collides with real country codes.
+        let strip1 = DialPlan::new(["1"]);
+        let (d, _) = strip1.to_international_with_prefix("12125551234").unwrap();
+        assert_eq!(
+            country::resolve(&d).unwrap().iso,
+            "MA",
+            "1-212 wrongly becomes Morocco"
+        );
+
+        // The correct config: bare E.164, so the whole +1XXX resolves.
+        let e164 = DialPlan::new(["011"]).with_bare_e164();
+        let (us, _) = e164.to_international_with_prefix("12125551234").unwrap();
+        assert_eq!(country::resolve(&us).unwrap().iso, "NANP", "geographic US");
+        let (dm, _) = e164.to_international_with_prefix("17671234567").unwrap();
+        assert_eq!(
+            country::resolve(&dm).unwrap().iso,
+            "DM",
+            "Dominica IPRN is international"
+        );
+    }
+
     use super::*;
 
     fn plan() -> DialPlan {

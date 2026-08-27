@@ -397,6 +397,20 @@ fn main() -> ExitCode {
     say!("tfps {} — starting", env!("CARGO_PKG_VERSION"));
     say!("  watched ports     : {:?}", args.ports);
     say!("  intl prefixes     : {:?}", args.intl_prefixes);
+    // The NANPA footgun: a bare "1" stripped as a prefix turns 1-212-… into 212… which
+    // resolves to Morocco, and 1-767… into Russia. +1 numbers must keep their country code.
+    let peer_has_one = args
+        .peer_plans
+        .iter()
+        .any(|(_, p)| p.prefixes().iter().any(|x| x == "1"));
+    if args.intl_prefixes.iter().any(|p| p == "1") || peer_has_one {
+        eprintln!(
+            "WARNING: \"1\" is configured as an international prefix. For NANPA (+1), \
+             stripping it mis-resolves numbers (1-212 -> Morocco, 1-767 -> Russia). Use \
+             `bare_e164` (or the `+` prefix) so +1XXX keeps its country code, and set \
+             `home_countries: [\"NANP\"]` for domestic US/Canada."
+        );
+    }
     // The behavioural layer only reasons about *international* destinations, and the
     // international prefixes are how it tells one from an internal extension or an inbound
     // call to an E.164 DID. Wrong prefixes mean the wrong calls are judged — so with
