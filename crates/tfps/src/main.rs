@@ -715,8 +715,20 @@ fn main() -> ExitCode {
                 s.apiban_prune(t.0.saturating_sub(APIBAN_RETENTION_SECS));
                 // Only the behavioural layer has learned state worth persisting.
                 if engine.behavioural_enabled() {
+                    // Refit the benign hypotheses and the volume prior from the traffic seen
+                    // so far, then persist. This is the self-calibration: the operator tunes
+                    // error rates, never the traffic constants.
+                    engine.recalibrate();
+                    let p = engine.params();
+                    s.meta_set(
+                        "calibration",
+                        &format!(
+                            "theta0={:.3} theta0_prefix={:.3} theta0c={:.3} prior_mean={:.2}",
+                            p.theta0, p.theta0_prefix, p.theta0c, p.prior_mean
+                        ),
+                    );
                     match s.checkpoint(&engine) {
-                        Ok((p, _)) if args.verbose => say!("    checkpoint: {p} pairs written"),
+                        Ok((n, _)) if args.verbose => say!("    checkpoint: {n} sources written"),
                         Ok(_) => {}
                         Err(e) => eprintln!("ALARM: checkpoint failed — {e}"),
                     }

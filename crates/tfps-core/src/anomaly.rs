@@ -63,6 +63,16 @@ impl SeqTest {
         self.evidence()
     }
 
+    /// Adopts new hypotheses and bounds, keeping the walk where it stands. Used when the
+    /// population estimate of the benign rate improves.
+    pub fn recalibrate(&mut self, theta0: f64, theta1: f64, alpha: f64, beta: f64) {
+        self.step_hit = (theta1 / theta0).ln();
+        self.step_miss = ((1.0 - theta1) / (1.0 - theta0)).ln();
+        self.upper = ((1.0 - beta) / alpha).ln();
+        self.floor = (beta / (1.0 - alpha)).ln();
+        self.llr = self.llr.clamp(self.floor, self.upper + 1.0);
+    }
+
     /// Leaks the walk toward zero. Applied by elapsed time before each trial, so novelty
     /// spread over hours never accumulates while a burst in minutes does — which is what
     /// separates a legitimate source discovering its few countries from a scanner.
@@ -149,6 +159,9 @@ impl RateModel {
 pub struct Params {
     pub theta0: f64,
     pub theta1: f64,
+    /// Prefix arm's benign first-contact rate. Lower than `theta0`: most sources settle on
+    /// one dialling format, so a novel prefix is rarer than a novel country.
+    pub theta0_prefix: f64,
     /// Completion arm: probability a *final* international response is a failure. Benign
     /// traffic mostly completes; a scanner probing dead routes mostly does not.
     pub theta0c: f64,
@@ -172,6 +185,7 @@ impl Default for Params {
         Self {
             theta0: 0.15,
             theta1: 0.70,
+            theta0_prefix: 0.05,
             theta0c: 0.20,
             theta1c: 0.85,
             alpha,
@@ -201,6 +215,8 @@ pub struct Verdict {
     pub countries: u32,
     /// This country was a first for the source.
     pub first_time: bool,
+    /// This dialling prefix was a first for the source.
+    pub first_prefix: bool,
     /// The fused evidence crossed the fire bound.
     pub fired: bool,
 }
@@ -250,7 +266,7 @@ impl SourceAnomaly {
             country_scan: SeqTest::new(p.theta0, p.theta1, p.alpha, p.beta),
             seen_prefixes: 0,
             prefix_bits_set: 0,
-            prefix_scan: SeqTest::new(p.theta0, p.theta1, p.alpha, p.beta),
+            prefix_scan: SeqTest::new(p.theta0_prefix, p.theta1, p.alpha, p.beta),
             completion_scan: SeqTest::new(p.theta0c, p.theta1c, p.alpha, p.beta),
             rate: RateModel::new(p.prior_mean, p.prior_strength, p.decay),
             window_start: 0,
@@ -330,7 +346,9 @@ impl SourceAnomaly {
         let prefix_bits = self.prefix_scan.observe(novel_prefix);
 
         let _ = (country_bits, prefix_bits);
-        self.fused(first_time)
+        let mut v = self.fused(first_time);
+        v.first_prefix = novel_prefix;
+        v
     }
 
     /// Records an observed **outcome** of an international call from this source: whether it
@@ -365,8 +383,25 @@ impl SourceAnomaly {
             completion_bits,
             countries: self.n_countries,
             first_time,
+            first_prefix: false,
             fired: evidence >= self.fire_bits,
         }
+    }
+
+    /// Adopts calibrated hypotheses across all three scan arms, keeping their walks.
+    pub fn recalibrate(&mut self, p: &Params) {
+        self.country_scan
+            .recalibrate(p.theta0, p.theta1, p.alpha, p.beta);
+        self.prefix_scan
+            .recalibrate(p.theta0_prefix, p.theta1, p.alpha, p.beta);
+        self.completion_scan
+            .recalibrate(p.theta0c, p.theta1c, p.alpha, p.beta);
+        self.fire_bits = p.fire_bits;
+    }
+
+    /// The source's learned international-call rate, for the population prior fit.
+    pub fn learned_rate(&self) -> f64 {
+        self.rate.rate()
     }
 
     pub fn distinct_countries(&self) -> u32 {

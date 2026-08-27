@@ -126,6 +126,8 @@ pub struct Stats {
     pub intl_completed: u64,
     /// International calls observed to fail (a final `4xx`/`5xx`/`6xx`) — the scan signal.
     pub intl_failed: u64,
+    /// First-time-prefix events, for the learned prefix benign rate.
+    pub prefix_novel: u64,
     pub invites: u64,
     pub international: u64,
     pub uncanonicalizable: u64,
@@ -220,6 +222,10 @@ impl PendingAuth {
 
 pub struct Engine {
     peers: HashMap<Ipv4Addr, PeerState>,
+    /// The benign hypotheses and priors every source is judged against. Starts at the
+    /// cold-start defaults and is refined from the deployment's own aggregate traffic
+    /// during the learning window — see `recalibrate`.
+    params: Params,
     default_plan: DialPlan,
     mode: Mode,
     /// Whether behavioural fraud detection runs at all.
@@ -242,6 +248,7 @@ impl Engine {
             peers: HashMap::new(),
             default_plan,
             mode,
+            params: Params::default(),
             behavioural: false,
             noise_filter: NoiseFilter::new(),
             stats: Stats::default(),
@@ -270,6 +277,55 @@ impl Engine {
 
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
+    }
+
+    /// The calibrated parameters currently in force, for the report.
+    pub fn params(&self) -> &Params {
+        &self.params
+    }
+
+    /// Refits the benign hypotheses and the volume prior from the deployment's own
+    /// aggregate traffic, then adopts them across every source. Meant to be called
+    /// periodically (at checkpoint) during the learning window — it is the self-calibration
+    /// the design calls for, so the operator tunes only the error rates, never the traffic
+    /// constants. A parameter is only overridden once there is enough data to trust it;
+    /// otherwise the cold-start default stands.
+    pub fn recalibrate(&mut self) {
+        let mut p = self.params.clone();
+        // theta0: the population rate of first-time countries. Clamped so a pathological
+        // sample cannot make the walk fire on everything or never.
+        if self.stats.international >= 500 {
+            let r = self.stats.novel as f64 / self.stats.international as f64;
+            p.theta0 = r.clamp(0.02, 0.5);
+            let rp = self.stats.prefix_novel as f64 / self.stats.international as f64;
+            p.theta0_prefix = rp.clamp(0.005, 0.3);
+        }
+        // theta0c: the population failure rate among observed final responses.
+        let finals = self.stats.intl_completed + self.stats.intl_failed;
+        if finals >= 200 {
+            let rc = self.stats.intl_failed as f64 / finals as f64;
+            p.theta0c = rc.clamp(0.05, 0.7);
+        }
+        // Volume prior: a method-of-moments Gamma fit to the current per-source rates.
+        let rates: Vec<f64> = self
+            .peers
+            .values()
+            .map(|s| s.anomaly.learned_rate())
+            .collect();
+        if rates.len() >= 20 {
+            let n = rates.len() as f64;
+            let mean = rates.iter().sum::<f64>() / n;
+            let var = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
+            if mean > 0.0 && var > 0.0 {
+                p.prior_mean = mean;
+                p.prior_strength = (mean / var).clamp(0.1, 50.0);
+            }
+        }
+        self.params = p;
+        // Adopt the refined hypotheses across every source, keeping their walks in place.
+        for st in self.peers.values_mut() {
+            st.anomaly.recalibrate(&self.params);
+        }
     }
 
     pub fn peer_count(&self) -> usize {
@@ -301,12 +357,14 @@ impl Engine {
             return;
         }
         let plan = self.default_plan.clone();
+        let params = self.params.clone();
         let st = self.peers.entry(r.peer).or_insert_with(|| PeerState {
             dial_plan: plan,
+            anomaly: SourceAnomaly::new(&params),
             ..Default::default()
         });
         st.anomaly = SourceAnomaly::from_snapshot(
-            &Params::default(),
+            &params,
             AnomalySnapshot {
                 seen_countries: r.seen_countries,
                 n_countries: r.n_countries,
@@ -481,8 +539,10 @@ impl Engine {
             self.stats.auth_attempts += 1;
             if self.peers.len() < MAX_PEERS || self.peers.contains_key(&peer) {
                 let plan = self.default_plan.clone();
+                let params = self.params.clone();
                 let st = self.peers.entry(peer).or_insert_with(|| PeerState {
                     dial_plan: plan,
+                    anomaly: SourceAnomaly::new(&params),
                     ..Default::default()
                 });
                 if let Some(key) = sip::transaction_key(req.via_branch(), req.call_id, req.cseq) {
@@ -517,8 +577,10 @@ impl Engine {
             self.stats.peers_dropped += 1;
             return Decision::OutOfScope("peer ceiling reached");
         }
+        let params = self.params.clone();
         let state = self.peers.entry(peer).or_insert_with(|| PeerState {
             dial_plan: self.default_plan.clone(),
+            anomaly: SourceAnomaly::new(&params),
             ..Default::default()
         });
 
@@ -558,6 +620,7 @@ impl Engine {
         }
         // A first-time country registers as novelty for the report's thermometer.
         stats.novel += u64::from(v.first_time);
+        stats.prefix_novel += u64::from(v.first_prefix);
         let bits = v.evidence.round().max(0.0) as u32;
 
         if !v.fired {
@@ -800,6 +863,36 @@ mod tests {
         }
         assert!(!ever, "completing calls are not a scan");
         assert!(e.stats.intl_completed > 0);
+    }
+
+    #[test]
+    fn recalibration_learns_the_benign_rate_and_still_catches_a_scan() {
+        // Feed a lot of settled, single-country traffic so the population theta0 falls,
+        // then confirm a scan still fires against the tighter baseline.
+        let mut e = engine();
+        for i in 0..1000u32 {
+            // one country, so novelty is rare after the first call — a low population rate
+            e.observe(peer(), &invite(&format!("a{i}"), "00551199998888"), t(i));
+        }
+        let before = e.params().theta0;
+        e.recalibrate();
+        assert!(
+            e.params().theta0 < before,
+            "theta0 fell toward the observed rate"
+        );
+        assert!(e.params().theta0 >= 0.02, "but is clamped away from zero");
+
+        // A fresh scanner is still caught under the recalibrated params.
+        let scanner = Ipv4Addr::new(203, 0, 113, 9);
+        let mut fired = false;
+        for i in 0..20u16 {
+            let dest = format!("00{}12345678", 30 + i);
+            fired |= matches!(
+                e.observe(scanner, &invite("x", &dest), t(100_000 + i as u32 * 60)),
+                Decision::Block { .. }
+            );
+        }
+        assert!(fired, "recalibration must not blind the detector to a scan");
     }
 
     #[test]

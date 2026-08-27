@@ -267,6 +267,15 @@ fn stats(args: &Args) -> Result<(), String> {
         }
     }
 
+    if let Some(cal) = s.meta_get("calibration").filter(|c| !c.is_empty()) {
+        say!("\nCALIBRATION  (benign hypotheses learned from this deployment)");
+        for kv in cal.split_whitespace() {
+            if let Some((k, v)) = kv.split_once('=') {
+                say!("  {k:<16} {v:>10}");
+            }
+        }
+    }
+
     let (pairs, peers, _) = s.totals()?;
     let (countries, calls) = s.country_spread()?;
     say!("\nLEARNED");

@@ -161,10 +161,21 @@ documented bypass. Simpler and stronger than the previous per-pair bitmap.
 ## Self-calibration
 
 The benign hypotheses are learned from the deployment's **own aggregate traffic** (permitted
-— aggregate data, never a corpus): θ₀ is the observed rate of novel-country calls across
-mature sources; the population Gamma prior is a method-of-moments fit to per-source rates.
-No per-install threshold tuning. Only α and β are set, and they are properties of the
-operator's risk appetite, not of the traffic.
+— aggregate data, never a corpus), and this is now wired up: at each checkpoint during the
+learning window, `Engine::recalibrate` refits
+
+- **θ₀** (country) and **θ₀ (prefix)** from the population rate of first-time countries and
+  prefixes — `novel / international`;
+- **θ₀c** from the population failure rate among *observed final responses* —
+  `intl_failed / (intl_failed + intl_completed)`;
+- the **volume Gamma prior** as a method-of-moments fit to the current per-source rates,
+
+then adopts them across every source, keeping each walk in place. A parameter is overridden
+only once there is enough data to trust it (≥500 international calls, ≥200 final responses,
+≥20 sources); until then the cold-start default stands, and every value is clamped so a
+pathological sample can neither blind the detector nor make it fire on everything. The
+operator sets only α and β — properties of their risk appetite, never of the traffic — and
+`tfps_ctl stats` shows the learned constants under CALIBRATION.
 
 ## Limitations, stated
 
