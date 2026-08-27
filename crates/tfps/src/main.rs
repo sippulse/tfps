@@ -60,6 +60,7 @@ struct Args {
     checkpoint_every: u64,
     apiban_key: Option<String>,
     ignoreip: Vec<String>,
+    home_countries: Vec<String>,
     signatures: Option<PathBuf>,
     config: PathBuf,
     /// Per-peer dial plan from the file. Declaring beats learning because it holds on
@@ -93,6 +94,7 @@ impl Default for Args {
             checkpoint_every: 300,
             apiban_key: None,
             ignoreip: Vec::new(),
+            home_countries: Vec::new(),
             signatures: None,
             config: PathBuf::from(config::DEFAULT_PATH),
             peer_plans: Vec::new(),
@@ -124,6 +126,7 @@ USAGE: tfps [options]
       --checkpoint-every N seconds between writes      (default: 300)
       --apiban-key KEY     enable APIBAN (optional, in the background)
       --ignoreip CIDR      never enforce against this address or network (repeatable)
+      --home-country ISO   your own country, not treated as international (repeatable)
       --signatures PATH    file that ADDS signatures to the built-in ones
       --config PATH        configuration               (default: /etc/tfps/config.json)
   -h, --help               this help
@@ -182,6 +185,7 @@ fn parse_args() -> Result<Args, String> {
             "--no-db" => a.db = PathBuf::new(),
             "--apiban-key" => a.apiban_key = Some(next("--apiban-key")?),
             "--ignoreip" => a.ignoreip.push(next("--ignoreip")?),
+            "--home-country" => a.home_countries.push(next("--home-country")?),
             "--signatures" => a.signatures = Some(PathBuf::from(next("--signatures")?)),
             "--config" => a.config = PathBuf::from(next("--config")?),
             "--checkpoint-every" => {
@@ -227,6 +231,7 @@ fn apply_config(a: &mut Args, c: &config::Config) {
     // The file adds to the command line here rather than replacing it: both are the
     // operator's own words, and dropping either would be a surprise.
     a.ignoreip.extend(c.ignoreip.iter().cloned());
+    a.home_countries.extend(c.home_countries.iter().cloned());
     if !a.given.contains("--apiban-key") && c.apiban_key.is_some() {
         a.apiban_key = c.apiban_key.clone();
     }
@@ -330,6 +335,10 @@ fn main() -> ExitCode {
     if args.behavioural {
         engine = engine.with_behavioural();
     }
+    let unknown_home = engine.set_home_countries(args.home_countries.iter().map(String::as_str));
+    for iso in &unknown_home {
+        eprintln!("WARNING: home country \"{iso}\" is not a known ISO label — ignored");
+    }
 
     // Signatures **add** to the built-in ones; they never replace. Replacing would make
     // someone who writes three lines silently lose the 18 shipped ones.
@@ -398,6 +407,21 @@ fn main() -> ExitCode {
              calls. Configure `intl_prefixes` (globally and per peer) for THIS installation \
              — it is how extensions and inbound E.164 DIDs are told apart from real \
              outbound international destinations. Defaults are a starting point, not a fit."
+        );
+        if engine.home_country_count() == 0 {
+            say!(
+                "  RECOMMENDED       : set `home_countries` (e.g. [\"BR\"]) so calls to your \
+                 own country are treated as national, not international."
+            );
+        } else {
+            say!(
+                "  home countries    : {} configured (national, not international)",
+                engine.home_country_count()
+            );
+        }
+        say!(
+            "  RECOMMENDED       : add your INBOUND gateway IPs to `ignoreip` — they deliver \
+             calls to your internal destinations and should never be judged or blocked."
         );
     }
     if !engine.behavioural_enabled() {

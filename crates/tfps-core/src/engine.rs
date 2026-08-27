@@ -128,6 +128,8 @@ pub struct Stats {
     pub intl_failed: u64,
     /// First-time-prefix events, for the learned prefix benign rate.
     pub prefix_novel: u64,
+    /// Calls to the operator's own country — national, excluded from the behavioural layer.
+    pub domestic: u64,
     pub invites: u64,
     pub international: u64,
     pub uncanonicalizable: u64,
@@ -228,6 +230,11 @@ pub struct Engine {
     params: Params,
     default_plan: DialPlan,
     mode: Mode,
+    /// The operator's own country/countries, by index. A destination resolving to one of
+    /// these is **national, not international** — even when it arrived with a `+` or in
+    /// E.164 — so it is out of scope for the behavioural layer. This is what keeps an
+    /// inbound call to your own DID from being judged as an international destination.
+    home_countries: std::collections::HashSet<u16>,
     /// Whether behavioural fraud detection runs at all.
     ///
     /// **Off by default.** The product is noise reduction — the perimeter and its clean
@@ -249,6 +256,7 @@ impl Engine {
             default_plan,
             mode,
             params: Params::default(),
+            home_countries: std::collections::HashSet::new(),
             behavioural: false,
             noise_filter: NoiseFilter::new(),
             stats: Stats::default(),
@@ -282,6 +290,29 @@ impl Engine {
     /// The calibrated parameters currently in force, for the report.
     pub fn params(&self) -> &Params {
         &self.params
+    }
+
+    /// Declares the operator's own country/countries by ISO label (`+1` is `NANP`).
+    /// Returns the labels it could not resolve, so the binary can warn about a typo rather
+    /// than silently leave a country international.
+    pub fn set_home_countries<'a>(
+        &mut self,
+        isos: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<String> {
+        let mut unknown = Vec::new();
+        for iso in isos {
+            match crate::country::index_for_iso(iso) {
+                Some(idx) => {
+                    self.home_countries.insert(idx.0);
+                }
+                None => unknown.push(iso.to_string()),
+            }
+        }
+        unknown
+    }
+
+    pub fn home_country_count(&self) -> usize {
+        self.home_countries.len()
     }
 
     /// Refits the benign hypotheses and the volume prior from the deployment's own
@@ -596,6 +627,13 @@ impl Engine {
             return Decision::UnknownCountry(digits.0);
         };
 
+        // The operator's own country is national traffic, not fraud — this is where an
+        // inbound call to a home E.164 DID leaves, before the detector ever sees it.
+        if self.home_countries.contains(&c.index.0) {
+            self.stats.domestic += 1;
+            return Decision::OutOfScope("home country");
+        }
+
         Self::decide(&prefix, state, req, c, now, self.mode, &mut self.stats)
     }
 
@@ -753,6 +791,36 @@ mod tests {
         assert!(matches!(d, Decision::OutOfScope(_)));
         // The cheapest filter: it never reached the international path.
         assert_eq!(e.stats.international, 0);
+    }
+
+    #[test]
+    fn a_call_to_the_home_country_is_national_not_international() {
+        // An inbound call to your own E.164 DID resolves to your country — that is national
+        // traffic and must leave before the detector sees it.
+        let mut e = engine();
+        assert!(e.set_home_countries(["BR"]).is_empty());
+        let d = e.observe(peer(), &invite("200", "005511999998888"), t(0));
+        assert!(
+            matches!(d, Decision::OutOfScope("home country")),
+            "a Brazilian destination is national for a BR operator: {d:?}"
+        );
+        assert_eq!(e.stats.domestic, 1);
+        assert_eq!(
+            e.stats.international, 1,
+            "it was still counted as reaching the intl path"
+        );
+        // A different country is still international.
+        assert!(matches!(
+            e.observe(peer(), &invite("200", "00447700900123"), t(1)),
+            Decision::Pass { country: "GB", .. }
+        ));
+    }
+
+    #[test]
+    fn an_unknown_home_country_label_is_reported() {
+        let mut e = engine();
+        assert_eq!(e.set_home_countries(["BR", "ZZ", "nanp"]), vec!["ZZ"]);
+        assert_eq!(e.home_country_count(), 2);
     }
 
     #[test]

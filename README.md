@@ -141,6 +141,17 @@ IRSF by anomaly.
 > it tells a real outbound international call from an internal extension or an inbound call to
 > an E.164 DID. Get them wrong and the wrong calls are judged. The defaults are a starting
 > point, not a fit for your installation — set them, and the detector's job becomes correct.
+>
+> **Two companions to that setting**, both about not judging traffic that isn't outbound
+> international fraud:
+>
+> - **`home_countries`** — your own country (or countries), as ISO labels (`+1` is `NANP`).
+>   A destination that resolves to one of them is *national*, not international, even when it
+>   arrives with a `+` or in E.164 — so an inbound call to your own DID is not mistaken for a
+>   foreign destination. Without it, startup recommends setting it.
+> - **`ignoreip` your inbound gateways** — the carriers that deliver calls *to* your internal
+>   destinations should never be judged or blocked. Put their IPs in `ignoreip`; startup
+>   recommends this too.
 
 The full design and its literature are in
 [`docs/anomaly-detection.md`](docs/anomaly-detection.md); in brief:
@@ -201,6 +212,7 @@ integrations. Never **policy** configuration, which would say what fraud is.
   "signatures": ["MyLocalScanner", "=sipsak"],
   "injection": ["xp_cmdshell"],
   "ignoreip": ["10.0.0.0/8", "203.0.113.7"],
+  "home_countries": ["BR"],
 
   "behavioural": false,
   "apiban_key": "optional-key",

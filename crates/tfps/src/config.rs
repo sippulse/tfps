@@ -16,6 +16,7 @@
 //!   "signatures": ["MyLocalScanner", "=sipsak"],
 //!   "injection": ["xp_cmdshell"],
 //!   "ignoreip": ["10.0.0.0/8", "203.0.113.7"],
+//!   "home_countries": ["BR"],
 //!   "behavioural": false,
 //!   "apiban_key": "...",
 //!   "learn_days": 30,
@@ -76,6 +77,12 @@ pub struct Config {
     /// which is what keeps it inside `SPEC.md` §11.
     #[serde(default, alias = "ignore")]
     pub ignoreip: Vec<String>,
+    /// The operator's own country/countries, ISO labels (`+1` is `NANP`). A destination
+    /// resolving to one of these is national, not international, and is excluded from the
+    /// behavioural layer — this is what stops an inbound call to your own E.164 DID from
+    /// being judged as an international destination.
+    #[serde(default)]
+    pub home_countries: Vec<String>,
     /// Turn on behavioural fraud detection (country novelty and the rest). **Off by
     /// default**: the product is noise reduction, and the behavioural layer is an opt-in
     /// extra most installs will not need.

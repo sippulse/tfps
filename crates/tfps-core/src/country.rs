@@ -314,6 +314,15 @@ pub fn resolve(digits: &InternationalDigits) -> Option<Country> {
 /// countries — the control tool, and the day-31 summary.
 ///
 /// A linear scan: the table has 240 entries and this is never on the packet path.
+/// The stable index for an ISO label (case-insensitive), for configuring home countries.
+/// `+1` countries share the `NANP` label. Returns `None` for a label not in the table.
+pub fn index_for_iso(iso: &str) -> Option<CountryIndex> {
+    CODES
+        .iter()
+        .find(|(_, label, _)| label.eq_ignore_ascii_case(iso))
+        .map(|(_, _, i)| CountryIndex(*i))
+}
+
 pub fn iso_for_index(index: u16) -> Option<&'static str> {
     CODES
         .iter()
@@ -349,6 +358,15 @@ mod tests {
 
     fn dig(s: &str) -> InternationalDigits {
         InternationalDigits(s.to_string())
+    }
+
+    #[test]
+    fn iso_resolves_to_the_same_index_it_labels() {
+        let br = resolve(&dig("5511999998888")).unwrap().index;
+        assert_eq!(index_for_iso("BR"), Some(br));
+        assert_eq!(index_for_iso("br"), Some(br), "case-insensitive");
+        assert_eq!(index_for_iso("NANP"), Some(CountryIndex(0)), "+1 is NANP");
+        assert_eq!(index_for_iso("ZZ"), None, "an unknown label is None");
     }
 
     #[test]
