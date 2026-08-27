@@ -6,6 +6,7 @@
 //!
 //! Architecture in `SPEC.md`, normative vocabulary in `CONTEXT.md`.
 
+pub mod anomaly;
 pub mod country;
 pub mod dialplan;
 pub mod engine;
