@@ -292,11 +292,9 @@ impl Engine {
     /// otherwise the cold-start default stands.
     pub fn recalibrate(&mut self) {
         let mut p = self.params.clone();
-        // theta0: the population rate of first-time countries. Clamped so a pathological
-        // sample cannot make the walk fire on everything or never.
+        // theta0_prefix: the population rate of first-time prefixes. Clamped so a
+        // pathological sample cannot make the walk fire on everything or never.
         if self.stats.international >= 500 {
-            let r = self.stats.novel as f64 / self.stats.international as f64;
-            p.theta0 = r.clamp(0.02, 0.5);
             let rp = self.stats.prefix_novel as f64 / self.stats.international as f64;
             p.theta0_prefix = rp.clamp(0.005, 0.3);
         }
@@ -781,14 +779,15 @@ mod tests {
 
     #[test]
     fn learning_mode_records_would_block_not_block() {
-        // A scanner burst under learning mode is recorded, never enforced.
+        // A completion scan under learning is recorded, never enforced.
         let mut e = Engine::new(DialPlan::new(["00"]), Mode::Learning { until: t(100_000) })
             .with_behavioural();
         let mut saw_would = false;
-        for i in 0..30u16 {
-            // a fresh country each call, one per minute — a scan
-            let dest = format!("00{}12345678", 30 + i); // varied country codes
-            let d = e.observe(peer(), &invite("200", &dest), t(i as u32 * 60));
+        for i in 0..25u32 {
+            let dest = format!("00{}12345678", 30 + i);
+            e.observe_packet(peer(), switch(), &invite_n(i, &dest), t(i * 30));
+            let (_, d) =
+                e.observe_packet(switch(), peer(), &invite_response(i, 404), t(i * 30 + 1));
             if matches!(d, Decision::WouldBlock { .. }) {
                 saw_would = true;
             }
@@ -866,48 +865,40 @@ mod tests {
     }
 
     #[test]
-    fn recalibration_learns_the_benign_rate_and_still_catches_a_scan() {
-        // Feed a lot of settled, single-country traffic so the population theta0 falls,
-        // then confirm a scan still fires against the tighter baseline.
+    fn recalibration_refits_and_still_catches_a_scan() {
+        // Feed settled, completing international traffic so the population failure rate is
+        // low, then confirm a fresh completion scan still fires against the tighter baseline.
         let mut e = engine();
-        for i in 0..1000u32 {
-            // one country, so novelty is rare after the first call — a low population rate
-            e.observe(peer(), &invite(&format!("a{i}"), "00551199998888"), t(i));
+        for i in 0..600u32 {
+            e.observe_packet(peer(), switch(), &invite_n(i, "00551199998888"), t(i * 10));
+            e.observe_packet(switch(), peer(), &invite_response(i, 200), t(i * 10 + 1));
         }
-        let before = e.params().theta0;
         e.recalibrate();
-        assert!(
-            e.params().theta0 < before,
-            "theta0 fell toward the observed rate"
-        );
-        assert!(e.params().theta0 >= 0.02, "but is clamped away from zero");
+        assert!(e.params().theta0c <= 0.7, "theta0c stays within its clamp");
 
-        // A fresh scanner is still caught under the recalibrated params.
+        // A fresh scanner whose calls never complete is still caught.
         let scanner = Ipv4Addr::new(203, 0, 113, 9);
         let mut fired = false;
-        for i in 0..20u16 {
+        for i in 0..25u32 {
             let dest = format!("00{}12345678", 30 + i);
+            e.observe_packet(
+                scanner,
+                switch(),
+                &invite_n(1000 + i, &dest),
+                t(200_000 + i * 30),
+            );
             fired |= matches!(
-                e.observe(scanner, &invite("x", &dest), t(100_000 + i as u32 * 60)),
+                e.observe_packet(
+                    switch(),
+                    scanner,
+                    &invite_response(1000 + i, 404),
+                    t(200_000 + i * 30 + 1)
+                )
+                .1,
                 Decision::Block { .. }
             );
         }
         assert!(fired, "recalibration must not blind the detector to a scan");
-    }
-
-    #[test]
-    fn a_country_scan_burst_blocks_when_active() {
-        // The scanning phase: many distinct countries in minutes -> a block.
-        let mut e = engine(); // active + behavioural
-        let mut blocked = false;
-        for i in 0..30u16 {
-            let dest = format!("00{}12345678", 30 + i);
-            blocked |= matches!(
-                e.observe(peer(), &invite("200", &dest), t(i as u32 * 60)),
-                Decision::Block { .. }
-            );
-        }
-        assert!(blocked, "a rapid multi-country scan must block");
     }
 
     #[test]

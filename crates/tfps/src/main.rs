@@ -388,6 +388,18 @@ fn main() -> ExitCode {
     say!("tfps {} — starting", env!("CARGO_PKG_VERSION"));
     say!("  watched ports     : {:?}", args.ports);
     say!("  intl prefixes     : {:?}", args.intl_prefixes);
+    // The behavioural layer only reasons about *international* destinations, and the
+    // international prefixes are how it tells one from an internal extension or an inbound
+    // call to an E.164 DID. Wrong prefixes mean the wrong calls are judged — so with
+    // behavioural on, make the operator confirm them rather than trust a default.
+    if engine.behavioural_enabled() {
+        say!(
+            "  ATTENTION         : behavioural detection reasons only about INTERNATIONAL \
+             calls. Configure `intl_prefixes` (globally and per peer) for THIS installation \
+             — it is how extensions and inbound E.164 DIDs are told apart from real \
+             outbound international destinations. Defaults are a starting point, not a fit."
+        );
+    }
     if !engine.behavioural_enabled() {
         say!("  mode              : NOISE REDUCTION (perimeter only; --behavioural adds fraud detection)");
     } else {
@@ -723,8 +735,8 @@ fn main() -> ExitCode {
                     s.meta_set(
                         "calibration",
                         &format!(
-                            "theta0={:.3} theta0_prefix={:.3} theta0c={:.3} prior_mean={:.2}",
-                            p.theta0, p.theta0_prefix, p.theta0c, p.prior_mean
+                            "theta0_prefix={:.3} theta0c={:.3} prior_mean={:.2}",
+                            p.theta0_prefix, p.theta0c, p.prior_mean
                         ),
                     );
                     match s.checkpoint(&engine) {

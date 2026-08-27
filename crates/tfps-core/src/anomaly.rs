@@ -157,7 +157,6 @@ impl RateModel {
 /// traffic; these are the cold-start defaults.
 #[derive(Debug, Clone)]
 pub struct Params {
-    pub theta0: f64,
     pub theta1: f64,
     /// Prefix arm's benign first-contact rate. Lower than `theta0`: most sources settle on
     /// one dialling format, so a novel prefix is rarer than a novel country.
@@ -183,7 +182,6 @@ impl Default for Params {
         // description ("dozens"), not three.
         let (alpha, beta) = (1e-4, 1e-2);
         Self {
-            theta0: 0.15,
             theta1: 0.70,
             theta0_prefix: 0.05,
             theta0c: 0.20,
@@ -203,8 +201,6 @@ impl Default for Params {
 pub struct Verdict {
     /// Total fused evidence, in nats.
     pub evidence: f64,
-    /// Contribution of the country-scan arm.
-    pub country_bits: f64,
     /// Contribution of the prefix-scan arm.
     pub prefix_bits: f64,
     /// Contribution of the volume arm.
@@ -227,7 +223,6 @@ pub struct SourceAnomaly {
     /// Countries ever attempted, as a 256-bit set — no rotation, just membership.
     seen_countries: [u64; 4],
     n_countries: u32,
-    country_scan: SeqTest,
     /// Prefix identifiers ever used (hashed, capped), for the prefix-scan arm.
     seen_prefixes: u64,
     prefix_bits_set: u32,
@@ -263,7 +258,6 @@ impl SourceAnomaly {
         Self {
             seen_countries: [0; 4],
             n_countries: 0,
-            country_scan: SeqTest::new(p.theta0, p.theta1, p.alpha, p.beta),
             seen_prefixes: 0,
             prefix_bits_set: 0,
             prefix_scan: SeqTest::new(p.theta0_prefix, p.theta1, p.alpha, p.beta),
@@ -326,26 +320,26 @@ impl SourceAnomaly {
         }
         self.window_count += 1;
 
-        // Leak the scan walks by the time since the last call — a 10-minute half-life, so
-        // the burst window the field description calls out (5-15 min) is exactly the scale
-        // over which novelty still counts as a burst.
+        // Leak the prefix walk by the time since the last call — a 10-minute half-life, so
+        // a burst inside the 5-15 min window still counts while slow variety leaks away.
         if self.last_call != 0 {
             let dt = now.saturating_sub(self.last_call) as f64;
-            let factor = 0.5f64.powf(dt / SCAN_HALFLIFE_SECS as f64);
-            self.country_scan.decay(factor);
-            self.prefix_scan.decay(factor);
+            self.prefix_scan
+                .decay(0.5f64.powf(dt / SCAN_HALFLIFE_SECS as f64));
         }
         self.last_call = now;
 
-        // Scan arms: novelty is the first-contact event.
+        // The seen-country set is still tracked, for the report and for `tfps_ctl` — but a
+        // never-seen country no longer *blocks*. Country novelty was too fragile: without
+        // correct international-prefix configuration an internal extension or an inbound
+        // call to an E.164 DID is mis-read as a new international destination. The robust
+        // signals — prefix probing, failed completions, volume — carry the detection.
         let first_time = !self.country_seen(country);
         self.mark_country(country);
-        let country_bits = self.country_scan.observe(first_time);
 
         let novel_prefix = self.prefix_first_contact(prefix);
-        let prefix_bits = self.prefix_scan.observe(novel_prefix);
+        self.prefix_scan.observe(novel_prefix);
 
-        let _ = (country_bits, prefix_bits);
         let mut v = self.fused(first_time);
         v.first_prefix = novel_prefix;
         v
@@ -361,6 +355,9 @@ impl SourceAnomaly {
             self.completion_scan
                 .decay(0.5f64.powf(dt / SCAN_HALFLIFE_SECS as f64));
         }
+        // Completions share the activity clock, so the decay measures time since the last
+        // event on this source, not since its last INVITE.
+        self.last_call = now;
         // A failure is the suspicious outcome for the walk.
         self.completion_scan.observe(!completed);
         self.fused(false)
@@ -369,15 +366,13 @@ impl SourceAnomaly {
     /// Fuses the arms into a verdict. Each arm contributes its non-negative evidence, so a
     /// well-behaved arm never masks another.
     fn fused(&self, first_time: bool) -> Verdict {
-        let country_bits = self.country_scan.evidence();
         let prefix_bits = self.prefix_scan.evidence();
         let completion_bits = self.completion_scan.evidence();
         // Volume evidence is in bits; convert to nats to share units with the walks.
         let volume_bits = self.volume_evidence * core::f64::consts::LN_2;
-        let evidence = country_bits + prefix_bits + completion_bits + volume_bits;
+        let evidence = prefix_bits + completion_bits + volume_bits;
         Verdict {
             evidence,
-            country_bits,
             prefix_bits,
             volume_bits,
             completion_bits,
@@ -388,10 +383,8 @@ impl SourceAnomaly {
         }
     }
 
-    /// Adopts calibrated hypotheses across all three scan arms, keeping their walks.
+    /// Adopts calibrated hypotheses across the arms, keeping their walks.
     pub fn recalibrate(&mut self, p: &Params) {
-        self.country_scan
-            .recalibrate(p.theta0, p.theta1, p.alpha, p.beta);
         self.prefix_scan
             .recalibrate(p.theta0_prefix, p.theta1, p.alpha, p.beta);
         self.completion_scan
@@ -489,46 +482,9 @@ mod tests {
     }
 
     #[test]
-    fn the_scan_arm_fires_fast_on_a_scanner_and_never_on_breadth() {
-        let p = Params::default();
-        // A scanner: a new country almost every call.
-        let mut s = SourceAnomaly::new(&p);
-        // A scanner: a new country roughly every minute — a burst.
-        let mut fired_at = None;
-        for i in 0..20u16 {
-            let v = s.observe(ci(i), "+", i as u32 * 60);
-            if v.fired && fired_at.is_none() {
-                fired_at = Some(i);
-            }
-        }
-        assert!(
-            fired_at.is_some_and(|i| i < 15),
-            "a rapid scanner is caught: {fired_at:?}"
-        );
-
-        // A legitimate call centre: 3 distinct countries, even a couple in quick
-        // succession at the start, then endless repeats. Must never fire.
-        let mut s = SourceAnomaly::new(&p);
-        let mut ever = false;
-        for i in 0..60u32 {
-            let c = ci((i % 3) as u16);
-            ever |= s.observe(c, "+", i * 60).fired;
-        }
-        assert!(!ever, "a settled 3-country source must never fire");
-
-        // A fresh source that legitimately calls 5 countries, but spread over the day.
-        let mut s = SourceAnomaly::new(&p);
-        let mut ever = false;
-        for i in 0..5u16 {
-            ever |= s.observe(ci(i), "+", i as u32 * 3600).fired; // one per hour
-        }
-        assert!(!ever, "novelty spread over hours is not a burst");
-    }
-
-    #[test]
     fn a_known_country_is_evidence_against_scanning() {
         let p = Params::default();
-        let mut t = SeqTest::new(p.theta0, p.theta1, p.alpha, p.beta);
+        let mut t = SeqTest::new(p.theta0_prefix, p.theta1, p.alpha, p.beta);
         let after_hit = t.observe(true);
         let after_miss = t.observe(false);
         assert!(
@@ -615,7 +571,7 @@ mod tests {
         let mut s = SourceAnomaly::new(&p);
         for i in 0..20u16 {
             let v = s.observe(ci(i), "+", 0);
-            assert!(v.country_bits >= 0.0 && v.prefix_bits >= 0.0 && v.volume_bits >= 0.0);
+            assert!(v.prefix_bits >= 0.0 && v.completion_bits >= 0.0 && v.volume_bits >= 0.0);
         }
     }
 }

@@ -48,7 +48,7 @@ noisiest scanners disappear from the capture entirely.
 | what it does | drops scanning, injection, brute-force, known-bad IPs | learns each source's normal, blocks IRSF by anomaly |
 | needs learning? | no — effective from minute one | yes — 30-day learning window before it acts |
 | state | rebuilds from traffic in minutes | per-source, persisted in SQLite |
-| the signal | user-agent, URI shape, failed auth, APIBAN | four-arm sequential detector (see below) |
+| the signal | user-agent, URI shape, failed auth, APIBAN | three-arm sequential detector (see below) |
 | default | **on** | **off** |
 
 ```sh
@@ -69,7 +69,7 @@ The banner always says which of the two you are running, so it is never ambiguou
 | perimeter: user-agent, URI injection, failed auth | IPv6, SIP over TLS |
 | APIBAN, background-synced and persisted | call-duration signal via `BYE` |
 | `ignoreip`, with the host's own addresses always exempt | day-31 activation confirmation |
-| four-arm behavioural detector, self-calibrating | |
+| three-arm behavioural detector, self-calibrating | |
 | SQLite persistence and control tool | |
 
 **The perimeter enforces today; the behavioural layer detects and reports.** During the
@@ -134,7 +134,15 @@ structurally cannot fire is the `fail2ban` blindness this project exists to avoi
 ## Fraud detection — the opt-in layer
 
 Turn it on with `--behavioural`. It learns each **source IP**'s normal behaviour and blocks
-IRSF by anomaly. The full design and its literature are in
+IRSF by anomaly.
+
+> **Prerequisite — configure your international prefixes.** The behavioural layer reasons
+> only about **international** destinations, and `intl_prefixes` (global and per-peer) is how
+> it tells a real outbound international call from an internal extension or an inbound call to
+> an E.164 DID. Get them wrong and the wrong calls are judged. The defaults are a starting
+> point, not a fit for your installation — set them, and the detector's job becomes correct.
+
+The full design and its literature are in
 [`docs/anomaly-detection.md`](docs/anomaly-detection.md); in brief:
 
 **The B-number cannot be classified.** Tested against a real libphonenumber port, classic
@@ -147,13 +155,17 @@ from legitimate traffic. Detection has to be **behavioural**.
 - **Scanning** — "they try dozens of countries to find one that routes through a partner
   ITSP." That *is* a port scan, and it is detected with a **Threshold Random Walk** (Jung et
   al., IEEE S&P 2004) — a sequential test that accumulates evidence per call and fires the
-  moment it is sufficient. Three arms run: a new **country**, a new **prefix** (probing
-  `00`, `011`, `+5540`…), and a **failed completion** (a call answered `4xx`/`5xx`/`6xx`, or
-  never — the AT&T signature, "the call never came here").
+  moment it is sufficient. Two arms run: a new **prefix** (probing `00`, `011`, `+5540`…),
+  and a **failed completion** (a call answered `4xx`/`5xx`/`6xx`, or never — the AT&T
+  signature, "the call never came here"). A never-seen **country** is *not* one of them:
+  country novelty was too fragile, because without correct international-prefix
+  configuration an internal extension or an inbound E.164 DID is mis-read as a new
+  international destination. The seen-country set is still tracked for the report, but it no
+  longer blocks.
 - **Exploitation** — hammering the route it found shows as a volume spike against the
   source's own norm, scored with **hierarchical Gamma-Poisson surprise**.
 
-The four arms produce evidence in the same log-likelihood units, so they **add**;
+The three arms produce evidence in the same log-likelihood units, so they **add**;
 enforcement fires when the total crosses a bound set by the **error rates you choose**
 (α, β) — not a hand-picked threshold. Every block is one explainable sentence:
 *"14 bits: 9 country-scan, 5 volume."*
@@ -413,7 +425,7 @@ Documented, not engineered away — a limitation stated plainly beats one that f
 ## Documentation
 
 - [`docs/anomaly-detection.md`](docs/anomaly-detection.md) — the behavioural detector: the
-  research, why the constraints rule out most methods, and the four-arm design
+  research, why the constraints rule out most methods, and the three-arm design
 - [`DETECTION.md`](DETECTION.md) — how a packet is examined, test by test, in code order
 - [`SPEC.md`](SPEC.md) — the architecture and the decisions (§6 superseded by the doc above)
 - [`CONTEXT.md`](CONTEXT.md) — the vocabulary, normative for code and documentation

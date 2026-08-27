@@ -52,6 +52,14 @@ Half-Space Trees) are real but not naturally per-source and are harder to interp
 
 ## Each phase is a solved problem
 
+> **Country novelty was removed as a blocking signal.** It fired on mis-classified traffic:
+> without correct international-prefix configuration, an internal extension or an inbound
+> call to an E.164 DID is read as a new international destination. The seen-country set is
+> still tracked for reporting, but the blocking arms are **prefix**, **completion** and
+> **volume** — all of which key on genuinely international behaviour. This also makes
+> configuring `intl_prefixes` a **prerequisite** for the behavioural layer: it is how the
+> system knows what is international at all.
+
 ### Scanning → Threshold Random Walk (sequential hypothesis testing)
 
 The scanning phase *is* a port scan: one source, many first-contact attempts, most failing.
