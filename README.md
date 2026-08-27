@@ -16,6 +16,9 @@ they should not pay for anything more.
   and never notices.
 - **Kernel-level drop** — condemned sources vanish from `sngrep`, `tcpdump` and `tshark`.
 
+> ⭐ **If TFPS keeps your `sngrep` clean or your bill honest, please star the repo** — it is
+> open source and non-commercial, and a star is how it reaches the next operator who needs it.
+
 ---
 
 ## The garbage disappears from sngrep
@@ -441,6 +444,12 @@ Documented, not engineered away — a limitation stated plainly beats one that f
 - [`DETECTION.md`](DETECTION.md) — how a packet is examined, test by test, in code order
 - [`SPEC.md`](SPEC.md) — the architecture and the decisions (§6 superseded by the doc above)
 - [`CONTEXT.md`](CONTEXT.md) — the vocabulary, normative for code and documentation
+
+## Star the project
+
+TFPS is open source, non-commercial, and built for its own use — there is nothing to sell.
+If it earns its place on your box, a **GitHub star** is the whole thank-you, and it is what
+helps another operator find it.
 
 ## License
 

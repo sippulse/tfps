@@ -219,16 +219,19 @@ fn stats(args: &Args) -> Result<(), String> {
         }
         Err(e) => say!("KERNEL  (live)\n  unavailable — {e}"),
     }
+    let s = Store::open_readonly(&args.db)?;
+    let apiban = s.apiban_all().unwrap_or_default();
     if let Ok(b) = Blocklist::open(args.map.as_deref()) {
         let e = b.entries();
-        say!(
-            "  condemned now     : {} ({} permanent, e.g. the APIBAN feed)",
-            e.len(),
-            e.iter().filter(|(_, u)| *u == 0).count()
-        );
+        let from_apiban = e
+            .iter()
+            .filter(|(ip, _)| apiban.contains(&ip.to_string()))
+            .count();
+        say!("  condemned now     : {}", e.len());
+        say!("    from APIBAN feed : {from_apiban}");
+        say!("    perimeter/manual : {}", e.len() - from_apiban);
     }
 
-    let s = Store::open_readonly(&args.db)?;
     let now = now();
     match (s.meta_get("stats"), s.meta_get("stats_ts")) {
         (Some(line), ts) => {
@@ -284,7 +287,13 @@ fn stats(args: &Args) -> Result<(), String> {
     say!("  {:<16} {:>10}", "countries", countries);
     say!("  {:<16} {:>10}", "intl calls", calls);
 
-    say!("\nBLOCKS BY REASON");
+    say!("\nBLOCKS BY REASON  (perimeter/manual — the APIBAN feed is a separate list)");
+    say!(
+        "  {:<16} {:>10}  {}",
+        "apiban (feed)",
+        apiban.len(),
+        "permanent, not audit-logged"
+    );
     for (label, since) in [
         ("last hour", 3600u32),
         ("last day", 86400),
