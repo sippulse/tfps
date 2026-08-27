@@ -1,0 +1,28 @@
+[Unit]
+Description=TFPS - IRSF fraud prevention for SIP networks
+Documentation=https://github.com/sippulse/tfps
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+StateDirectory=tfps
+Type=simple
+ExecStart=/usr/local/bin/tfps
+Restart=always
+RestartSec=5
+
+# AF_PACKET capture requires CAP_NET_RAW; XDP needs the BPF/ADMIN ones.
+AmbientCapabilities=CAP_NET_RAW CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=full
+ReadOnlyPaths=/etc/tfps
+ProtectHome=yes
+PrivateTmp=yes
+MemoryMax=192M
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

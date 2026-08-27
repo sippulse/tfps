@@ -269,13 +269,40 @@ Requires kernel **≥ 5.15** with BTF. Tested on 6.1.
 
 ## Installing and running
 
+On the target machine, as root, from a checkout with the binaries already built:
+
 ```sh
-scp target/x86_64-unknown-linux-musl/release/tfps root@server:/usr/local/bin/
-tfps
+./packaging/install.sh
 ```
 
-It works with no arguments at all, on built-in defaults. To fit your installation, write
-`/etc/tfps/config.json` — see the configuration section above.
+That compiles the XDP program against the running kernel's BTF, installs `tfps` and
+`tfps_ctl`, drops in the systemd unit, writes a starting `/etc/tfps/config.json` **only if
+one is not already there**, and starts the service. Run it again to upgrade — it is
+idempotent and never overwrites your configuration.
+
+Then:
+
+```sh
+journalctl -u tfps -f      # watch it decide, live
+tfps_ctl status            # what it has learned, what is blocked
+```
+
+Two things it needs from the machine: `clang` and `bpftool` at install time (Debian/Ubuntu:
+`apt install clang linux-tools-common`), and a kernel ≥ 5.15 with BTF.
+
+### By hand, if you prefer
+
+```sh
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+clang -O2 -g -target bpf -c ebpf/tfps_xdp.c -o /usr/local/lib/tfps/tfps_xdp.o
+install -m755 target/x86_64-unknown-linux-musl/release/{tfps,tfps_ctl} /usr/local/bin/
+install -D -m644 packaging/tfps.service /etc/systemd/system/tfps.service
+systemctl enable --now tfps
+```
+
+**It also runs with no configuration and no arguments at all** — `tfps` on its own uses the
+built-in defaults. The config file is for fitting it to your installation, not for making it
+work.
 
 Capture is `AF_PACKET`/`SOCK_DGRAM`: it hooks at the netdev layer and **does not open a UDP
 socket**, so your softswitch keeps its own bind and never notices. Nothing needs
@@ -322,8 +349,17 @@ TFPS condemned the machine it was defending. The blast radius was small — inbo
 carry the attacker's source, not yours — but a defence that can shoot its own host will
 eventually do so at three in the morning.
 
-`"ignore": ["10.0.0.0/8", "203.0.113.7"]` adds trusted carriers and management ranges, the
-equivalent of `fail2ban`'s `ignoreip`. Also available as `--ignore CIDR`, repeatable.
+`"ignoreip": ["10.0.0.0/8", "203.0.113.7"]` adds trusted carriers and management ranges —
+the same name `fail2ban` uses for the same job. Also `--ignoreip CIDR`, repeatable.
+
+Two rules keep it from becoming a policy knob (`SPEC.md` §11): **`0.0.0.0/0` is refused**,
+because one line that disables enforcement without announcing it is the silent failure this
+project exists to prevent — `--no-enforce` does that explicitly and says so in every report;
+and **every entry counts its hits**, so a stale exemption shows up as cold:
+
+```
+    ignoreip: 3 exemption(s) applied, never matched: 203.0.113.0/24
+```
 
 An exempt source is still **judged and reported**, only never enforced:
 

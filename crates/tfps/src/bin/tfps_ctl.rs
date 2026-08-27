@@ -259,6 +259,16 @@ fn stats(args: &Args) -> Result<(), String> {
         say!("  {:<16} {:>10}", "running for", ago(now.saturating_sub(t)));
     }
 
+    if let Some(line) = s.meta_get("ignoreip").filter(|l| !l.is_empty()) {
+        say!("\nIGNOREIP  (exempt from enforcement, still judged and reported)");
+        for entry in line.split_whitespace() {
+            if let Some((label, hits)) = entry.rsplit_once('=') {
+                let note = if hits == "0" { "  never matched" } else { "" };
+                say!("  {label:<22} {hits:>8}{note}");
+            }
+        }
+    }
+
     let (pairs, peers, _) = s.totals()?;
     let (countries, calls) = s.country_spread()?;
     say!("\nLEARNED");

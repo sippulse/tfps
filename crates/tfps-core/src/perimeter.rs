@@ -173,19 +173,28 @@ impl NoiseFilter {
 
     /// Does the URI carry an injection pattern?
     ///
-    /// Takes raw URIs (Request-URI and `From`) because the attack usually lands in the user
-    /// part or the host, and normalising first would hide what we are looking for.
+    /// **Only the `user@host` part of each URI is examined**, and that boundary is the
+    /// whole safety of this rule. Handing it the raw header value scans the *display name*
+    /// too, where an apostrophe or a double hyphen is an ordinary surname: `"O'Brien"`,
+    /// `"Smith--Jones"`, `"Select Cars Ltd"` were all condemned as SQL injection by the
+    /// previous version — and a perimeter block takes the whole source IP off the network
+    /// for an hour, so one call from the wrong customer removed their PBX.
     ///
-    /// It is **not** applied to the whole message: `Via`, `User-Agent` and the SDP body
-    /// contain legitimate characters that would match by accident.
+    /// Nor is it applied to the whole message: `Via`, `User-Agent` and the SDP body contain
+    /// legitimate characters that would match by accident.
     pub fn injection_in_uri(&mut self, uris: &[Option<&str>]) -> Option<&'static str> {
-        for uri in uris.iter().flatten() {
-            let lower = uri.to_ascii_lowercase();
+        for raw in uris.iter().flatten() {
+            let Some(addr) = uri_addr(raw) else {
+                continue;
+            };
+            let lower = addr.to_ascii_lowercase();
             for pat in INJECTION {
                 // `;` is legitimate as a SIP URI parameter separator (`;tag=`,
                 // `;transport=`), so it only counts inside the **user part**.
                 if *pat == ";" {
-                    if user_part(&lower).is_some_and(|u| u.contains(';')) {
+                    // `;` never survives `uri_addr`, which stops at the first one — so it
+                    // is checked against the raw value, restricted to the user part.
+                    if user_part(&raw.to_ascii_lowercase()).is_some_and(|u| u.contains(';')) {
                         self.injections += 1;
                         return Some(pat);
                     }
@@ -324,6 +333,31 @@ fn matches_sig(ua: &str, sig: &str, kind: Match) -> bool {
     }
 }
 
+/// The `user@host` of a SIP URI, with the display name and the header parameters removed.
+///
+/// Everything this rule inspects passes through here. The display name is free text an
+/// end-user chose; the parameters (`;tag=`, `;transport=tcp`) are structured and
+/// legitimate. Injection lands in the user part or the host, and nowhere else.
+fn uri_addr(value: &str) -> Option<&str> {
+    // Prefer what is inside the angle brackets: a display name is free text and may itself
+    // contain something that looks like a URI.
+    let scope = match (value.find('<'), value.find('>')) {
+        (Some(a), Some(b)) if b > a => &value[a + 1..b],
+        _ => value,
+    };
+    let start = scope
+        .find("sip:")
+        .map(|i| i + 4)
+        .or_else(|| scope.find("sips:").map(|i| i + 5))
+        .or_else(|| scope.find("tel:").map(|i| i + 4))?;
+    let rest = &scope[start..];
+    // Only `>` and `;` end the address. Whitespace does **not**: `sip:1 union select@host`
+    // is malformed on purpose and is exactly what this rule is for. The display name needs
+    // no terminator, because the scan starts at the scheme and the name precedes it.
+    let end = rest.find(['>', ';']).unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
 /// Lower-cased user part of a SIP URI, for the `;` check.
 fn user_part(uri: &str) -> Option<&str> {
     let start = uri
@@ -441,6 +475,50 @@ mod tests {
             .injection_in_uri(&[Some("sip:200@pbx.com;transport=tcp")])
             .is_none());
         assert!(f.injection_in_uri(&[Some("sip:20;0@pbx.com")]).is_some());
+    }
+
+    #[test]
+    fn ordinary_display_names_are_not_sql_injection() {
+        // Every one of these was blocked by the first version of this rule, because it was
+        // handed the whole header value. A perimeter block condemns the source IP for an
+        // hour: one call from a customer called O'Brien removed their PBX from the network.
+        let mut f = NoiseFilter::new();
+        for from in [
+            "\"O'Brien\" <sip:1001@pbx.example.com>;tag=abc",
+            "\"Smith--Jones\" <sip:1002@pbx.example.com>;tag=abc",
+            "\"Sébastien D'Arcy\" <sip:1003@pbx.example.com>;tag=abc",
+            "\"Select Cars Ltd\" <sip:1004@pbx.example.com>;tag=abc",
+            "\"Credit Union Desk\" <sip:1005@pbx.example.com>;tag=abc",
+            "\"Ext == 200\" <sip:1006@pbx.example.com>;tag=abc",
+            // A display name that itself contains a URI must not smuggle the scan back
+            // into free text.
+            "\"call sip:o'brien now\" <sip:1007@pbx.example.com>;tag=abc",
+        ] {
+            assert_eq!(
+                f.injection_in_uri(&[Some("sip:00442039967796@pbx"), Some(from)]),
+                None,
+                "display name wrongly condemned: {from}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_attack_in_the_user_part_still_fires_after_the_narrowing() {
+        // The narrowing must not cost detection: these are the real attack shapes.
+        let mut f = NoiseFilter::new();
+        for uri in [
+            "sip:1001'@pbx.com",
+            "sip:admin--@pbx.com",
+            "sip:x%27or%271%27=%271@pbx.com",
+            "sip:?=?@pbx.com",
+            "<sip:1 union select@pbx.com>",
+            "sip:a;drop@pbx.com",
+        ] {
+            assert!(
+                f.injection_in_uri(&[Some(uri)]).is_some(),
+                "attack no longer detected: {uri}"
+            );
+        }
     }
 
     #[test]

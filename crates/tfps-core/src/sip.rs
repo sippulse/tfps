@@ -187,13 +187,24 @@ pub fn transaction_key(
     call_id: Option<&str>,
     cseq: Option<&str>,
 ) -> Option<String> {
+    // Both halves are attacker-controlled and a datagram can carry tens of kilobytes of
+    // either, so the key is capped: a real RFC 3261 branch is around forty characters, and
+    // an unbounded key would turn the pending-transaction ceiling into a memory multiplier.
+    const MAX_KEY_LEN: usize = 128;
+    let clip = |s: &str| {
+        let mut end = MAX_KEY_LEN.min(s.len());
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s[..end].to_string()
+    };
     if let Some(b) = branch {
         if !b.is_empty() {
-            return Some(b.to_string());
+            return Some(clip(b));
         }
     }
     let c = call_id?;
-    Some(format!("{c}|{}", cseq.unwrap_or("")))
+    Some(clip(&format!("{c}|{}", cseq.unwrap_or(""))))
 }
 
 /// A SIP message is either a request or a response. The distinction matters for

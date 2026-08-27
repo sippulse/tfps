@@ -1,0 +1,7 @@
+{
+  "ports": [5060],
+  "intl_prefixes": ["+", "00", "011", "9011"],
+  "learn_days": 30,
+  "block_ttl": 3600,
+  "stats_every": 60
+}

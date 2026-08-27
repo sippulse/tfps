@@ -58,7 +58,7 @@ struct Args {
     db: PathBuf,
     checkpoint_every: u64,
     apiban_key: Option<String>,
-    ignore: Vec<String>,
+    ignoreip: Vec<String>,
     signatures: Option<PathBuf>,
     config: PathBuf,
     /// Per-peer dial plan from the file. Declaring beats learning because it holds on
@@ -90,7 +90,7 @@ impl Default for Args {
             // and checkpointing per packet would be a write bottleneck.
             checkpoint_every: 300,
             apiban_key: None,
-            ignore: Vec::new(),
+            ignoreip: Vec::new(),
             signatures: None,
             config: PathBuf::from(config::DEFAULT_PATH),
             peer_plans: Vec::new(),
@@ -121,7 +121,7 @@ USAGE: tfps [options]
       --no-db              do not persist (learning dies on restart)
       --checkpoint-every N seconds between writes      (default: 300)
       --apiban-key KEY     enable APIBAN (optional, in the background)
-      --ignore CIDR        never block this address or network (repeatable)
+      --ignoreip CIDR      never enforce against this address or network (repeatable)
       --signatures PATH    file that ADDS signatures to the built-in ones
       --config PATH        configuration               (default: /etc/tfps/config.json)
   -h, --help               this help
@@ -178,7 +178,7 @@ fn parse_args() -> Result<Args, String> {
             "--db" => a.db = PathBuf::from(next("--db")?),
             "--no-db" => a.db = PathBuf::new(),
             "--apiban-key" => a.apiban_key = Some(next("--apiban-key")?),
-            "--ignore" => a.ignore.push(next("--ignore")?),
+            "--ignoreip" => a.ignoreip.push(next("--ignoreip")?),
             "--signatures" => a.signatures = Some(PathBuf::from(next("--signatures")?)),
             "--config" => a.config = PathBuf::from(next("--config")?),
             "--checkpoint-every" => {
@@ -223,7 +223,7 @@ fn apply_config(a: &mut Args, c: &config::Config) {
     }
     // The file adds to the command line here rather than replacing it: both are the
     // operator's own words, and dropping either would be a surprise.
-    a.ignore.extend(c.ignore.iter().cloned());
+    a.ignoreip.extend(c.ignoreip.iter().cloned());
     if !a.given.contains("--apiban-key") && c.apiban_key.is_some() {
         a.apiban_key = c.apiban_key.clone();
     }
@@ -424,21 +424,32 @@ fn main() -> ExitCode {
     // Never condemn the machine we are defending. This is not configurable, because the
     // one time it happened during development it was a test firing from the host itself —
     // and no operator would have guessed to switch it on beforehand.
-    let mut ignore = IgnoreList::new();
+    let mut ignoreip = IgnoreList::new();
     let local = xdp::local_addresses();
     for ip in &local {
-        let _ = ignore.add(&ip.to_string());
+        ignoreip.add_local(*ip);
     }
-    for entry in &args.ignore {
-        if let Err(e) = ignore.add(entry) {
-            eprintln!("WARNING: ignoring malformed ignore entry — {e}");
+    for entry in &args.ignoreip {
+        // A refused entry is announced, never dropped quietly: an operator who believes a
+        // range is exempt when it is not would draw exactly the wrong conclusion from a
+        // block.
+        if let Err(e) = ignoreip.add(entry) {
+            eprintln!("ALARM: ignoreip entry rejected — {e}");
         }
     }
+    // §12 requires the operator to see which rules exist, not just how many.
     say!(
-        "  never blocked     : {} local address(es) + {} declared",
-        local.len(),
-        ignore.len() - local.len()
+        "  ignoreip          : {} local, {} declared",
+        ignoreip.len() - ignoreip.declared(),
+        ignoreip.declared()
     );
+    for (label, origin, _) in ignoreip.report() {
+        let kind = match origin {
+            tfps_core::ignore::Origin::Local => "this host",
+            tfps_core::ignore::Origin::Declared => "declared",
+        };
+        say!("                      {label} ({kind})");
+    }
 
     let sock = match Socket::new(
         Domain::from(AF_PACKET),
@@ -489,17 +500,27 @@ fn main() -> ExitCode {
     if args.apiban_key.is_some() {
         if let (Some(s), Some(e)) = (db.as_ref(), enforcer.as_mut()) {
             match s.apiban_since(start.0.saturating_sub(APIBAN_RETENTION_SECS)) {
-                Ok(ips) if !ips.is_empty() => {
-                    for ip in ips.iter().filter(|ip| !ignore.contains(**ip)) {
-                        let _ = e.block(*ip, 0);
+                Ok(ips) => {
+                    let (mut restored, mut failed) = (0u64, 0u64);
+                    for ip in ips {
+                        if ignoreip.exempt(ip).is_some() {
+                            continue;
+                        }
+                        match e.block(ip, 0) {
+                            Ok(()) => restored += 1,
+                            // Announcing a restore that did not happen would leave the
+                            // operator believing in protection that is not there.
+                            Err(_) => failed += 1,
+                        }
                     }
-                    apiban_total = ips.len() as u64;
-                    say!(
-                        "  APIBAN restored   : {} addresses from the last 7 days",
-                        ips.len()
-                    );
+                    apiban_total = restored;
+                    if restored > 0 {
+                        say!("  APIBAN restored   : {restored} addresses from the last 7 days");
+                    }
+                    if failed > 0 {
+                        eprintln!("ALARM: {failed} APIBAN addresses could not be restored");
+                    }
                 }
-                Ok(_) => {}
                 Err(err) => eprintln!("WARNING: could not restore the APIBAN list: {err}"),
             }
         }
@@ -569,10 +590,11 @@ fn main() -> ExitCode {
                         Decision::AuthAbuse { .. } => Some(("auth-volume", "no-answer")),
                         _ => None,
                     };
-                    if let (Some((kind, detail)), true) = (reason, ignore.contains(subject)) {
+                    let exempt = reason.and_then(|_| ignoreip.exempt(subject).map(str::to_string));
+                    if let (Some((kind, detail)), Some(rule)) = (reason, exempt) {
                         // Judged, reported, not enforced. Staying silent here would hide a
                         // compromised trusted peer, which is when it matters most.
-                        say!("EXEMPT peer={subject} reason={kind} detail={detail} (ignore list)");
+                        say!("EXEMPT peer={subject} reason={kind} detail={detail} ignoreip={rule}");
                     } else if let (Some((kind, detail)), Some(e)) = (reason, enforcer.as_mut()) {
                         match e.block(subject, args.block_ttl) {
                             Ok(()) => {
@@ -622,7 +644,7 @@ fn main() -> ExitCode {
         // APIBAN batches, if any. Non-blocking: it only drains what has already arrived.
         if let (Some(rx), Some(e)) = (apiban_rx.as_ref(), enforcer.as_mut()) {
             while let Ok(batch) = rx.try_recv() {
-                let n = batch.ips.len();
+                let mut n = batch.ips.len();
                 // Persist the resume point before the addresses: refetching a batch is
                 // harmless, whereas losing the id means starting the feed over.
                 if let (Some(id), Some(s)) = (&batch.next_id, db.as_ref()) {
@@ -636,8 +658,11 @@ fn main() -> ExitCode {
                 for ip in batch.ips {
                     // A third-party feed listing your own range is exactly what the ignore
                     // list is for: it is curated, but it is not yours.
-                    if ignore.contains(ip) {
-                        say!("APIBAN: {ip} is on the ignore list, not blocked");
+                    if let Some(rule) = ignoreip.exempt(ip) {
+                        say!("APIBAN: {ip} not blocked, ignoreip={rule}");
+                        // Counted out as well as skipped: reporting it as condemned would
+                        // overstate what the feed actually did.
+                        n -= 1;
                         continue;
                     }
                     // No expiry: the APIBAN list is curated, and re-applying it hourly
@@ -661,6 +686,14 @@ fn main() -> ExitCode {
                 s.meta_set("stats", &counter_line(&engine.stats));
                 s.meta_set("stats_ts", &t.0.to_string());
                 s.meta_set("started_at", &start.0.to_string());
+                s.meta_set(
+                    "ignoreip",
+                    &ignoreip
+                        .report()
+                        .map(|(label, _, hits)| format!("{label}={hits}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
                 match s.checkpoint(&engine) {
                     Ok((p, _)) => {
                         // A 90-day audit window — more than twice the bitmap ageing
@@ -739,6 +772,21 @@ fn main() -> ExitCode {
                     engine.stats.auth_attempts, args.ports
                 );
                 auth_blind_warned = true;
+            }
+            // §12.4: a rule that matches zero must be reportable. An exemption is a rule,
+            // and a stale one is worse than a stale signature — it is a hole somebody
+            // opened deliberately and then forgot.
+            let cold = ignoreip.cold();
+            if ignoreip.total_hits() > 0 || !cold.is_empty() {
+                say!(
+                    "    ignoreip: {} exemption(s) applied{}",
+                    ignoreip.total_hits(),
+                    if cold.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", never matched: {}", cold.join(" "))
+                    }
+                );
             }
             let total = engine.noise_filter.hits().count();
             if engine.noise_filter.cold_signatures().len() == total

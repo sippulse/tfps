@@ -15,7 +15,7 @@ use std::net::Ipv4Addr;
 use std::time::Instant;
 
 use tfps_core::dialplan::DialPlan;
-use tfps_core::engine::{Engine, Mode};
+use tfps_core::engine::{Decision, Engine, Mode};
 use tfps_core::novelty::Timestamp;
 
 fn invite(from: &str, dialed: &str) -> Vec<u8> {
@@ -54,9 +54,17 @@ fn run(label: &str, n: usize, rotate_a_number: bool) {
             } else {
                 "1001".to_string()
             };
-            invite(&from, "004420399677 96")
+            invite(&from, "00442039967796")
         })
         .collect();
+
+    // Assert the workload before timing it. A payload that fails to parse would leave
+    // every iteration on the reject path and still print a confident INVITEs/s figure —
+    // which is exactly what an earlier version of this file did.
+    match engine.observe(peer, &payloads[0], Timestamp(1_800_000_000)) {
+        Decision::Pass { country, .. } => assert_eq!(country, "GB"),
+        other => panic!("benchmark payload does not reach a verdict: {other:?}"),
+    }
 
     let t0 = Instant::now();
     for i in 0..n {

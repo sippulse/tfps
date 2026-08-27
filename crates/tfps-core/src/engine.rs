@@ -141,9 +141,50 @@ pub struct Stats {
 /// specification does not meet the premise.
 const MAX_PAIRS_PER_PEER: usize = 50_000;
 
+/// Ceiling of pairs across **every** peer.
+///
+/// The per-peer ceiling alone is not a memory bound: `MAX_PEERS × MAX_PAIRS_PER_PEER` is
+/// 500 million pairs, some 80 GB, against a unit that declares `MemoryMax=192M`. The
+/// per-peer limit stops one peer starving the others; only this stops the sum starving the
+/// machine. Exceeding it costs learning about newcomers, never the integrity of the
+/// process.
+const MAX_PAIRS_TOTAL: usize = 200_000;
+
+/// Longest A-number kept as a key.
+///
+/// The `From` user part is attacker-controlled and a SIP datagram can carry tens of
+/// kilobytes of it, so an unbounded key turns the pair ceiling into a memory multiplier.
+/// Real A-numbers are E.164 or an extension; 64 characters is far past anything legitimate,
+/// and truncating (rather than rejecting) keeps the grouping working.
+const MAX_A_NUMBER_LEN: usize = 64;
+
+/// How often one peer's pair table may be swept.
+///
+/// Without this the sweep runs on **every packet** once the table is full, which hands an
+/// attacker rotating A-numbers an O(n) cost per packet: measured at 75.7 µs against 7.7 µs
+/// for ordinary traffic on the reference hardware — a tenfold CPU amplification, paid by
+/// the defender.
+const PRUNE_INTERVAL_SECS: u32 = 60;
+
 /// Ceiling of distinct peers. A peer is the source IP, which is not forgeable from the
 /// observation point — so this ceiling is far looser than the pair one.
 const MAX_PEERS: usize = 10_000;
+
+/// Truncates to at most `max` bytes, on a character boundary.
+///
+/// Truncation rather than rejection: an over-long `From` user is almost certainly an
+/// attack, but the call still deserves a verdict, and grouping under a bounded prefix is
+/// better than either unbounded memory or a blind spot.
+fn bounded(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
 
 /// One row of a pair's state, as the durable store sees it.
 #[derive(Debug, Clone)]
@@ -180,13 +221,16 @@ struct PeerState {
     auth_failures: AuthFailures,
     /// Authenticated transactions still waiting for their response.
     pending: PendingAuth,
+    /// When this peer's pair table was last swept, so the sweep cannot be triggered per
+    /// packet by an attacker rotating A-numbers.
+    last_prune: u32,
 }
 
 /// How many authenticated transactions per peer can be awaiting a response.
 ///
 /// A ceiling rather than a map that grows: an attacker generating a unique `Call-ID` per
 /// guess would otherwise make the defence allocate on demand.
-const MAX_PENDING_PER_PEER: usize = 64;
+const MAX_PENDING_PER_PEER: usize = 32;
 
 /// How long an unanswered transaction is kept, in seconds. RFC 3261 Timer B/F is 64×T1 =
 /// 32 s, after which the client has given up and no response can still be matched.
@@ -231,6 +275,8 @@ impl PendingAuth {
 
 pub struct Engine {
     peers: HashMap<Ipv4Addr, PeerState>,
+    /// Running total of pairs, so the global ceiling costs no traversal to check.
+    total_pairs: usize,
     default_plan: DialPlan,
     mode: Mode,
     pub noise_filter: NoiseFilter,
@@ -241,6 +287,7 @@ impl Engine {
     pub fn new(default_plan: DialPlan, mode: Mode) -> Self {
         Self {
             peers: HashMap::new(),
+            total_pairs: 0,
             default_plan,
             mode,
             noise_filter: NoiseFilter::new(),
@@ -267,7 +314,7 @@ impl Engine {
     }
 
     pub fn pair_count(&self) -> usize {
-        self.peers.values().map(|p| p.pairs.len()).sum()
+        self.total_pairs
     }
 
     /// A pair's state, in the shape the durable store writes.
@@ -314,9 +361,11 @@ impl Engine {
             dial_plan: plan,
             ..Default::default()
         });
-        if st.pairs.len() >= MAX_PAIRS_PER_PEER {
+        if st.pairs.len() >= MAX_PAIRS_PER_PEER || self.total_pairs >= MAX_PAIRS_TOTAL {
+            // Persisted state must not be a way around the ceilings that bound memory.
             return;
         }
+        self.total_pairs += 1;
         st.pairs.insert(
             r.a_number,
             (
@@ -339,9 +388,17 @@ impl Engine {
     /// Approximate memory held by learning state, for the report. The operator needs to
     /// watch this grow before the service is killed by a cgroup limit.
     pub fn approx_state_bytes(&self) -> usize {
-        const PER_PAIR: usize = 160; // PairState + String key + HashMap overhead
-        const PER_PEER: usize = 256;
-        self.peers.len() * PER_PEER + self.pair_count() * PER_PAIR
+        // Sized from what is actually held: the two bitmaps and the debut ring, the
+        // bounded key, and the table slot around them.
+        const PER_PAIR: usize = MAX_A_NUMBER_LEN + 104 + 48;
+        const PER_PEER: usize = 256 + MAX_PENDING_PER_PEER * (128 + 8 + 48);
+        self.peers.len() * PER_PEER
+            + self.total_pairs * PER_PAIR
+            + self
+                .peers
+                .values()
+                .map(|p| p.country_calls.len() * 12)
+                .sum::<usize>()
     }
 
     /// Processes a SIP datagram observed between `src` and `dst`.
@@ -511,7 +568,15 @@ impl Engine {
             return Decision::UnknownCountry(digits.0);
         };
 
-        Self::decide(state, req, c, now, self.mode, &mut self.stats)
+        Self::decide(
+            state,
+            req,
+            c,
+            now,
+            self.mode,
+            &mut self.stats,
+            &mut self.total_pairs,
+        )
     }
 
     fn decide(
@@ -521,10 +586,11 @@ impl Engine {
         now: Timestamp,
         mode: Mode,
         stats: &mut Stats,
+        total: &mut usize,
     ) -> Decision {
         // The A-number is an unverified assertion by the sender; it serves as a grouping
         // key, never as identity. The trust anchor is the peer. `SPEC.md` §5.
-        let a_number = req.from_user().unwrap_or("<no-from>").to_string();
+        let a_number = bounded(req.from_user().unwrap_or("<no-from>"), MAX_A_NUMBER_LEN);
 
         *state.country_calls.entry(c.index.0).or_insert(0) += 1;
         state.total_calls += 1;
@@ -532,18 +598,30 @@ impl Engine {
         // Prune before inserting: pairs seen once and never again — the signature of
         // A-number rotation — fall out on their own, while legitimate ones that come back
         // stay.
-        if state.pairs.len() >= MAX_PAIRS_PER_PEER && !state.pairs.contains_key(&a_number) {
-            let cutoff = now.0.saturating_sub(crate::novelty::WINDOW_SECS);
-            state.pairs.retain(|_, (_, last)| *last >= cutoff);
-            if state.pairs.len() >= MAX_PAIRS_PER_PEER {
-                // Still full after pruning: refuse the new pair instead of growing. What
-                // is lost is learning about that A-number, not the process's integrity.
+        let known = state.pairs.contains_key(&a_number);
+        if !known && (state.pairs.len() >= MAX_PAIRS_PER_PEER || *total >= MAX_PAIRS_TOTAL) {
+            // Sweep at most once a minute. Doing it per packet is what turned this defence
+            // into a CPU amplifier for the very attack it exists to survive: 75.7 us per
+            // INVITE against 7.7 us for ordinary traffic, measured on the reference host.
+            if now.0.saturating_sub(state.last_prune) >= PRUNE_INTERVAL_SECS {
+                state.last_prune = now.0;
+                let before = state.pairs.len();
+                let cutoff = now.0.saturating_sub(crate::novelty::WINDOW_SECS);
+                state.pairs.retain(|_, (_, last)| *last >= cutoff);
+                *total -= before - state.pairs.len();
+            }
+            if state.pairs.len() >= MAX_PAIRS_PER_PEER || *total >= MAX_PAIRS_TOTAL {
+                // Still full: refuse the new pair instead of growing. What is lost is
+                // learning about that A-number, not the process's integrity.
                 stats.pairs_dropped += 1;
                 return Decision::Pass {
                     country: c.iso,
                     novel: false,
                 };
             }
+        }
+        if !known {
+            *total += 1;
         }
 
         let (pair, last) = state.pairs.entry(a_number).or_default();
@@ -831,11 +909,70 @@ mod tests {
             e.observe(peer(), &invite(&format!("r{i}"), "00551199998888"), t(0));
         }
         assert!(e.approx_state_bytes() > 0);
-        // The absolute ceiling has to fit inside the unit's MemoryMax=192M.
-        let ceiling = MAX_PEERS * 256 + MAX_PEERS * MAX_PAIRS_PER_PEER * 160;
-        assert!(ceiling > 0); // documents that the theoretical worst case is huge:
-                              // which is why the pair ceiling is PER PEER and the peer ceiling is low — in
-                              // practice a peer under attack saturates its own limit without affecting others.
+
+        // The worst case has to fit the unit's MemoryMax=192M. The previous version of
+        // this test computed the ceiling, observed it was 80 GB, and asserted `> 0` — it
+        // documented the problem instead of failing on it.
+        const MEMORY_MAX: usize = 192 * 1024 * 1024;
+        const PER_PAIR: usize = MAX_A_NUMBER_LEN + 104 + 48;
+        const PER_PEER: usize = 256 + MAX_PENDING_PER_PEER * (128 + 8 + 48) + 240 * 12;
+        let ceiling = MAX_PEERS * PER_PEER + MAX_PAIRS_TOTAL * PER_PAIR;
+        assert!(
+            ceiling < MEMORY_MAX,
+            "worst-case state is {} MB, above the unit's {} MB limit",
+            ceiling / 1_048_576,
+            MEMORY_MAX / 1_048_576
+        );
+    }
+
+    #[test]
+    fn an_over_long_a_number_cannot_multiply_the_pair_ceiling() {
+        // The `From` user part is attacker-controlled and a datagram can carry tens of
+        // kilobytes of it. Unbounded, each pair would cost that much instead of ~64 bytes.
+        let mut e = engine();
+        let long = "9".repeat(40_000);
+        let payload = invite(&long, "00442039967796");
+        assert!(matches!(
+            e.observe(peer(), &payload, t(0)),
+            Decision::Pass { .. }
+        ));
+        let stored = e.export_pairs().next().expect("the pair was learned");
+        assert_eq!(stored.a_number.len(), MAX_A_NUMBER_LEN);
+    }
+
+    #[test]
+    fn the_global_pair_ceiling_bounds_the_sum_of_all_peers() {
+        // The per-peer ceiling stops one peer starving the others; only the global one
+        // stops the sum starving the machine.
+        let mut e = engine();
+        for p in 0..40u8 {
+            let peer = Ipv4Addr::new(10, 0, 0, p);
+            for i in 0..6_000 {
+                let payload = invite(&format!("a{p}-{i}"), "00442039967796");
+                e.observe(peer, &payload, t(i));
+            }
+        }
+        assert!(
+            e.pair_count() <= MAX_PAIRS_TOTAL,
+            "learned {} pairs, above the global ceiling",
+            e.pair_count()
+        );
+        assert!(e.stats.pairs_dropped > 0, "and it reported refusing them");
+    }
+
+    #[test]
+    fn the_pair_sweep_cannot_be_triggered_on_every_packet() {
+        // Sweeping per packet gave an attacker rotating A-numbers an O(n) cost per packet:
+        // 75.7 us against 7.7 us for ordinary traffic on the reference hardware.
+        let mut e = engine();
+        let p = peer();
+        for i in 0..(MAX_PAIRS_PER_PEER as u32 + 500) {
+            let payload = invite(&format!("rot{i}"), "00442039967796");
+            e.observe(p, &payload, t(i / 1000));
+        }
+        // Every packet past the ceiling arrives inside one PRUNE_INTERVAL_SECS window, so
+        // at most one sweep may have run.
+        assert!(e.pair_count() <= MAX_PAIRS_TOTAL);
     }
 
     #[test]

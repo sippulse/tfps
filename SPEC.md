@@ -235,6 +235,8 @@ Two reasons beyond simplicity: it is genuinely zero configuration — the 2023 T
 
 **State split**: **perimeter** state dies with the process and rebuilds itself in minutes from the traffic — consistent with fail-open by not pinning. **Behavioural** state, 45 to 90 days old, survives on disk.
 
+**One exception, and it is named here rather than argued in a code comment**: the APIBAN feed. It is perimeter state, but it does **not** rebuild itself from traffic, because it is consumed through a forward-only cursor — a restart that remembered the cursor but forgot the addresses would come back protecting nothing while reporting itself healthy. Feed addresses are therefore persisted and re-applied for 7 days. Everything else in the perimeter still dies with the process.
+
 The block audit log goes straight there, being low volume.
 
 ---
@@ -250,8 +252,15 @@ The block audit log goes straight there, being low volume.
 | noise user-agents and IP ranges | product data | no |
 | APIBAN key | optional integration | no |
 | structural regex for the operation | override | no, **empty by default** |
+| `ignoreip` — sources never enforced against | enforcement scope | no, **empty by default** |
 
 **Normative distinction**: **installation** configuration tells the system *where to look and how to read*; **policy** configuration would say *what fraud is*. The first is admitted, the second **does not exist in this product**. The fourteen knobs of the 2023 TFPS `defines.m4` have no equivalent here.
+
+**`ignoreip` is admitted as a third category**, and the distinction is load-bearing. Policy configuration would say *what fraud is*; `ignoreip` says *who this system may act against*. An exempt source is still evaluated, still counted, and still reported — the entry changes enforcement scope, never a verdict. That is what separates it from R07: a destination whitelist decides that a call is not fraud, while this decides that a peer is not ours to punish.
+
+Two constraints keep it from becoming policy by the back door: **`0.0.0.0/0` is refused**, since one line that disables enforcement without saying so is precisely the silent failure §12 exists to prevent (`--no-enforce` does it explicitly and announces it in every report); and **every entry counts its hits**, so an exemption that has matched nothing is reported as cold, like any other rule.
+
+The **host's own addresses are always exempt and are not configuration at all** — they are discovered from the machine. This exists because it happened: a brute-force verification fired from the softswitch host and the system condemned the address it was defending.
 
 **The override regex** serves a structural rule specific to the operation (*"our traffic never goes to satellite"*), **not** a destination whitelist — that last one is R07 with different syntax. If filled in, the system **reports each pattern's hit rate**: a regex that matches zero times in three months has rotted and the user needs to know.
 
