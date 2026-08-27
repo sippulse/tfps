@@ -149,6 +149,10 @@ impl RateModel {
 pub struct Params {
     pub theta0: f64,
     pub theta1: f64,
+    /// Completion arm: probability a *final* international response is a failure. Benign
+    /// traffic mostly completes; a scanner probing dead routes mostly does not.
+    pub theta0c: f64,
+    pub theta1c: f64,
     pub alpha: f64,
     pub beta: f64,
     pub prior_mean: f64,
@@ -168,6 +172,8 @@ impl Default for Params {
         Self {
             theta0: 0.15,
             theta1: 0.70,
+            theta0c: 0.20,
+            theta1c: 0.85,
             alpha,
             beta,
             prior_mean: 2.0,
@@ -189,6 +195,8 @@ pub struct Verdict {
     pub prefix_bits: f64,
     /// Contribution of the volume arm.
     pub volume_bits: f64,
+    /// Contribution of the completion arm.
+    pub completion_bits: f64,
     /// Distinct countries this source has been seen to attempt.
     pub countries: u32,
     /// This country was a first for the source.
@@ -208,6 +216,8 @@ pub struct SourceAnomaly {
     seen_prefixes: u64,
     prefix_bits_set: u32,
     prefix_scan: SeqTest,
+    /// Completion arm: fed by observed international-call outcomes, not by the INVITE.
+    completion_scan: SeqTest,
     rate: RateModel,
     /// International calls in the current volume window, and when it started.
     window_start: u32,
@@ -241,6 +251,7 @@ impl SourceAnomaly {
             seen_prefixes: 0,
             prefix_bits_set: 0,
             prefix_scan: SeqTest::new(p.theta0, p.theta1, p.alpha, p.beta),
+            completion_scan: SeqTest::new(p.theta0c, p.theta1c, p.alpha, p.beta),
             rate: RateModel::new(p.prior_mean, p.prior_strength, p.decay),
             window_start: 0,
             window_count: 0,
@@ -318,15 +329,40 @@ impl SourceAnomaly {
         let novel_prefix = self.prefix_first_contact(prefix);
         let prefix_bits = self.prefix_scan.observe(novel_prefix);
 
+        let _ = (country_bits, prefix_bits);
+        self.fused(first_time)
+    }
+
+    /// Records an observed **outcome** of an international call from this source: whether it
+    /// completed (a `2xx`) or failed (a final `4xx`/`5xx`/`6xx`). Provisional responses and
+    /// unseen ones are never fed here — silence is not evidence, the same honesty the auth
+    /// rule keeps. Returns the refreshed verdict, which may now fire.
+    pub fn observe_completion(&mut self, completed: bool, now: u32) -> Verdict {
+        if self.last_call != 0 {
+            let dt = now.saturating_sub(self.last_call) as f64;
+            self.completion_scan
+                .decay(0.5f64.powf(dt / SCAN_HALFLIFE_SECS as f64));
+        }
+        // A failure is the suspicious outcome for the walk.
+        self.completion_scan.observe(!completed);
+        self.fused(false)
+    }
+
+    /// Fuses the arms into a verdict. Each arm contributes its non-negative evidence, so a
+    /// well-behaved arm never masks another.
+    fn fused(&self, first_time: bool) -> Verdict {
+        let country_bits = self.country_scan.evidence();
+        let prefix_bits = self.prefix_scan.evidence();
+        let completion_bits = self.completion_scan.evidence();
         // Volume evidence is in bits; convert to nats to share units with the walks.
         let volume_bits = self.volume_evidence * core::f64::consts::LN_2;
-        let evidence = country_bits + prefix_bits + volume_bits;
-
+        let evidence = country_bits + prefix_bits + completion_bits + volume_bits;
         Verdict {
             evidence,
             country_bits,
             prefix_bits,
             volume_bits,
+            completion_bits,
             countries: self.n_countries,
             first_time,
             fired: evidence >= self.fire_bits,
@@ -506,6 +542,34 @@ mod tests {
             v3.prefix_bits < v2.prefix_bits,
             "reusing a prefix is evidence against"
         );
+    }
+
+    #[test]
+    fn failed_completions_are_evidence_of_scanning() {
+        // The AT&T signature: attempts that never complete. A source whose international
+        // calls keep failing accumulates evidence; one whose calls answer does not.
+        let p = Params::default();
+        let mut s = SourceAnomaly::new(&p);
+        // Seed some novel countries so the source is plausibly mid-scan, then feed failures.
+        for i in 0..4u16 {
+            s.observe(ci(i), "+", i as u32 * 60);
+        }
+        let mut fired = false;
+        for k in 0..20 {
+            fired |= s.observe_completion(false, 240 + k * 30).fired; // nothing answers
+        }
+        assert!(
+            fired,
+            "many novel countries and nothing completing must fire"
+        );
+
+        // A source whose calls complete does not accumulate completion evidence.
+        let mut s = SourceAnomaly::new(&p);
+        let mut ever = false;
+        for k in 0..40 {
+            ever |= s.observe_completion(true, k * 60).fired;
+        }
+        assert!(!ever, "calls that answer are not a scan");
     }
 
     #[test]

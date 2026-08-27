@@ -868,6 +868,8 @@ fn counter_line(s: &tfps_core::engine::Stats) -> String {
         ("auth_fail", s.auth_failures),
         ("auth_ok", s.auth_ok),
         ("auth_chal", s.digest_challenges),
+        ("intl_ok", s.intl_completed),
+        ("intl_fail", s.intl_failed),
         ("auth_volume", s.auth_abuse),
         ("invites", s.invites),
         ("intl", s.international),
@@ -898,7 +900,7 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
         }
     };
     say!(
-        "--- mode={mode_label} packets={} sip={} responses={} keepalive={} not_sip={} noise={} ({}%) injection={} auth_att={} auth_fail={} auth_ok={} auth_chal={} auth_volume={} invites={} intl={} \
+        "--- mode={mode_label} packets={} sip={} responses={} keepalive={} not_sip={} noise={} ({}%) injection={} auth_att={} auth_fail={} auth_ok={} auth_chal={} auth_volume={} intl_ok={} intl_fail={} invites={} intl={} \
          unknown_country={} first_time={} blocks={} would_block={} sources={} ports={:?}",
         s.packets,
         s.sip_parsed,
@@ -916,6 +918,8 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
         s.auth_ok,
         s.digest_challenges,
         s.auth_abuse,
+        s.intl_completed,
+        s.intl_failed,
         s.invites,
         s.international,
         s.unknown_country,

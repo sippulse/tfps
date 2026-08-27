@@ -122,6 +122,10 @@ pub struct Stats {
     /// Challenges seen. Zero here with non-zero `auth_att` means the softswitch is not
     /// answering, so only the backstop can fire.
     pub digest_challenges: u64,
+    /// International calls observed to complete (a `2xx`).
+    pub intl_completed: u64,
+    /// International calls observed to fail (a final `4xx`/`5xx`/`6xx`) — the scan signal.
+    pub intl_failed: u64,
     pub invites: u64,
     pub international: u64,
     pub uncanonicalizable: u64,
@@ -162,6 +166,9 @@ struct PeerState {
     auth_failures: AuthFailures,
     /// Authenticated transactions still waiting for their response.
     pending: PendingAuth,
+    /// International INVITEs still waiting for a final response, so the completion arm can
+    /// be fed when one arrives.
+    pending_intl: PendingAuth,
 }
 
 /// How many authenticated transactions per peer can be awaiting a response.
@@ -371,35 +378,73 @@ impl Engine {
         r: &sip::Response<'_>,
         now: Timestamp,
     ) -> Decision {
+        let mode = self.mode;
+        let behavioural = self.behavioural;
         if r.is_digest_challenge() {
             self.stats.digest_challenges += 1;
         }
-        if !r.is_digest_challenge() && !r.is_success() {
-            return Decision::OutOfScope("SIP response");
-        }
+        // Provisional responses (1xx) are not outcomes — the final one comes later.
+        let provisional = (100..200).contains(&r.status);
         let Some(key) = sip::transaction_key(r.via_branch(), r.call_id, r.cseq) else {
             return Decision::OutOfScope("SIP response");
         };
         let Some(st) = self.peers.get_mut(&peer) else {
-            // No state for this peer means no authenticated request was seen from it, so
-            // there is nothing this response can be evidence about.
+            // No state for this peer means nothing this response can be evidence about.
             return Decision::OutOfScope("SIP response");
         };
-        if !st.pending.claim(&key) {
+
+        // Authentication path: a response to a REGISTER we recorded as an authenticated
+        // attempt. This is where a rejected credential is counted.
+        if st.pending.claim(&key) {
+            if r.is_success() {
+                self.stats.auth_ok += 1;
+                st.auth_failures.clear();
+                return Decision::OutOfScope("SIP response");
+            }
+            if r.is_digest_challenge() {
+                self.stats.auth_failures += 1;
+                let (n, exceeded) = st.auth_failures.record(now.0, AUTH_FAILURE_WINDOW_SECS);
+                if exceeded {
+                    return Decision::AuthFailure { failures: n };
+                }
+            }
             return Decision::OutOfScope("SIP response");
         }
-        if r.is_success() {
-            // The credential was accepted. Earlier rejections were someone mistyping a
-            // password, not an attack — forgetting them is what keeps a customer who fixed
-            // their configuration from being blocked minutes later.
-            self.stats.auth_ok += 1;
-            st.auth_failures.clear();
-            return Decision::OutOfScope("SIP response");
-        }
-        self.stats.auth_failures += 1;
-        let (n, exceeded) = st.auth_failures.record(now.0, AUTH_FAILURE_WINDOW_SECS);
-        if exceeded {
-            return Decision::AuthFailure { failures: n };
+
+        // Completion path: the final response to an international INVITE we remembered.
+        // Only a final response is an outcome, and silence is never fed — the same honesty
+        // the auth rule keeps.
+        if !provisional && st.pending_intl.claim(&key) {
+            let completed = r.is_success();
+            if completed {
+                self.stats.intl_completed += 1;
+            } else if r.status >= 400 {
+                self.stats.intl_failed += 1;
+            } else {
+                // A 3xx redirect is neither a completion nor a failure; ignore it.
+                return Decision::OutOfScope("SIP response");
+            }
+            if !behavioural {
+                return Decision::OutOfScope("SIP response");
+            }
+            let v = st.anomaly.observe_completion(completed, now.0);
+            let bits = v.evidence.round().max(0.0) as u32;
+            if v.fired {
+                if mode.is_learning(now) {
+                    self.stats.would_block += 1;
+                    return Decision::WouldBlock {
+                        country: "?",
+                        bits,
+                        countries: v.countries,
+                    };
+                }
+                self.stats.blocks += 1;
+                return Decision::Block {
+                    country: "?",
+                    bits,
+                    countries: v.countries,
+                };
+            }
         }
         Decision::OutOfScope("SIP response")
     }
@@ -497,7 +542,7 @@ impl Engine {
     fn decide(
         prefix: &str,
         state: &mut PeerState,
-        _req: &sip::Request<'_>,
+        req: &sip::Request<'_>,
         c: Country,
         now: Timestamp,
         mode: Mode,
@@ -507,6 +552,10 @@ impl Engine {
         // and the dialling prefix, at this instant. All the state — novelty, prefix
         // variety, volume — lives inside it.
         let v = state.anomaly.observe(c.index, prefix, now.0);
+        // Remember the call so its final response can feed the completion arm.
+        if let Some(key) = sip::transaction_key(req.via_branch(), req.call_id, req.cseq) {
+            state.pending_intl.remember(key, now.0);
+        }
         // A first-time country registers as novelty for the report's thermometer.
         stats.novel += u64::from(v.first_time);
         let bits = v.evidence.round().max(0.0) as u32;
@@ -687,6 +736,70 @@ mod tests {
         }
         assert!(saw_would, "the scan should have produced a WouldBlock");
         assert_eq!(e.stats.blocks, 0);
+    }
+
+    /// An INVITE to `dest` with a distinct transaction `n`, and the softswitch's response.
+    fn invite_n(n: u32, dest: &str) -> Vec<u8> {
+        format!(
+            "INVITE sip:{dest}@pbx SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.0.0.5;branch=z9hG4bK{n}\r\n\
+             From: <sip:200@pbx>;tag=t1\r\nTo: <sip:{dest}@pbx>\r\n\
+             Call-ID: call-{n}\r\nCSeq: {n} INVITE\r\n\r\n"
+        )
+        .into_bytes()
+    }
+    fn invite_response(n: u32, status: u16) -> Vec<u8> {
+        format!(
+            "SIP/2.0 {status} X\r\n\
+             Via: SIP/2.0/UDP 10.0.0.5;branch=z9hG4bK{n}\r\n\
+             From: <sip:200@pbx>;tag=t1\r\nTo: <sip:x@pbx>;tag=s\r\n\
+             Call-ID: call-{n}\r\nCSeq: {n} INVITE\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn international_calls_that_never_complete_are_a_scan() {
+        // The AT&T signature, end to end: a source dials many countries and every call is
+        // rejected (404). The completion arm should fire.
+        let mut e = engine();
+        let mut fired = false;
+        for i in 0..25u32 {
+            let dest = format!("00{}12345678", 30 + i);
+            e.observe_packet(peer(), switch(), &invite_n(i, &dest), t(i * 30));
+            let (subject, d) =
+                e.observe_packet(switch(), peer(), &invite_response(i, 404), t(i * 30 + 1));
+            if matches!(d, Decision::Block { .. }) {
+                assert_eq!(
+                    subject,
+                    peer(),
+                    "the block lands on the caller, not the switch"
+                );
+                fired = true;
+            }
+        }
+        assert!(
+            fired,
+            "many international attempts, none completing, must block"
+        );
+        assert!(e.stats.intl_failed > 0 && e.stats.intl_completed == 0);
+    }
+
+    #[test]
+    fn international_calls_that_answer_are_not_a_scan() {
+        let mut e = engine();
+        let mut ever = false;
+        for i in 0..40u32 {
+            let dest = format!("00{}12345678", 30 + (i % 3)); // a few countries, all answer
+            e.observe_packet(peer(), switch(), &invite_n(i, &dest), t(i * 60));
+            ever |= matches!(
+                e.observe_packet(switch(), peer(), &invite_response(i, 200), t(i * 60 + 1))
+                    .1,
+                Decision::Block { .. }
+            );
+        }
+        assert!(!ever, "completing calls are not a scan");
+        assert!(e.stats.intl_completed > 0);
     }
 
     #[test]

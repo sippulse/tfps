@@ -101,6 +101,16 @@ fire point out to "many rapid novel countries" and away from an unlucky legitima
 dials one consistent format; probing `00`, `011`, `+`, `+5540` is first-contact after
 first-contact.
 
+**Completion** is a third arm, and the closest to the AT&T ground truth — "the call never
+came here." Each observed *final* response to an international INVITE is a Bernoulli trial:
+a `2xx` completed (benign), a final `4xx`/`5xx`/`6xx` did not (scan evidence). This is the
+original TRW mapping exactly — connection succeeded/failed. Only *observed* final responses
+are fed; a provisional `1xx` is not an outcome, and **silence is never scored** — the same
+honesty the auth rule keeps, since a softswitch that rejects probes without answering (the
+reference server does) leaves this arm no evidence rather than false ones. Where the
+response side is visible, "attempted fifteen countries, fourteen never answered" is close to
+unmissable and has almost no legitimate analogue.
+
 ### Exploitation → hierarchical Gamma-Poisson surprise
 
 The volume spike is count-rate change detection. Model each source's international-call rate
@@ -161,10 +171,10 @@ operator's risk appetite, not of the traffic.
 - **The slow evader.** A source that paces its novelty below θ₀ evades the scan arm (the
   demo's alternating case never fired). Mitigated — not solved — by the volume arm, by a slow
   decay rather than a hard reset on the benign side, and by a long-window backstop.
-- **Completion is a missing multiplier.** The scan arm is good on novelty alone and
-  *AT&T-grade* with completion ("attempted 15 countries, 14 never answered"). That needs
-  response-side correlation (`200 OK`/`BYE`), which `SPEC.md` §3 currently excludes from the
-  decision path. It is the one architectural addition worth making.
+- **Completion depends on seeing the response side.** The completion arm is only as good as
+  the responses TFPS can observe. Where the softswitch rejects probes silently (the
+  reference server does), it has little to work with — the same structural blindness the auth
+  failure rule has, and reported the same way (`intl_ok`/`intl_fail` near zero is visible).
 - **Low-and-slow mimicry** of a legitimate profile at low volume is the residual gap no
   on-wire method closes. This is why behavioural detection is opt-in, blocks carry a TTL, and
   every block is unbannable with the unban rate watched as the precision proxy.
