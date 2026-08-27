@@ -191,10 +191,12 @@ impl NoiseFilter {
             for pat in INJECTION {
                 // `;` is legitimate as a SIP URI parameter separator (`;tag=`,
                 // `;transport=`), so it only counts inside the **user part**.
+                // `;` is a legitimate URI parameter separator, so it only counts inside
+                // the user part — before the `@`. `uri_addr` has already removed the
+                // display name and stopped at the first `;`, so a `;` present here is one
+                // the attacker put in the user part.
                 if *pat == ";" {
-                    // `;` never survives `uri_addr`, which stops at the first one — so it
-                    // is checked against the raw value, restricted to the user part.
-                    if user_part(&raw.to_ascii_lowercase()).is_some_and(|u| u.contains(';')) {
+                    if addr.split('@').next().is_some_and(|u| u.contains(';')) {
                         self.injections += 1;
                         return Some(pat);
                     }
@@ -339,34 +341,40 @@ fn matches_sig(ua: &str, sig: &str, kind: Match) -> bool {
 /// end-user chose; the parameters (`;tag=`, `;transport=tcp`) are structured and
 /// legitimate. Injection lands in the user part or the host, and nowhere else.
 fn uri_addr(value: &str) -> Option<&str> {
-    // Prefer what is inside the angle brackets: a display name is free text and may itself
-    // contain something that looks like a URI.
-    let scope = match (value.find('<'), value.find('>')) {
-        (Some(a), Some(b)) if b > a => &value[a + 1..b],
-        _ => value,
+    // A `From`/`To` value is `[display-name] <addr-spec> *(;param)`, or a bare `addr-spec`
+    // with its own `*(;param)`. The scan must reach `user@host` and nothing else.
+    //
+    // A **quoted** display name is the hazard the first attempt missed: it is free text the
+    // caller chose and may contain a literal `sip:` or an apostrophe, so it is skipped
+    // before anything else. The bracketed URI is then preferred over a bare one.
+    let after_name = match value.trim_start().strip_prefix('"') {
+        Some(rest) => match rest.find('"') {
+            Some(q) => &rest[q + 1..],
+            None => rest,
+        },
+        None => value,
     };
-    let start = scope
+    let inner = match (after_name.find('<'), after_name.find('>')) {
+        (Some(a), Some(b)) if b > a => &after_name[a + 1..b],
+        _ => after_name,
+    };
+    let start = inner
         .find("sip:")
         .map(|i| i + 4)
-        .or_else(|| scope.find("sips:").map(|i| i + 5))
-        .or_else(|| scope.find("tel:").map(|i| i + 4))?;
-    let rest = &scope[start..];
-    // Only `>` and `;` end the address. Whitespace does **not**: `sip:1 union select@host`
-    // is malformed on purpose and is exactly what this rule is for. The display name needs
-    // no terminator, because the scan starts at the scheme and the name precedes it.
-    let end = rest.find(['>', ';']).unwrap_or(rest.len());
-    Some(&rest[..end])
-}
+        .or_else(|| inner.find("sips:").map(|i| i + 5))
+        .or_else(|| inner.find("tel:").map(|i| i + 4))?;
+    let rest = &inner[start..];
 
-/// Lower-cased user part of a SIP URI, for the `;` check.
-fn user_part(uri: &str) -> Option<&str> {
-    let start = uri
-        .find("sip:")
-        .map(|i| i + 4)
-        .or_else(|| uri.find("sips:").map(|i| i + 5))?;
-    let rest = &uri[start..];
-    let end = rest.find('@')?;
-    Some(&rest[..end])
+    // The boundary between the address and its parameters is the `@`: a `;` *before* it is
+    // userinfo — a real attack shape, `sip:a;drop@host` — and must be kept; a `;` *after*
+    // the host is a legitimate URI parameter (`;transport=tcp`) and is dropped. `>` and
+    // whitespace always end it; `?` never does (`sip:?=?@host` is an attack).
+    let host_from = rest.find('@').map(|i| i + 1).unwrap_or(0);
+    let tail = rest[host_from..]
+        .find(['>', ';', ' ', '\t'])
+        .map(|i| host_from + i)
+        .unwrap_or(rest.len());
+    Some(&rest[..tail])
 }
 
 #[cfg(test)]
@@ -500,6 +508,45 @@ mod tests {
                 "display name wrongly condemned: {from}"
             );
         }
+    }
+
+    #[test]
+    fn a_display_name_cannot_hide_an_attack_uri_from_the_scan() {
+        // The first fix scoped to the bracketed URI, which a crafted display name could
+        // capture: `"<x>" <sip:...>` put the brackets inside the quoted name. These must
+        // still be caught.
+        let mut f = NoiseFilter::new();
+        for uri in [
+            "\"<unknown>\" <sip:1001'--@pbx.com>;tag=x",
+            "\"Anonymous <hidden>\" <sip:x'or'1'='1@pbx.com>",
+        ] {
+            assert!(
+                f.injection_in_uri(&[Some(uri)]).is_some(),
+                "attack hidden behind a display name: {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_display_name_that_merely_contains_sip_is_not_an_attack() {
+        // The addr-spec is the bracketed URI, not the `sip:` that happens to sit in a
+        // quoted name. `"call sip:me; now" <sip:1001@pbx.com>` is a legitimate call.
+        let mut f = NoiseFilter::new();
+        assert_eq!(
+            f.injection_in_uri(&[Some("\"call sip:me; now\" <sip:1001@pbx.com>")]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_semicolon_in_a_display_name_is_not_an_attack() {
+        // The `;` check must not read the display name, or an ordinary punctuated name
+        // trips it.
+        let mut f = NoiseFilter::new();
+        assert_eq!(
+            f.injection_in_uri(&[Some("\"Reception; front desk\" <sip:1001@pbx.com>")]),
+            None
+        );
     }
 
     #[test]

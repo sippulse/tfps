@@ -120,6 +120,19 @@ produces no authentication failures at all and is invisible in the SIP plane.
 **Challenge** — diverting a suspicious attempt to verification (voice captcha, PIN) instead
 of denying it. It exists so the ambiguous case never needs a risk-appetite threshold.
 
+**ignoreip** — a source (address or network) the system is told never to **enforce**
+against. Named after `fail2ban`'s field of the same job. An exempt source is still
+evaluated, counted and reported; only the block is withheld. **Not a whitelist of
+destinations** (which would be R07, a claim about what is not fraud) — it is a claim about
+what is not *ours to punish*. Two kinds: **local** entries (the host's own addresses,
+discovered, never configured) and **declared** entries (the operator's). A declared entry
+that has never matched is **cold**, and reported as such.
+
+**Volume backstop** — the authentication rule that fires on *authenticated attempts* when
+no digest challenge is ever seen, as opposed to the primary rule that fires on *failed
+authentications*. In code: `AuthAbuse`, reported as `auth_volume`. Distinct from a *failed
+authentication*; the two must not be conflated.
+
 **Perimeter** — the layer that removes noise: scanning, brute force, bad-reputation IPs,
 known tool user-agents. **It does not exist to catch fraud**; it exists to keep garbage out
 of the behavioural baseline. Active from installation.

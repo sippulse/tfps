@@ -73,7 +73,7 @@ pub struct Config {
     /// trusted carriers and management ranges. An exempt source is still evaluated,
     /// counted and reported — the entry changes **enforcement scope**, never a verdict,
     /// which is what keeps it inside `SPEC.md` §11.
-    #[serde(default)]
+    #[serde(default, alias = "ignore")]
     pub ignoreip: Vec<String>,
     pub apiban_key: Option<String>,
     pub learn_days: Option<u32>,
@@ -149,6 +149,17 @@ mod tests {
         assert_eq!(c.signatures.len(), 2);
         assert_eq!(c.ignoreip, ["10.0.0.0/8"]);
         assert_eq!(c.apiban_key.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn a_config_from_the_previous_version_still_loads() {
+        // The field was renamed `ignore` -> `ignoreip`. With `deny_unknown_fields` and no
+        // alias, an existing config would fail to parse and the daemon would fall back to
+        // built-in defaults — silently dropping the operator's apiban_key, ports and
+        // exemptions. The alias is what stops a rename from erasing a live configuration.
+        let c = parse(r#"{"ignore": ["10.0.0.0/8"], "ports": [5060]}"#)
+            .expect("a config written by the previous version must still load");
+        assert_eq!(c.ignoreip, ["10.0.0.0/8"]);
     }
 
     #[test]

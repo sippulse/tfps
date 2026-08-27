@@ -68,15 +68,26 @@ packet on a watched port
    │
    └─ country never seen for this (peer, A-number) pair?
          ├─ NO  ──► pass
-         └─ YES ──► how many first-time countries in the last hour?
-                      ├─ < 10 ──► pass
-                      └─ ≥ 10 ──► block
+         └─ YES ──► enough first-time countries, rare for this peer, in the last hour?
+                      ├─ NO  ──► pass
+                      └─ YES ──► block
 ```
 
 **A single new country never fires.** A first-time country happens on 0.85% of calls;
 blocking that would block 0.85% of everyone's international traffic. The signal is
-**accumulation**, not a single event — ten first-time countries within an hour fired 4
-times across 2,829 account-days in the measurement that produced the rule.
+**accumulation**, not a single event.
+
+**On the threshold — and it is not yet its final form.** Today the count is a universal
+constant (10 first-time countries in an hour), calibrated for the wholesale target: it
+fired 4 times across 2,829 account-days, and those four windows were the corpus's most
+atypical. That number is deliberately conservative for a *broad* profile and too lax for a
+narrow one — a hijacked twenty-extension PBX can reach nine new countries in an hour and
+pass. The specified next step (`SPEC.md` §6, §14) is a **peer-relative** predicate: a debut
+that is *ordinary for the peer* does not count, only debuts that are also rare for it, with
+the threshold scaled to the unit's own established breadth. That makes "three in an hour"
+abnormal where three is genuinely abnormal, without blocking the salesman who calls Germany
+daily from an office that calls Germany daily. The per-peer prior it needs is already
+measured and stored (`tfps_ctl countries`); wiring it into the decision is the open work.
 
 ### The perimeter does not exist to catch fraud
 
@@ -140,7 +151,7 @@ Two properties that matter more than they sound:
   addresses would come back protecting nothing while looking perfectly healthy. TFPS stores
   both, re-applies the last 7 days at startup, and says so: `APIBAN restored: 2140
   addresses`.
-- **The feed respects the ignore list.** A curated third-party list is still not yours.
+- **The feed respects `ignoreip`.** A curated third-party list is still not yours.
 
 ### The backstop, and why it has to exist
 
@@ -364,7 +375,7 @@ and **every entry counts its hits**, so a stale exemption shows up as cold:
 An exempt source is still **judged and reported**, only never enforced:
 
 ```
-EXEMPT peer=209.38.75.252 reason=auth-failed detail=rejected (ignore list)
+EXEMPT peer=209.38.75.252 reason=auth-failed detail=rejected ignoreip=<rule>
 ```
 
 Silently skipping the evaluation would hide a compromised trusted peer, which is the case
