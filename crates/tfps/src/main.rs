@@ -425,7 +425,7 @@ fn main() -> ExitCode {
         );
     }
     if !engine.behavioural_enabled() {
-        say!("  mode              : NOISE REDUCTION (perimeter only; --behavioural adds fraud detection)");
+        say!("  mode              : PREVENTION (perimeter/fail2ban replacement; --behavioural adds the experimental layer)");
     } else {
         match mode {
             // The mode is announced loudly and repeated: this project's difference from
@@ -936,15 +936,19 @@ fn counter_line(s: &tfps_core::engine::Stats) -> String {
 
 fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode) {
     let s = &e.stats;
-    let mode_label = match mode {
-        Mode::Active => "ACTIVE".to_string(),
-        Mode::Learning { until } => {
-            let left = until.0.saturating_sub(t.0);
-            format!(
-                "LEARNING ({}d {}h left)",
-                left / 86400,
-                (left % 86400) / 3600
-            )
+    let mode_label = if !e.behavioural_enabled() {
+        "PREVENTION".to_string()
+    } else {
+        match mode {
+            Mode::Active => "ACTIVE".to_string(),
+            Mode::Learning { until } => {
+                let left = until.0.saturating_sub(t.0);
+                format!(
+                    "LEARNING ({}d {}h left)",
+                    left / 86400,
+                    (left % 86400) / 3600
+                )
+            }
         }
     };
     say!(

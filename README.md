@@ -3,12 +3,20 @@
 **Telephony Fraud Prevention System** for SIP networks. One static binary, no cloud, no
 policy configuration.
 
-TFPS is **two things, and the first is the product.** By default it is a **noise filter**:
-it drops SIP scanning, brute-force and known-bad sources in the kernel, before they reach
-your `sngrep` — and that alone is worth running. **Behavioural IRSF detection** — learning
-each source's normal and catching fraud by anomaly — is an **opt-in extra**
-(`--behavioural`), off by default. Most installs will only ever want the noise filter, and
-they should not pay for anything more.
+TFPS **detects and prevents SIP fraud by banning attacker addresses in the kernel.** Think
+of it as a **faster `fail2ban`**: it reads SIP straight off the wire instead of tailing and
+parsing log files, so it reacts in packets rather than log-flush intervals, and it catches
+attacks the logs never record. As a side effect the banned traffic vanishes from your
+`sngrep`.
+
+Two layers, and the first is the product:
+
+- **Prevention** (default, on): drops SIP scanning, brute-force and known-bad sources —
+  the `fail2ban` job, done faster and without log parsing. Most installs only ever want this.
+- **Behavioural detection** (`--behavioural`, off, **highly experimental**): goes where no
+  other system does — the **compromised downstream PBX**, where the attacker already holds
+  valid credentials and every perimeter signal is clean. It catches IRSF by anomaly. It is a
+  research-grade layer, not a guarantee.
 
 - **Static musl binaries** — `tfps` ≈ 4.3 MB, `tfps_ctl` ≈ 2.3 MB. No glibc dependency;
   they run on Ubuntu 24.04, Debian 12 and forward.
@@ -44,22 +52,32 @@ noisiest scanners disappear from the capture entirely.
 
 ---
 
-## Two products, one binary
+## Two layers, one binary
 
-| | **Noise reduction** (default) | **Fraud detection** (`--behavioural`) |
+| | **Prevention** (default) | **Behavioural detection** (`--behavioural`) |
 |---|---|---|
-| what it does | drops scanning, injection, brute-force, known-bad IPs | learns each source's normal, blocks IRSF by anomaly |
+| what it does | bans scanning, injection, brute-force, known-bad IPs | catches the compromised PBX — IRSF by anomaly |
+| compared to | a faster `fail2ban`, no log parsing | goes where fail2ban structurally cannot |
+| maturity | production | **highly experimental** |
 | needs learning? | no — effective from minute one | yes — 30-day learning window before it acts |
-| state | rebuilds from traffic in minutes | per-source, persisted in SQLite |
 | the signal | user-agent, URI shape, failed auth, APIBAN | three-arm sequential detector (see below) |
 | default | **on** | **off** |
 
 ```sh
-tfps                 # noise reduction only — the product
-tfps --behavioural   # add IRSF detection (or "behavioural": true in the config)
+tfps                 # prevention only — the product
+tfps --behavioural   # add the experimental behavioural layer
 ```
 
 The banner always says which of the two you are running, so it is never ambiguous.
+
+### Why faster than fail2ban
+
+`fail2ban` tails a log file and matches a regex, so it is bounded by how often the softswitch
+flushes logs and by whether the event is logged at all — Asterisk's security channel ships
+off, PJSIP does not log below 5 requests in 5 s. TFPS reads the SIP on the wire: a rejected
+credential or a scanner user-agent is seen **as the packet arrives**, and the ban is written
+to the kernel immediately. It also sees what the logs never record, and it needs no logging
+configured on the softswitch at all.
 
 ---
 
@@ -134,9 +152,19 @@ structurally cannot fire is the `fail2ban` blindness this project exists to avoi
 
 ---
 
-## Fraud detection — the opt-in layer
+## Behavioural detection — the experimental layer
 
-Turn it on with `--behavioural`. It learns each **source IP**'s normal behaviour and blocks
+> ⚠️ **Highly experimental.** This layer is research-grade: it addresses a case no other tool
+> reaches, but it has not earned the confidence the prevention layer has. Run it in learning
+> mode, read the `WOULD BLOCK` lines, and judge it on your own traffic before trusting it.
+
+It exists for one case the prevention layer — and `fail2ban`, and reputation lists — cannot
+touch: the **compromised downstream PBX**. The attacker already holds a valid credential, the
+traffic arrives authenticated from the usual IP, and every perimeter signal is clean. Nothing
+that keys on *reputation* or *authentication failure* sees it. TFPS keys on **behaviour**:
+what a source does with those valid credentials.
+
+Turn it on with `--behavioural`. It learns each **source IP**'s normal behaviour and flags
 IRSF by anomaly.
 
 > **Prerequisite — configure your international prefixes.** The behavioural layer reasons
@@ -323,7 +351,7 @@ why).
 
 | flag | effect |
 |---|---|
-| `--behavioural` | turn on fraud detection (default: OFF, noise reduction only) |
+| `--behavioural` | turn on the experimental behavioural layer (default: OFF, prevention only) |
 | `--ports 5060,5080` | SIP ports to watch (default `5060`) |
 | `--intl +,00,011,9011` | international dialling prefixes |
 | `--ignoreip CIDR` | never enforce against this address/network (repeatable) |
@@ -382,7 +410,7 @@ state needs only the database file.
 ## Reading the report
 
 ```
---- mode=NOISE REDUCTION packets=330 sip=98 responses=0 keepalive=232 not_sip=0
+--- mode=PREVENTION packets=330 sip=98 responses=0 keepalive=232 not_sip=0
     noise=12 (12%) injection=0 auth_att=142 auth_fail=5 auth_ok=97 auth_chal=104
     auth_volume=0 intl_ok=0 intl_fail=0 invites=62 intl=62 unknown_country=20
     first_time=21 blocks=0 would_block=0 sources=3 ports={5060: 330}
@@ -391,7 +419,7 @@ state needs only the database file.
 
 | field | meaning |
 |---|---|
-| `mode` | NOISE REDUCTION, or FRAUD DETECTION (LEARNING / ACTIVE) |
+| `mode` | PREVENTION, or (behavioural) LEARNING / ACTIVE |
 | `keepalive` | NAT CRLF pings (RFC 5626) — on a residential 5060, most packets |
 | `not_sip` | unclassified. **Should be ~0**; high means something is not understood |
 | `noise (%)` | how much the perimeter removed — the number behind a clean sngrep |
