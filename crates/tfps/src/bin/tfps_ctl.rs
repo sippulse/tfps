@@ -305,9 +305,15 @@ fn banned(args: &Args) -> Result<(), String> {
         say!("nothing is blocked");
         return Ok(());
     }
-    // The audit log says *why*, which the kernel map cannot know.
+    // The audit log says *why* for perimeter blocks; the APIBAN feed is a separate record,
+    // since its thousands of addresses are not written to the audit log. Load both once.
     let store = Store::open_readonly(&args.db).ok();
+    let apiban = store
+        .as_ref()
+        .and_then(|s| s.apiban_all().ok())
+        .unwrap_or_default();
     let now_ns = monotonic_ns();
+    let mut apiban_count = 0usize;
     say!("{:<16} {:>10}  REASON", "SOURCE", "EXPIRES IN");
     for (ip, until) in &entries {
         let left = if *until == 0 {
@@ -315,18 +321,28 @@ fn banned(args: &Args) -> Result<(), String> {
         } else {
             ago(((*until).saturating_sub(now_ns) / 1_000_000_000) as u32)
         };
+        let ip_s = ip.to_string();
+        let from_apiban = apiban.contains(&ip_s);
+        if from_apiban {
+            apiban_count += 1;
+        }
         let why = match (args.why, store.as_ref()) {
             (true, Some(s)) => s
-                .blocks(1, Some(&ip.to_string()))
+                .blocks(1, Some(&ip_s))
                 .ok()
                 .and_then(|v| v.into_iter().next())
                 .map(|r| format!("{} ({})", r.reason, r.detail))
+                .or_else(|| from_apiban.then(|| "apiban (feed)".to_string()))
                 .unwrap_or_else(|| "not in this audit log".to_string()),
             _ => String::new(),
         };
-        say!("{ip:<16} {left:>10}  {why}");
+        say!("{ip_s:<16} {left:>10}  {why}");
     }
-    say!("\n{} blocked", entries.len());
+    say!(
+        "\n{} blocked ({apiban_count} from the APIBAN feed, {} from the perimeter/manual)",
+        entries.len(),
+        entries.len() - apiban_count
+    );
     Ok(())
 }
 

@@ -223,6 +223,18 @@ impl Store {
         Ok(rows.flatten().filter_map(|s| s.parse().ok()).collect())
     }
 
+    /// Every address currently on the APIBAN feed, for attributing a block to it.
+    pub fn apiban_all(&self) -> Result<std::collections::HashSet<String>, String> {
+        let mut st = self
+            .conn
+            .prepare("SELECT ip FROM apiban_ip")
+            .map_err(|e| format!("reading apiban_ip: {e}"))?;
+        let rows = st
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("iterating apiban_ip: {e}"))?;
+        Ok(rows.flatten().collect())
+    }
+
     /// Drops feed entries older than the retention window.
     pub fn apiban_prune(&self, older_than: u32) -> usize {
         self.conn
