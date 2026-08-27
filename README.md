@@ -3,18 +3,25 @@
 **Telephony Fraud Prevention System** for SIP networks. One static binary, no cloud, no
 policy configuration.
 
-**Two things, and the first is the product.** By default TFPS is a **noise filter**: it
-drops SIP scanning, brute-force and known-bad sources in the kernel, before they reach your
-`sngrep` — and that alone is worth running. **Fraud detection** — behavioural IRSF
-detection by anomaly — is an **opt-in extra** (`--behavioural`), off by default. Most
-installs will only ever want the noise filter, and they should not pay for anything more.
+TFPS is **two things, and the first is the product.** By default it is a **noise filter**:
+it drops SIP scanning, brute-force and known-bad sources in the kernel, before they reach
+your `sngrep` — and that alone is worth running. **Behavioural IRSF detection** — learning
+each source's normal and catching fraud by anomaly — is an **opt-in extra**
+(`--behavioural`), off by default. Most installs will only ever want the noise filter, and
+they should not pay for anything more.
+
+- **Static musl binaries** — `tfps` ≈ 4.3 MB, `tfps_ctl` ≈ 2.3 MB. No glibc dependency;
+  they run on Ubuntu 24.04, Debian 12 and forward.
+- **No UDP bind** — capture is `AF_PACKET`, so your softswitch keeps its own socket on 5060
+  and never notices.
+- **Kernel-level drop** — condemned sources vanish from `sngrep`, `tcpdump` and `tshark`.
 
 ---
 
 ## The garbage disappears from sngrep
 
-This is what the product delivers today, and it works because of one specific ordering
-inside the Linux kernel:
+This is what the product delivers, and it works because of one specific ordering inside the
+Linux kernel:
 
 ```
 NIC → driver → XDP ← TFPS drops here
@@ -27,162 +34,139 @@ NIC → driver → XDP ← TFPS drops here
 A packet dropped at **XDP never reaches the libpcap tap**. That is why `nftables` would not
 work for this purpose: its drop happens later, and your capture would still be polluted.
 
-**Verified in production**: with 959 sources blocked, 40 seconds of `tcpdump` filtered to
-six of them captured **zero** packets, against 5 in the control window.
-
-It is not hermetic — one packet slipped through in a 90 s test. What the data supports is a
-drastic reduction, not perfect blocking.
+**Verified in production**: with ~2,000 sources blocked (APIBAN + perimeter), a `tcpdump`
+filtered to a sample of them captured a fraction of the packets a control window did. It is
+not hermetic — the occasional packet slips through — but the reduction is drastic, and the
+noisiest scanners disappear from the capture entirely.
 
 ---
 
-## Turning on fraud detection
+## Two products, one binary
 
-Everything above is the default. Behavioural fraud detection — learning each source's
-normal destinations and flagging anomalies — is **off unless you ask for it**:
+| | **Noise reduction** (default) | **Fraud detection** (`--behavioural`) |
+|---|---|---|
+| what it does | drops scanning, injection, brute-force, known-bad IPs | learns each source's normal, blocks IRSF by anomaly |
+| needs learning? | no — effective from minute one | yes — 30-day learning window before it acts |
+| state | rebuilds from traffic in minutes | per-source, persisted in SQLite |
+| the signal | user-agent, URI shape, failed auth, APIBAN | four-arm sequential detector (see below) |
+| default | **on** | **off** |
 
 ```sh
-tfps --behavioural            # or "behavioural": true in the config
+tfps                 # noise reduction only — the product
+tfps --behavioural   # add IRSF detection (or "behavioural": true in the config)
 ```
 
-It adds a learning period, per-source state, and the SQLite persistence that carries it.
-None of that runs in the default noise-reduction mode. It is genuinely useful, and
-genuinely optional.
+The banner always says which of the two you are running, so it is never ambiguous.
+
+---
 
 ## Status — v0.1.0
 
-| done | missing |
+| working | not yet |
 |---|---|
-| `AF_PACKET` capture, no port bind | forged `603` for the fraud verdict |
-| XDP enforcement (native or generic) | peer prior for a brand-new pair |
-| perimeter: user-agent, injection, brute force | learning the dial plan in parallel |
-| optional APIBAN integration | call duration via `BYE` |
-| SIP parsing: request, response, keepalive | local honeypot |
-| dial plan as a prefix list | IPv6 and SIP over TCP |
-| destination country (240 E.164 codes) | day-31 confirmation |
-| per-pair novelty with a rotating bitmap | |
-| SQLite persistence | |
-| memory ceilings with automatic pruning | |
+| `AF_PACKET` capture, no port bind | enforcing the behavioural verdict (forged `603`) |
+| XDP enforcement of perimeter blocks (native/generic) | SIP over TCP (detection) |
+| perimeter: user-agent, URI injection, failed auth | IPv6, SIP over TLS |
+| APIBAN, background-synced and persisted | call-duration signal via `BYE` |
+| `ignoreip`, with the host's own addresses always exempt | day-31 activation confirmation |
+| four-arm behavioural detector, self-calibrating | |
+| SQLite persistence and control tool | |
 
-**Today it filters noise and learns. It does not block fraud yet** — the behavioural layer
-observes for 30 days before acting, and the fraud verdict is not enforced.
+**The perimeter enforces today; the behavioural layer detects and reports.** During the
+30-day learning window it prints `WOULD BLOCK` lines and blocks nothing. After that it
+prints `BLOCK` lines with the evidence — but pushing that verdict to the kernel (the forged
+`603 Decline` of `SPEC.md` §8, or a source-level drop) is the remaining piece. Read the
+`WOULD BLOCK`/`BLOCK` lines and the `tfps_ctl stats` calibration to judge the (α, β) tuning
+before wiring enforcement on.
 
 ---
 
-## How it decides
+## The perimeter — the default product
+
+Every packet on a watched port is checked, cheapest first. A match **condemns the source**:
+its next packets die at XDP and vanish from the capture.
+
+- **Known scanner user-agents** — 18 built-in signatures (`friendly`, `sipcli`, `sipvicious`,
+  `pplsip`, `sipsorcery`, `Nmap NSE`…). Weak as *detection* — a competent attacker forges a
+  legitimate UA — but most scanning traffic uses a default one, so as a *volume filter* it
+  earns its place. A missing `User-Agent` is **not** noise.
+- **URI injection** — 11 built-in patterns (`'`, `%27`, `--`, `?=?`, `union`, `select`, and
+  `;` inside the user part), matched against the `user@host` of the Request-URI, `From` and
+  `To` only — never the display name, so an Irish surname is not mistaken for SQL injection.
+  Higher confidence than a user-agent: no real phone puts a single quote in a `From` header.
+- **Failed authentication** — see below.
+- **APIBAN** — the collaborative bad-IP list, if a key is configured.
+
+The perimeter does **not** exist to catch fraud. It exists to keep noise out of the
+behavioural baseline: if scanning fed a source's baseline, the detector would learn that
+bursts to strange destinations are normal there, and poison itself.
+
+### Failed authentication, and what does not count
+
+**A bare `401` means nothing.** Digest is a two-step flow: every legitimate `REGISTER` gets
+a `401` with a nonce and is resent with `Authorization`. Counting challenges would block
+every customer.
+
+What counts is a request that **carried a credential and was answered `401`/`407` anyway**:
 
 ```
-packet on a watched port
-   │
-   ├─ known scanner user-agent?             ──► condemn the source, gone from sngrep
-   ├─ injection in the URI (' -- %27 ?=?)?  ──► condemn the source, gone from sngrep
-   ├─ credential brute force?               ──► condemn the source, gone from sngrep
-   │
-   ├─ matches an international prefix? ──► NO: out of scope, pass. Done.
-   │                                        (this is where most traffic leaves)
-   ├─ strip, canonicalise, resolve country
-   │
-   └─ country never seen for this (peer, A-number) pair?
-         ├─ NO  ──► pass
-         └─ YES ──► enough first-time countries, rare for this peer, in the last hour?
-                      ├─ NO  ──► pass
-                      └─ YES ──► block
+REGISTER (no Authorization)  →  401 + nonce     the normal handshake, ignored
+REGISTER (Authorization)     →  200 OK          accepted — the count is cleared
+REGISTER (Authorization)     →  401 again       a rejected password. This is the signal.
 ```
 
-**A single new country never fires.** A first-time country happens on 0.85% of calls;
-blocking that would block 0.85% of everyone's international traffic. The signal is
-**accumulation**, not a single event.
+Five rejections in ten minutes condemn the source — `fail2ban`'s `maxretry`/`findtime` for
+the Asterisk jail, deliberately, but read off the wire instead of a log the softswitch may
+not be writing. Requests are matched to responses by the `Via` branch (RFC 3261 §17.1.3),
+falling back to `Call-ID` + `CSeq`. A retransmitted `401` counts once; an accepted credential
+clears the run, so someone who fixes a typo is not blocked by their next slip. Because it
+counts *failures*, a busy NAT is not a problem — a hundred phones behind one address all
+succeed.
 
-**On the threshold — and it is not yet its final form.** Today the count is a universal
-constant (10 first-time countries in an hour), calibrated for the wholesale target: it
-fired 4 times across 2,829 account-days, and those four windows were the corpus's most
-atypical. That number is deliberately conservative for a *broad* profile and too lax for a
-narrow one — a hijacked twenty-extension PBX can reach nine new countries in an hour and
-pass. The specified next step (`SPEC.md` §6, §14) is a **peer-relative** predicate: a debut
-that is *ordinary for the peer* does not count, only debuts that are also rare for it, with
-the threshold scaled to the unit's own established breadth. That makes "three in an hour"
-abnormal where three is genuinely abnormal, without blocking the salesman who calls Germany
-daily from an office that calls Germany daily. The per-peer prior it needs is already
-measured and stored (`tfps_ctl countries`); wiring it into the decision is the open work.
+**The backstop**: where the softswitch rejects probes *without* answering (measured on the
+reference server: one outbound packet in 45 s against hundreds inbound), the failure counter
+cannot rise, so a volume rule remains — 20 authenticated attempts in 60 s with no challenge
+seen. When that condition is detected, TFPS **says so** on the report, because a rule that
+structurally cannot fire is the `fail2ban` blindness this project exists to avoid.
 
-### The perimeter does not exist to catch fraud
+---
 
-It exists to **keep garbage out of the behavioural baseline**. If scanning feeds an
-account's baseline, the model learns that a burst to a strange destination is normal there,
-and the defence poisons itself.
+## Fraud detection — the opt-in layer
 
-Three families, at different confidence levels:
+Turn it on with `--behavioural`. It learns each **source IP**'s normal behaviour and blocks
+IRSF by anomaly. The full design and its literature are in
+[`docs/anomaly-detection.md`](docs/anomaly-detection.md); in brief:
 
-- **Tool user-agents** (18 signatures: `sipcli`, `friendly`, `sipvicious`, `pplsip`,
-  `sipscan`, `Nmap NSE`…). Weak as *detection* — a competent attacker forges a legitimate
-  UA. Adequate as a **volume filter**, because lazy scanners with default UAs are most of
-  the packets.
-- **URI injection** (`'`, `%27`, `--`, `%24`, `%60`, `==`, `?=?`, `union`, `select`, and
-  `;` inside the user part). **Higher** confidence: no real phone puts a single quote in
-  the `From` header.
-- **Failed authentication** — 5 rejected credentials in 10 minutes, with a volume backstop
-  of 20 authenticated attempts in 60 s for softswitches that never answer.
+**The B-number cannot be classified.** Tested against a real libphonenumber port, classic
+IRSF destinations (Latvia, Somalia, the Philippines) validate as ordinary mobile numbers,
+while some genuine ranges are rejected. Neither validity nor number-type separates fraud
+from legitimate traffic. Detection has to be **behavioural**.
 
-### What counts as a failed authentication, and what does not
+**IRSF has a behavioural signature, in two phases**, and each maps onto a solved problem:
 
-**A bare `401` means nothing.** The digest challenge is the normal flow: every legitimate
-`REGISTER` gets a `401` with a nonce before resending with `Authorization`. Counting
-challenges would block all of your customers within a minute.
+- **Scanning** — "they try dozens of countries to find one that routes through a partner
+  ITSP." That *is* a port scan, and it is detected with a **Threshold Random Walk** (Jung et
+  al., IEEE S&P 2004) — a sequential test that accumulates evidence per call and fires the
+  moment it is sufficient. Three arms run: a new **country**, a new **prefix** (probing
+  `00`, `011`, `+5540`…), and a **failed completion** (a call answered `4xx`/`5xx`/`6xx`, or
+  never — the AT&T signature, "the call never came here").
+- **Exploitation** — hammering the route it found shows as a volume spike against the
+  source's own norm, scored with **hierarchical Gamma-Poisson surprise**.
 
-What counts is a **request that carried a credential and was answered `401`/`407` anyway**:
+The four arms produce evidence in the same log-likelihood units, so they **add**;
+enforcement fires when the total crosses a bound set by the **error rates you choose**
+(α, β) — not a hand-picked threshold. Every block is one explainable sentence:
+*"14 bits: 9 country-scan, 5 volume."*
 
-```
-REGISTER (no Authorization)  →  401 + nonce        the normal handshake, ignored
-REGISTER (Authorization)     →  200 OK             accepted — the slate is wiped
-REGISTER (Authorization)     →  401 again          a rejected password. This is the signal.
-```
+**It self-calibrates.** The benign hypotheses — how often a normal source dials a new
+country, how often calls fail, the population's rate distribution — are learned from the
+deployment's *own* aggregate traffic during the learning window and refit at each
+checkpoint. The operator sets **only α and β**, properties of their risk appetite, never a
+traffic constant. `tfps_ctl stats` shows the learned values.
 
-Five rejections in ten minutes condemn the source — the `maxretry`/`findtime` defaults of
-the `fail2ban` Asterisk jail, deliberately, since that threshold has a decade of field use
-behind it. The difference is where the evidence comes from: **the wire, immediately**,
-instead of a log file the softswitch may not be writing. The method is irrelevant —
-`REGISTER` is where a password is stolen and `INVITE` is where it is spent, and both are
-challenged the same way.
-
-Requests are matched to their responses by the `Via` branch (RFC 3261 §17.1.3), falling
-back to `Call-ID` + `CSeq`. `CSeq` is part of the key on purpose: a client retrying a
-password keeps one `Call-ID` and increments `CSeq`, so keying on `Call-ID` alone would
-collapse a whole guessing run into one countable failure. A retransmitted `401` counts
-once. An accepted credential clears the count, so someone who fixes a mistyped password is
-not blocked by their next slip.
-
-Because it is failures and not volume, **a large NAT is not a problem**: a hundred phones
-behind one address all succeed, and successes do not accumulate.
-
-### APIBAN
-
-Set `apiban_key` and the feed is synced **on a background thread**, never queried per
-INVITE — that synchronous `rest_get()` is what capped the 2023 system at ~26 calls/s and
-froze every decision whenever apiban.org was slow.
-
-Two properties that matter more than they sound:
-
-- **The cursor is persisted.** The feed is consumed by a forward-only ID, so a restart that
-  forgot it would refetch the entire history; one that remembered it but forgot the
-  addresses would come back protecting nothing while looking perfectly healthy. TFPS stores
-  both, re-applies the last 7 days at startup, and says so: `APIBAN restored: 2140
-  addresses`.
-- **The feed respects `ignoreip`.** A curated third-party list is still not yours.
-
-### The backstop, and why it has to exist
-
-The rule above needs the softswitch's answer. There are real deployments where it never
-comes — measured on the reference server, where opensips drops requests addressed to a
-domain it does not serve **without challenging them**: 1 outbound packet in 45 seconds
-against hundreds inbound.
-
-There, the failure counter structurally cannot rise. So a volume backstop remains: **20
-authenticated attempts in 60 s** with no answer observed. It is looser, because it cannot
-tell success from failure — only volume. A legitimate phone sends one per registration
-cycle, typically every 300 s.
-
-And when that situation is detected — credentials presented, not one challenge seen — TFPS
-**says so on the report**, because a rule that structurally cannot match is exactly the
-`fail2ban` blindness this project exists to avoid.
+**Its one honest weakness**: a low-and-slow attacker who mimics a legitimate profile at low
+volume. Which is exactly why this layer is opt-in, blocks are temporary, and the unban rate
+is watched as the precision proxy.
 
 ---
 
@@ -204,7 +188,9 @@ integrations. Never **policy** configuration, which would say what fraud is.
 
   "signatures": ["MyLocalScanner", "=sipsak"],
   "injection": ["xp_cmdshell"],
+  "ignoreip": ["10.0.0.0/8", "203.0.113.7"],
 
+  "behavioural": false,
   "apiban_key": "optional-key",
 
   "learn_days": 30,
@@ -217,59 +203,58 @@ integrations. Never **policy** configuration, which would say what fraud is.
 ```
 
 Precedence: **command line > file > built-in default**, so you can debug in production
-without editing a file.
-
-An **unknown field is an error**, not silence: an `apiban_kei` quietly ignored would make
-you believe you enabled APIBAN when you did not. The same applies to malformed JSON and to
-an invalid peer IP — all of it becomes a startup alarm.
+without editing a file. An **unknown field is an error**, not silence: an `apiban_kei`
+quietly ignored would make you believe you enabled APIBAN when you did not. Malformed JSON
+and an invalid peer IP become startup alarms too. (Renamed fields keep an alias, so a config
+from an earlier version still loads rather than silently reverting to defaults.)
 
 ### `peers` — the dial plan per PBX
 
 Declaring beats learning because it holds on that peer's **very first** call instead of
-waiting for convergence. And the weight is large: **20.3% of destinations do not resolve to
-a country** without correct prefix stripping, and country is the only behavioural feature
-that survived measurement.
-
-`bare_e164` says the PBX sends plain E.164 with no prefix — common in wholesale. It is an
-explicit field rather than an empty prefix because the semantics are dangerous: with it on,
-`2125551234` is Morocco; with it off, it is a domestic US number.
-
-Dial-plan learning keeps running in parallel, and disagreement becomes an alarm.
+waiting for convergence, and the weight is large: **20.3% of destinations do not resolve to
+a country** without correct prefix stripping. `bare_e164` says the PBX sends plain E.164 with
+no prefix — common in wholesale; it is an explicit field because the semantics are
+dangerous: with it on, `2125551234` is Morocco; with it off, a domestic US number.
 
 ### `signatures` and `injection` — they add, never replace
 
-The seeds are **compiled into the binary** and work with no file at all. What you list is
-**added** to the 18 built-in user-agents and 11 built-in patterns.
+The seeds are compiled into the binary and work with no file. What you list is **added** to
+the 18 built-in user-agents and 11 built-in patterns — replacing would make someone who
+writes three lines silently lose the built-ins. Prefix match by default; `=text` matches
+exactly. TFPS warns when no signature has matched after thousands of messages: a rule that
+never fires is rotten.
 
-Replacing would make someone who writes three lines silently lose the built-ins — exactly
-the failure mode this project condemns. Prefix match by default; `=text` matches exactly
-(the equivalent of `^…$`).
+### `ignoreip` — sources never enforced against
 
-Startup reports how many came from each side, and the system warns when no signature has
-matched after thousands of messages: a signature that never fires is rotten.
+The equivalent of `fail2ban`'s field of the same name. The host's **own addresses are always
+exempt** and need no entry — that is not configuration, it is read from the machine, and it
+exists because a defence that can condemn its own host will eventually do so. Declared
+entries add trusted carriers and management ranges. An exempt source is still evaluated,
+counted and reported; only the block is withheld. Two rules keep it from becoming a policy
+knob: **`0.0.0.0/0` is refused** (use `--no-enforce`, which announces itself), and every
+entry counts its hits, so a stale exemption shows as cold.
 
 ### `apiban_key` — optional integration
 
-The collaborative [APIBAN](https://apiban.org) list, fed by honeypots. It runs on a
-**separate thread** and delivers over a channel: HTTP never touches the packet path.
-
-That is exactly where the 2023 TFPS died — a **synchronous `rest_get()` per INVITE**, with
-no cache and 4 workers: a ceiling of ~26 INVITEs/s, and any apiban.org outage froze the
-decision for every call. Here, if the network drops, the system carries on with the list it
-already has.
+The collaborative [APIBAN](https://apiban.org) list, fed by honeypots, on a **separate
+thread**: HTTP never touches the packet path. That is exactly where the 2023 TFPS died — a
+synchronous `rest_get()` per INVITE, ~26 INVITEs/s, any outage froze every call. Here the
+feed is resumed from its persisted cursor, re-applied for 7 days after a restart (so the
+integration never comes back protecting nothing), and honours `ignoreip`.
 
 ---
 
 ## Building
 
 ```sh
-cargo test                                                   # 81 tests
+cargo test                                                   # ~180 tests
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-The musl target produces a **~4.4 MB static binary** with no glibc dependency — it runs on
-Debian 12, Ubuntu 24.04 and whatever comes next. This solved a real case: the build machine
-had glibc 2.39 and the server 2.36, and glibc is not forward compatible.
+The musl target produces **static binaries with no glibc dependency** — `tfps` ≈ 4.3 MB,
+`tfps_ctl` ≈ 2.3 MB — that run on Debian 12, Ubuntu 24.04 and whatever comes next. This
+solved a real case: the build machine had glibc 2.39 and the server 2.36, and glibc is not
+forward compatible.
 
 SQLite is compiled in, which needs a C compiler that can target musl. If you do not have
 `musl-tools`, [zig](https://ziglang.org) works and needs no root:
@@ -279,23 +264,15 @@ export CC_x86_64_unknown_linux_musl="zig cc -target x86_64-linux-musl"
 export AR_x86_64_unknown_linux_musl="zig ar"
 ```
 
-### The XDP program
-
-Written in C (`ebpf/tfps_xdp.c`) because only the kernel side needs LLVM — keeping it in C
-avoids requiring `bpf-linker` on the development machine. Compile it on the target:
-
-```sh
-bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
-clang -O2 -g -target bpf -c tfps_xdp.c -o /usr/local/lib/tfps/tfps_xdp.o
-```
-
-Requires kernel **≥ 5.15** with BTF. Tested on 6.1.
+The XDP program is written in C (`ebpf/tfps_xdp.c`) because only the kernel side needs LLVM.
+The installer compiles it against the running kernel's BTF; requires kernel **≥ 5.15** with
+BTF.
 
 ---
 
 ## Installing and running
 
-On the target machine, as root, from a checkout with the binaries already built:
+On the target machine, as root, from a checkout with the binaries built:
 
 ```sh
 ./packaging/install.sh
@@ -303,141 +280,51 @@ On the target machine, as root, from a checkout with the binaries already built:
 
 That compiles the XDP program against the running kernel's BTF, installs `tfps` and
 `tfps_ctl`, drops in the systemd unit, writes a starting `/etc/tfps/config.json` **only if
-one is not already there**, and starts the service. Run it again to upgrade — it is
-idempotent and never overwrites your configuration.
-
-Then:
+one is not already there**, and starts the service. Run it again to upgrade — idempotent,
+and it never overwrites your configuration. It needs `clang` and `bpftool` (Debian/Ubuntu:
+`apt install clang linux-tools-common`).
 
 ```sh
 journalctl -u tfps -f      # watch it decide, live
 tfps_ctl status            # what it has learned, what is blocked
 ```
 
-Two things it needs from the machine: `clang` and `bpftool` at install time (Debian/Ubuntu:
-`apt install clang linux-tools-common`), and a kernel ≥ 5.15 with BTF.
-
-### By hand, if you prefer
-
-```sh
-bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
-clang -O2 -g -target bpf -c ebpf/tfps_xdp.c -o /usr/local/lib/tfps/tfps_xdp.o
-install -m755 target/x86_64-unknown-linux-musl/release/{tfps,tfps_ctl} /usr/local/bin/
-install -D -m644 packaging/tfps.service /etc/systemd/system/tfps.service
-systemctl enable --now tfps
-```
-
-**It also runs with no configuration and no arguments at all** — `tfps` on its own uses the
-built-in defaults. The config file is for fitting it to your installation, not for making it
-work.
-
-Capture is `AF_PACKET`/`SOCK_DGRAM`: it hooks at the netdev layer and **does not open a UDP
-socket**, so your softswitch keeps its own bind and never notices. Nothing needs
-reconfiguring.
-
-Needs `CAP_NET_RAW` (capture), plus `CAP_BPF` and `CAP_NET_ADMIN` (XDP).
+**It also runs with no configuration and no arguments** — `tfps` on its own uses the
+built-in defaults. Capture needs `CAP_NET_RAW`; XDP needs `CAP_BPF` and `CAP_NET_ADMIN`
+(and, on some kernels, `CAP_SYS_ADMIN` — verify on your target; the packaged unit explains
+why).
 
 | flag | effect |
 |---|---|
-| `--config PATH` | configuration (default `/etc/tfps/config.json`) |
+| `--behavioural` | turn on fraud detection (default: OFF, noise reduction only) |
 | `--ports 5060,5080` | SIP ports to watch (default `5060`) |
 | `--intl +,00,011,9011` | international dialling prefixes |
-| `--learn-days N` | days observing without blocking fraud (default `30`) |
+| `--ignoreip CIDR` | never enforce against this address/network (repeatable) |
+| `--learn-days N` | days observing before the behavioural layer acts (default `30`) |
 | `--active` | skip the learning period |
-| `--iface eth0` | XDP interface (default: the default-route one) |
-| `--xdp-obj PATH` | BPF object (default `/usr/local/lib/tfps/tfps_xdp.o`) |
-| `--drop-map PATH` | use a drop map already pinned by another product |
-| `--block-ttl N` | seconds a block lasts (default `3600`; `0` = never expires) |
 | `--no-enforce` | observe only, do not touch XDP |
-| `--db PATH` | SQLite database (default `/var/lib/tfps/tfps.db`) |
-| `--no-db` | do not persist — learning dies on restart |
 | `--apiban-key KEY` | enable APIBAN, in the background |
-| `--signatures PATH` | extra signature file, on top of `config.json` |
-| `--stats-every N` | seconds between reports (default `60`) |
-| `-v` | print every international attempt |
-| `--debug-unparsed` | show payloads that failed to parse |
-
-### Sharing the hook with something else
-
-Only **one** XDP program fits per interface. If a drop map is already pinned, point
-`--drop-map` at it and TFPS writes into that map instead of fighting for the hook.
-
-**Mind the blast radius**: the TFPS program drops only SIP ports, so an IP behind CGNAT does
-not lose web and SSH because of a scanner sharing the address. A third-party map may have a
-broader policy, and then the blast radius becomes theirs.
+| `--config PATH` | configuration (default `/etc/tfps/config.json`) |
+| `--db PATH` / `--no-db` | SQLite database, or run without persistence |
+| `-v` / `--debug-unparsed` | verbose; show payloads that failed to parse |
 
 ---
 
-### Addresses that are never blocked
-
-The host's **own addresses are always exempt**, with no configuration. This is not
-paranoia: during development a brute-force test fired from the softswitch host itself and
-TFPS condemned the machine it was defending. The blast radius was small — inbound packets
-carry the attacker's source, not yours — but a defence that can shoot its own host will
-eventually do so at three in the morning.
-
-`"ignoreip": ["10.0.0.0/8", "203.0.113.7"]` adds trusted carriers and management ranges —
-the same name `fail2ban` uses for the same job. Also `--ignoreip CIDR`, repeatable.
-
-Two rules keep it from becoming a policy knob (`SPEC.md` §11): **`0.0.0.0/0` is refused**,
-because one line that disables enforcement without announcing it is the silent failure this
-project exists to prevent — `--no-enforce` does that explicitly and says so in every report;
-and **every entry counts its hits**, so a stale exemption shows up as cold:
-
-```
-    ignoreip: 3 exemption(s) applied, never matched: 203.0.113.0/24
-```
-
-An exempt source is still **judged and reported**, only never enforced:
-
-```
-EXEMPT peer=209.38.75.252 reason=auth-failed detail=rejected ignoreip=<rule>
-```
-
-Silently skipping the evaluation would hide a compromised trusted peer, which is the case
-where an operator most needs to be told. The exemption also applies to the APIBAN feed: a
-third-party list is curated, but it is not yours.
-
 ## Controlling it — `tfps_ctl`
 
-The counterpart to `fail2ban-client`, and it exists for the same reason: a defence nobody
-can inspect is a defence nobody trusts. It also serves a requirement — with no labelled
-data, **how often an operator unbans is the only measure of precision this system has**, so
-that act has to be one command rather than a database session.
+The counterpart to `fail2ban-client`. With no labels, **how often you unban is the only
+precision measure this system has**, so that act is one command.
 
 ```
 tfps_ctl status                       what is running, what is blocked, how fresh the state is
-tfps_ctl stats                        every counter: kernel drops, traffic mix, blocks by reason
+tfps_ctl stats                        every counter: kernel drops, traffic mix, calibration
 tfps_ctl banned [--why]               condemned sources, with time left and the reason
 tfps_ctl unban <ip>... | --all        lift a block — takes effect on the next packet
 tfps_ctl ban <ip> [--ttl N]           condemn by hand (default 3600s, 0 = no expiry)
-tfps_ctl pairs [filters]              search learned (peer, A-number) pairs
-tfps_ctl pair <peer> <a-number>       everything known about one pair
-tfps_ctl peers                        peers, pair counts, and where they call
-tfps_ctl countries <peer>             that peer's destinations by volume
+tfps_ctl sources [--peer --country]   learned sources and the countries they call
+tfps_ctl source <peer>                everything known about one source
+tfps_ctl peers                        sources by country breadth, when last heard
 tfps_ctl log [--limit N] [--ip IP]    the block audit log, newest first
-tfps_ctl forget <peer> [--a NUMBER]   erase learned state (requires tfps stopped)
-```
-
-Filters for `pairs`: `--peer IP`, `--a TEXT` (substring of the A-number), `--country ISO`,
-`--limit N`.
-
-```console
-# tfps_ctl status
-database          : /var/lib/tfps/tfps.db
-learned state     : 293 pairs across 8 peers
-last checkpoint   : 35s ago (state is a snapshot, not live)
-enforcement       : own map id 7478
-blocked now       : 3 (0 without expiry)
-
-# tfps_ctl banned --why
-SOURCE           EXPIRES IN  REASON
-51.75.106.116           49m  user-agent (pplsip)
-162.217.103.70          51m  user-agent (friendly)
-
-# tfps_ctl peers
-PEER               PAIRS      LAST  TOP COUNTRIES
-149.50.107.48         60        1m  NANP:174 SS:58
-149.50.107.47         59        1m  GB:171
 ```
 
 ```console
@@ -447,129 +334,88 @@ KERNEL  (live)
   dropped by XDP    : 9042 (42.1% — gone before sngrep)
   condemned now     : 2140 (2140 permanent, e.g. the APIBAN feed)
 
+CALIBRATION  (benign hypotheses learned from this deployment)
+  theta0                 0.083
+  theta0c                0.310
+  prior_mean             1.90
+
 TRAFFIC  (as of the last checkpoint, 2m ago)
   packets              1879   sip                   768
-  keepalive            1110   not_sip                 1
   ...
-
-BLOCKS BY REASON
-  last day               48  user-agent:47 auth-failed:1
 ```
 
-**Two sources of truth, and the tool never blurs them.** Blocks live in the kernel map and
-are read and written directly, so an unban applies immediately. Learned state lives in
-SQLite and is written at checkpoint, so `status` reports **how old that snapshot is**
-instead of letting anyone draw conclusions from stale rows.
+**Two sources of truth, never blurred.** Blocks live in the kernel map and are read and
+written directly, so an unban applies immediately. Learned state lives in SQLite and is
+written at checkpoint, so `status` reports **how old that snapshot is** rather than passing
+stale rows off as current. Reading blocks needs `CAP_BPF` (run as root); reading learned
+state needs only the database file.
 
-Three deliberate refusals:
-
-- Unbanning an address that was not blocked says exactly that, rather than reporting
-  success — otherwise an operator who mistypes stops looking for the real block.
-- If two loaded eBPF maps share the name, it names the ambiguity instead of picking one:
-  guessing would edit somebody else's enforcement plane.
-- `forget` refuses while the daemon is running, because the in-memory working set would be
-  written straight back at the next checkpoint and quietly undo it.
-
-Reading blocks needs `CAP_BPF` (run as root); reading learned state only needs the
-database file.
+---
 
 ## Reading the report
 
 ```
---- mode=LEARNING (29d 23h left) packets=330 sip=98 responses=0 keepalive=232
-    not_sip=0 noise=12 (12%) injection=0 auth_att=142 auth_fail=5 auth_ok=97
-    auth_chal=104 auth_volume=0 invites=62
-    intl=62 unknown_country=20 first_time=21 blocks=0 would_block=0
-    peers=3 pairs=14 ports={5060: 330}
+--- mode=NOISE REDUCTION packets=330 sip=98 responses=0 keepalive=232 not_sip=0
+    noise=12 (12%) injection=0 auth_att=142 auth_fail=5 auth_ok=97 auth_chal=104
+    auth_volume=0 intl_ok=0 intl_fail=0 invites=62 intl=62 unknown_country=20
+    first_time=21 blocks=0 would_block=0 sources=3 ports={5060: 330}
     XDP: dropped=1840 seen=2100 expired=3 in_map=7 blocked_by_us=7
 ```
 
 | field | meaning |
 |---|---|
-| `mode` | learning (does not block fraud) or active |
-| `keepalive` | NAT CRLF pings (RFC 5626) — on a residential 5060 these are most packets |
+| `mode` | NOISE REDUCTION, or FRAUD DETECTION (LEARNING / ACTIVE) |
+| `keepalive` | NAT CRLF pings (RFC 5626) — on a residential 5060, most packets |
 | `not_sip` | unclassified. **Should be ~0**; high means something is not understood |
-| `noise (%)` | how much the perimeter removed — the number that measures a clean sngrep |
-| `unknown_country` | international by shape, no recognisable country: a symptom of a wrong dial plan, and in practice it also catches prefix-padding evasion |
-| `first_time` | country debuts; the measured reference is 0.85% of calls |
-| `auth_att` | requests that carried a credential |
-| `auth_fail` | credentials **rejected** — the brute-force signal |
-| `auth_ok` | credentials accepted |
-| `auth_chal` | digest challenges (`401`/`407`) seen. **Zero here with a non-zero `auth_att` means the softswitch is not answering**, so only the backstop can fire — and TFPS warns about it |
+| `noise (%)` | how much the perimeter removed — the number behind a clean sngrep |
+| `auth_fail` / `auth_ok` / `auth_chal` | rejected credentials, accepted, challenges seen |
 | `auth_volume` | sources condemned by the volume backstop |
-| `would_block` | would have blocked if it were not still learning |
-| `blocked_by_us` | sources **this** process condemned |
+| `intl_ok` / `intl_fail` | international calls observed to complete / fail (the completion arm's fuel) |
+| `unknown_country` | international by shape, no recognisable country — prefix padding |
+| `first_time` | first-time-country events; feeds the learned benign rate |
+| `blocks` / `would_block` | behavioural verdicts (active / during learning) |
+| `sources` | distinct source IPs under watch |
+| `XDP: …` | what the kernel side actually did; `blocked_by_us` is what **this** process condemned |
 
-### Silence is an alarm, not normality
-
-This project's argument against `fail2ban` is that **the incumbent fails silently** — the
-Asterisk security channel ships disabled, PJSIP does not log below 5 requests in 5 s, and no
-version of fail2ban has ever warned about a filter matching zero lines.
-
-Repeating that would forfeit the difference. So TFPS complains when it:
-
-- stops seeing traffic on the watched ports;
-- sees SIP over paths it does not analyse (IPv6, TCP);
-- cannot load or attach XDP — and says it **will not block anything**;
-- cannot persist — and says learning will die on restart;
-- has matched no user-agent signature after thousands of messages.
+Silence is an alarm, not normality: TFPS complains when it stops seeing traffic, when there
+is SIP on IPv6/TCP it cannot inspect, when no signature has matched in thousands of messages,
+and when credentials are presented with no challenge ever seen.
 
 ---
 
 ## Persistence
 
-A single SQLite file. No server, no daemon, no credentials, no port.
-
-```sh
-sqlite3 /var/lib/tfps/tfps.db "select * from block_log order by ts desc limit 20"
-```
-
-It stores the per-pair country bitmap, per-peer country frequencies, the block log, and —
-most importantly — **when learning started**. Without that, every restart would reset the 30
-days and the countdown would promise something a `systemctl restart` erases.
-
-It is **durable storage, not the hot path**: the working set lives in memory, loaded at boot
-and checkpointed every 5 minutes. Querying SQL per INVITE would be the bottleneck.
-
----
-
-## Memory ceilings
-
-Rotating the A-number is expected attacker behaviour. Without a ceiling the system would
-answer that by allocating until it dies — a denial-of-service vector described in its own
-specification.
-
-Ceilings of **50,000 pairs per peer** and **10,000 peers**. When full, the system prunes
-pairs not seen in the last hour: the signature of rotation is appearing once and never
-again, so the ephemeral ones go and the ones that come back stay.
+**SQLite. One file. No server, no daemon, no credential, no port.** The working set lives in
+memory; only the boot load and the periodic checkpoint touch disk. State splits by
+durability: **perimeter** state dies with the process and rebuilds from traffic in minutes
+(consistent with fail-open by not pinning the eBPF program); **behavioural** state and the
+APIBAN list survive on disk, the latter because it is consumed through a forward-only cursor
+and cannot rebuild itself.
 
 ---
 
 ## What it does not do
 
-**It never blocks because it failed to canonicalise.** That was `R07` in the 2014 TFPS,
-which denied everything it could not classify and became 39% of all rejections — the
-system's largest source of blocking was ignorance, not detection. Internal extensions,
-service codes and SIP URIs are not this system's business and pass through.
+Documented, not engineered away — a limitation stated plainly beats one that fails quietly.
 
-**It cannot see SIP over TLS.** Cryptographic blindness, no workaround. IP-reputation
-enforcement still works, because metadata stays visible.
-
-**It does not see IPv6 or SIP over TCP** — but it warns when they show up.
-
-**It does not cover customers with a broad international profile.** Against someone already
-calling dozens of countries daily, novelty saturates by construction and no behavioural
-signal fires.
-
-**No promises to anyone who downloads it.**
+| not handled | why |
+|---|---|
+| **SIP over TLS** | encrypted payload; only metadata and IP reputation remain |
+| **SIP over TCP** | L7 reassembly is not implemented; counted as a blind spot, not parsed |
+| **IPv6** | the capture takes `ETH_P_IP` only; counted and warned about |
+| **a broad international profile** | anomaly saturates by construction — a peer already calling 200 countries has no burst left |
+| **the first 30 days** | the behavioural layer's learning window, by design and announced |
+| **a low-and-slow mimic** | the residual gap no on-wire method closes — hence opt-in, TTL'd, unbannable |
+| **enforcing the behavioural verdict** | detected and reported today; the forged `603` is the remaining piece |
 
 ---
 
 ## Documentation
 
-- [`SPEC.md`](SPEC.md) — the architecture and the decisions, with the reasoning behind each
-- [`DETECTION.md`](DETECTION.md) — how a packet is examined: every test, in the order the code applies them
-- `tfps_ctl --help` — the control tool, above
+- [`docs/anomaly-detection.md`](docs/anomaly-detection.md) — the behavioural detector: the
+  research, why the constraints rule out most methods, and the four-arm design
+- [`DETECTION.md`](DETECTION.md) — how a packet is examined, test by test, in code order
+- [`SPEC.md`](SPEC.md) — the architecture and the decisions (§6 superseded by the doc above)
 - [`CONTEXT.md`](CONTEXT.md) — the vocabulary, normative for code and documentation
 
 ## License

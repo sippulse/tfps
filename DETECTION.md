@@ -409,7 +409,17 @@ international calls escaping the system entirely.
 
 ---
 
-## 9. Stage 10 — novelty: has this caller ever called this country?
+## 9. Stage 10 — behavioural detection `[superseded]`
+
+> **This stage has been replaced.** The rotating-bitmap novelty engine described below has
+> been retired in favour of the four-arm sequential detector in
+> [`docs/anomaly-detection.md`](docs/anomaly-detection.md): country-scan, prefix-scan and
+> completion (Threshold Random Walk) plus a Gamma-Poisson volume arm, keyed on the source IP,
+> fused in bits and tuned by (α, β). The description below is kept for the record of what the
+> earlier decision path did; stages 1–9 above (capture, parse, perimeter, dial plan, country)
+> are current.
+
+### (historical) novelty: has this caller ever called this country?
 
 `crates/tfps-core/src/novelty.rs`. There is no statistical model here — no z-score, no
 Isolation Forest, no negative binomial. The signal is set membership.
