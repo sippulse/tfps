@@ -477,7 +477,7 @@ Documented, not engineered away — a limitation stated plainly beats one that f
 | not handled | why |
 |---|---|
 | **SIP over TLS** | encrypted payload; only metadata and IP reputation remain |
-| **SIP over TCP** | L7 reassembly is not implemented; counted as a blind spot, not parsed |
+| **SIP over TCP — detection** | L7 reassembly is not implemented; content is not parsed. But **enforcement covers TCP**: a source condemned (perimeter or APIBAN) is dropped in XDP on the TCP SIP ports too, TLS/5061 included — so bad IPs are banned on TCP even though new attacks over TCP/TLS are not *detected* on the wire |
 | **IPv6** | the capture takes `ETH_P_IP` only; counted and warned about |
 | **a broad international profile** | anomaly saturates by construction — a peer already calling 200 countries has no burst left |
 | **the first 30 days** | the behavioural layer's learning window, by design and announced |

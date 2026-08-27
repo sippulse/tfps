@@ -22,6 +22,7 @@
 
 #define ETH_P_IP 0x0800
 #define IPPROTO_UDP_ 17
+#define IPPROTO_TCP_ 6
 
 // Ceiling on simultaneously blocked sources. `LRU_HASH` evicts the least recently used
 // entry when it fills up, which gives a hard memory bound — the program never grows
@@ -92,20 +93,33 @@ int tfps_filter(struct xdp_md *ctx)
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
         return XDP_PASS;
-    if (ip->protocol != IPPROTO_UDP_)
-        return XDP_PASS;
 
     // IHL comes in 32-bit words and is controlled by the sender; the verifier demands the
     // bound be checked after computing it.
     __u32 ihl = ip->ihl * 4;
     if (ihl < sizeof(struct iphdr))
         return XDP_PASS;
-    if ((void *)ip + ihl + sizeof(struct udphdr) > data_end)
-        return XDP_PASS;
 
-    struct udphdr *udp = (void *)ip + ihl;
-    __u16 dport = bpf_ntohs(udp->dest);
-    __u16 sport = bpf_ntohs(udp->source);
+    // Ports for UDP and TCP alike. The first two bytes of both headers are the source port
+    // and the next two the destination, so one read serves both — but each needs its own
+    // length check first. Enforcement covers TCP so a blocked source is dropped on the
+    // TLS/TCP SIP port (e.g. 5061), not only on UDP 5060; the content is never parsed here.
+    __u16 sport, dport;
+    if (ip->protocol == IPPROTO_UDP_) {
+        if ((void *)ip + ihl + sizeof(struct udphdr) > data_end)
+            return XDP_PASS;
+        struct udphdr *udp = (void *)ip + ihl;
+        sport = bpf_ntohs(udp->source);
+        dport = bpf_ntohs(udp->dest);
+    } else if (ip->protocol == IPPROTO_TCP_) {
+        if ((void *)ip + ihl + sizeof(struct tcphdr) > data_end)
+            return XDP_PASS;
+        struct tcphdr *tcp = (void *)ip + ihl;
+        sport = bpf_ntohs(tcp->source);
+        dport = bpf_ntohs(tcp->dest);
+    } else {
+        return XDP_PASS;
+    }
     if (!is_sip_port(dport) && !is_sip_port(sport))
         return XDP_PASS;
 
