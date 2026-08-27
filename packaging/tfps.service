@@ -11,7 +11,10 @@ ExecStart=/usr/local/bin/tfps
 Restart=always
 RestartSec=5
 
-# AF_PACKET capture requires CAP_NET_RAW; XDP needs the BPF/ADMIN ones.
+# AF_PACKET capture requires CAP_NET_RAW; XDP needs CAP_BPF + CAP_NET_ADMIN.
+# CAP_SYS_ADMIN is also required here: on this kernel (6.1, unprivileged BPF
+# disabled) BPF_PROG_LOAD returns EPERM without it. Verified by removing it —
+# enforcement went INACTIVE. Drop it only after testing on the target kernel.
 AmbientCapabilities=CAP_NET_RAW CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
 CapabilityBoundingSet=CAP_NET_RAW CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
 NoNewPrivileges=yes
