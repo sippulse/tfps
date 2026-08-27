@@ -16,6 +16,7 @@
 //!   "signatures": ["MyLocalScanner", "=sipsak"],
 //!   "injection": ["xp_cmdshell"],
 //!   "ignoreip": ["10.0.0.0/8", "203.0.113.7"],
+//!   "behavioural": false,
 //!   "apiban_key": "...",
 //!   "learn_days": 30,
 //!   "block_ttl": 3600
@@ -75,6 +76,11 @@ pub struct Config {
     /// which is what keeps it inside `SPEC.md` §11.
     #[serde(default, alias = "ignore")]
     pub ignoreip: Vec<String>,
+    /// Turn on behavioural fraud detection (country novelty and the rest). **Off by
+    /// default**: the product is noise reduction, and the behavioural layer is an opt-in
+    /// extra most installs will not need.
+    #[serde(default)]
+    pub behavioural: bool,
     pub apiban_key: Option<String>,
     pub learn_days: Option<u32>,
     pub block_ttl: Option<u64>,

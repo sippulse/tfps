@@ -659,7 +659,7 @@ mod tests {
         let peer = Ipv4Addr::new(10, 0, 0, 5);
         let t = Timestamp(1_800_000_000);
 
-        let mut e1 = Engine::new(DialPlan::new(["00"]), Mode::Active);
+        let mut e1 = Engine::new(DialPlan::new(["00"]), Mode::Active).with_behavioural();
         e1.observe(peer, &invite("200", "00551199998888"), t);
         e1.observe(peer, &invite("200", "00351912345678"), t);
 
@@ -669,7 +669,7 @@ mod tests {
         assert!(c >= 2, "two countries");
 
         // A fresh process, memory wiped.
-        let mut e2 = Engine::new(DialPlan::new(["00"]), Mode::Active);
+        let mut e2 = Engine::new(DialPlan::new(["00"]), Mode::Active).with_behavioural();
         let s2 = Store::open(&path).unwrap();
         s2.load_into(&mut e2).unwrap();
 

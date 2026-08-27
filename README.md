@@ -1,11 +1,13 @@
 # TFPS
 
-**Telephony Fraud Prevention System** — IRSF fraud prevention for SIP networks.
+**Telephony Fraud Prevention System** for SIP networks. One static binary, no cloud, no
+policy configuration.
 
-Watches traffic on the wire, learns what normal looks like for each source, and drops the
-garbage in the kernel before it ever reaches your `sngrep`.
-
-No policy configuration. No cloud. No fraud list. One static binary.
+**Two things, and the first is the product.** By default TFPS is a **noise filter**: it
+drops SIP scanning, brute-force and known-bad sources in the kernel, before they reach your
+`sngrep` — and that alone is worth running. **Fraud detection** — behavioural IRSF
+detection by anomaly — is an **opt-in extra** (`--behavioural`), off by default. Most
+installs will only ever want the noise filter, and they should not pay for anything more.
 
 ---
 
@@ -32,6 +34,19 @@ It is not hermetic — one packet slipped through in a 90 s test. What the data 
 drastic reduction, not perfect blocking.
 
 ---
+
+## Turning on fraud detection
+
+Everything above is the default. Behavioural fraud detection — learning each source's
+normal destinations and flagging anomalies — is **off unless you ask for it**:
+
+```sh
+tfps --behavioural            # or "behavioural": true in the config
+```
+
+It adds a learning period, per-source state, and the SQLite persistence that carries it.
+None of that runs in the default noise-reduction mode. It is genuinely useful, and
+genuinely optional.
 
 ## Status — v0.1.0
 

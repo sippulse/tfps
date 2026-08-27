@@ -279,20 +279,41 @@ pub struct Engine {
     total_pairs: usize,
     default_plan: DialPlan,
     mode: Mode,
+    /// Whether behavioural fraud detection runs at all.
+    ///
+    /// **Off by default.** The product is noise reduction — the perimeter and its clean
+    /// sngrep — and that stands on its own. Behavioural detection (country novelty and the
+    /// rest) is an opt-in extra: worth having, but most installs will never turn it on, and
+    /// forcing its state, its learning window and its per-peer memory on everyone would be
+    /// exactly the over-engineering this product is meant to avoid. When off, INVITEs are
+    /// still seen and the perimeter still enforces; the fraud path simply does not run.
+    behavioural: bool,
     pub noise_filter: NoiseFilter,
     pub stats: Stats,
 }
 
 impl Engine {
+    /// A perimeter-only engine: noise reduction, no behavioural detection. The default.
     pub fn new(default_plan: DialPlan, mode: Mode) -> Self {
         Self {
             peers: HashMap::new(),
             total_pairs: 0,
             default_plan,
             mode,
+            behavioural: false,
             noise_filter: NoiseFilter::new(),
             stats: Stats::default(),
         }
+    }
+
+    /// Turns behavioural fraud detection on. Opt-in, per the product's shape.
+    pub fn with_behavioural(mut self) -> Self {
+        self.behavioural = true;
+        self
+    }
+
+    pub fn behavioural_enabled(&self) -> bool {
+        self.behavioural
     }
 
     /// Declares a peer's dial plan. See `SPEC.md` §4: declaring beats learning because it
@@ -541,6 +562,13 @@ impl Engine {
         }
         self.stats.invites += 1;
 
+        // The perimeter has run and may have condemned the source. Behavioural detection is
+        // opt-in; with it off, the INVITE is simply out of scope — the product is a noise
+        // filter and nothing here pretends otherwise.
+        if !self.behavioural {
+            return Decision::OutOfScope("behavioural detection off");
+        }
+
         let Some(dialed) = req.request_user else {
             return Decision::OutOfScope("INVITE with no dialled number");
         };
@@ -724,7 +752,31 @@ mod tests {
     }
 
     fn engine() -> Engine {
-        Engine::new(DialPlan::new(["+", "00", "011", "9011"]), Mode::Active)
+        // The tests here exercise the behavioural path, so they opt into it. The default
+        // engine is perimeter-only — covered by `perimeter_runs_with_behavioural_off`.
+        Engine::new(DialPlan::new(["+", "00", "011", "9011"]), Mode::Active).with_behavioural()
+    }
+
+    #[test]
+    fn perimeter_runs_with_behavioural_off_but_fraud_does_not() {
+        // The default product: noise is still condemned, an international INVITE is not
+        // judged for fraud.
+        let mut e = Engine::new(DialPlan::new(["+", "00"]), Mode::Active);
+        assert!(!e.behavioural_enabled());
+        // A scanner is still caught by the perimeter.
+        let scan = b"OPTIONS sip:x@pbx SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z\r\n\
+                     From: <sip:x@pbx>;tag=t\r\nCall-ID: c\r\nCSeq: 1 OPTIONS\r\n\
+                     User-Agent: friendly-scanner\r\n\r\n";
+        assert!(matches!(
+            e.observe(peer(), scan, t(0)),
+            Decision::Noise { .. }
+        ));
+        // But an international INVITE is out of scope, and no pair state is created.
+        assert!(matches!(
+            e.observe(peer(), &invite("1001", "00442039967796"), t(1)),
+            Decision::OutOfScope("behavioural detection off")
+        ));
+        assert_eq!(e.pair_count(), 0, "no behavioural state when it is off");
     }
 
     fn t(s: u32) -> Timestamp {
@@ -796,7 +848,8 @@ mod tests {
 
     #[test]
     fn learning_mode_does_not_block_but_records() {
-        let mut e = Engine::new(DialPlan::new(["00"]), Mode::Learning { until: t(100_000) });
+        let mut e = Engine::new(DialPlan::new(["00"]), Mode::Learning { until: t(100_000) })
+            .with_behavioural();
         let destinations = [
             "00252612345678",
             "00371234567",
@@ -990,7 +1043,7 @@ mod tests {
 
     #[test]
     fn a_peer_declared_plan_beats_the_default() {
-        let mut e = Engine::new(DialPlan::new(["00"]), Mode::Active);
+        let mut e = Engine::new(DialPlan::new(["00"]), Mode::Active).with_behavioural();
         let other = Ipv4Addr::new(10, 0, 0, 9);
         e.declare_dial_plan(other, DialPlan::new(["9011"]));
 

@@ -47,6 +47,7 @@ struct Args {
     ports: Vec<u16>,
     intl_prefixes: Vec<String>,
     learn_secs: u32,
+    behavioural: bool,
     stats_every: u64,
     verbose: bool,
     debug_unparsed: bool,
@@ -75,6 +76,7 @@ impl Default for Args {
             // Covers the common shapes; `SPEC.md` §4 says to declare it per PBX.
             intl_prefixes: vec!["+".into(), "00".into(), "011".into(), "9011".into()],
             learn_secs: 30 * 24 * 3600,
+            behavioural: false,
             stats_every: 60,
             verbose: false,
             debug_unparsed: false,
@@ -163,6 +165,7 @@ fn parse_args() -> Result<Args, String> {
                 a.learn_secs = d * 24 * 3600;
             }
             "--active" => a.learn_secs = 0,
+            "--behavioural" | "--fraud" => a.behavioural = true,
             "--stats-every" => {
                 a.stats_every = next("--stats-every")?.parse().map_err(|e| format!("{e}"))?;
             }
@@ -230,6 +233,9 @@ fn apply_config(a: &mut Args, c: &config::Config) {
     if !a.given.contains("--learn-days") && !a.given.contains("--active") {
         if let Some(d) = c.learn_days {
             a.learn_secs = d.saturating_mul(24 * 3600);
+        }
+        if c.behavioural {
+            a.behavioural = true;
         }
     }
 
@@ -321,6 +327,9 @@ fn main() -> ExitCode {
 
     let plan = DialPlan::new(args.intl_prefixes.clone());
     let mut engine = Engine::new(plan, mode);
+    if args.behavioural {
+        engine = engine.with_behavioural();
+    }
 
     // Signatures **add** to the built-in ones; they never replace. Replacing would make
     // someone who writes three lines silently lose the 18 shipped ones.
@@ -364,28 +373,34 @@ fn main() -> ExitCode {
     let (ua_int, ua_ext) = engine.noise_filter.signature_count();
     let (inj_int, inj_ext) = engine.noise_filter.injection_count();
 
-    if let Some(d) = db.as_ref() {
-        match d.load_into(&mut engine) {
-            Ok((p, c)) if p > 0 || c > 0 => {
-                say!("  state restored    : {p} pairs, {c} peer-country rows");
+    if engine.behavioural_enabled() {
+        if let Some(d) = db.as_ref() {
+            match d.load_into(&mut engine) {
+                Ok((p, c)) if p > 0 || c > 0 => {
+                    say!("  state restored    : {p} pairs, {c} peer-country rows");
+                }
+                Ok(_) => say!("  state restored    : empty database (first run)"),
+                Err(e) => eprintln!("WARNING: could not restore state: {e}"),
             }
-            Ok(_) => say!("  state restored    : empty database (first run)"),
-            Err(e) => eprintln!("WARNING: could not restore state: {e}"),
         }
     }
 
     say!("tfps {} — starting", env!("CARGO_PKG_VERSION"));
     say!("  watched ports     : {:?}", args.ports);
     say!("  intl prefixes     : {:?}", args.intl_prefixes);
-    match mode {
-        // The mode is announced loudly and repeated in reports: this project's stated
-        // difference from fail2ban is that the incumbent fails silently (`SPEC.md` §12).
-        Mode::Active => say!("  mode              : ACTIVE — would block right away"),
-        Mode::Learning { until } => say!(
-            "  mode              : LEARNING for {} days (until {}), does NOT block",
-            args.learn_secs / 86400,
-            until.0
-        ),
+    if !engine.behavioural_enabled() {
+        say!("  mode              : NOISE REDUCTION (perimeter only; --behavioural adds fraud detection)");
+    } else {
+        match mode {
+            // The mode is announced loudly and repeated: this project's difference from
+            // fail2ban is that the incumbent fails silently (`SPEC.md` §12).
+            Mode::Active => say!("  mode              : FRAUD DETECTION, ACTIVE — would block right away"),
+            Mode::Learning { until } => say!(
+                "  mode              : FRAUD DETECTION, LEARNING for {} days (until {}), does NOT block",
+                args.learn_secs / 86400,
+                until.0
+            ),
+        }
     }
     // Enforcement: load XDP, or say so loudly and carry on observing. Never pretend.
     let mut enforcer = if args.no_enforce {
@@ -694,17 +709,17 @@ fn main() -> ExitCode {
                         .collect::<Vec<_>>()
                         .join(" "),
                 );
-                match s.checkpoint(&engine) {
-                    Ok((p, _)) => {
-                        // A 90-day audit window — more than twice the bitmap ageing
-                        // window, and enough to investigate.
-                        s.prune_log(t.0.saturating_sub(90 * 24 * 3600));
-                        s.apiban_prune(t.0.saturating_sub(APIBAN_RETENTION_SECS));
-                        if args.verbose {
-                            say!("    checkpoint: {p} pairs written");
-                        }
+                // A 90-day audit window for the block log, and the APIBAN retention prune;
+                // both apply whether or not behavioural detection is on.
+                s.prune_log(t.0.saturating_sub(90 * 24 * 3600));
+                s.apiban_prune(t.0.saturating_sub(APIBAN_RETENTION_SECS));
+                // Only the behavioural layer has learned state worth persisting.
+                if engine.behavioural_enabled() {
+                    match s.checkpoint(&engine) {
+                        Ok((p, _)) if args.verbose => say!("    checkpoint: {p} pairs written"),
+                        Ok(_) => {}
+                        Err(e) => eprintln!("ALARM: checkpoint failed — {e}"),
                     }
-                    Err(e) => eprintln!("ALARM: checkpoint failed — {e}"),
                 }
             }
         }
