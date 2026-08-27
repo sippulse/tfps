@@ -20,7 +20,8 @@ use crate::country::{self, Country};
 use crate::dialplan::DialPlan;
 use crate::novelty::Timestamp;
 use crate::perimeter::{
-    AuthAttempts, AuthFailures, NoiseFilter, AUTH_FAILURE_WINDOW_SECS, AUTH_WINDOW_SECS,
+    AuthAttempts, AuthFailures, NoiseFilter, SlidingCount, AUTH_FAILURE_WINDOW_SECS,
+    AUTH_WINDOW_SECS,
 };
 use crate::sip::{self, Message, Method};
 
@@ -75,6 +76,10 @@ pub enum Decision {
     /// scanning tool can forge a legitimate UA, but no real phone puts a single quote or
     /// `--` in the `From` header.
     Injection { pattern: &'static str },
+    /// Registration scanning: many REGISTER attempts, none succeeding — enumerating
+    /// extensions or probing without ever logging in. Caught even with no credential
+    /// presented, which the auth-failure rule cannot see.
+    RegScan { attempts: u32 },
     /// Too many **rejected** credentials in the window — a password being guessed.
     ///
     /// This is the on-the-wire equivalent of what `fail2ban` reads out of a log file, and
@@ -113,6 +118,8 @@ pub struct Stats {
     pub injections: u64,
     /// Sources condemned by a known scanner identity (Censys, Shodan, friendly-scanner…).
     pub scanners: u64,
+    /// Sources condemned for registration scanning (REGISTERs that never succeed).
+    pub reg_scans: u64,
     /// Sources condemned by the volume backstop.
     pub auth_abuse: u64,
     /// Authenticated attempts observed — a credential was presented.
@@ -154,6 +161,16 @@ pub struct Stats {
 /// observation point — so this ceiling is far looser than the pair one.
 const MAX_PEERS: usize = 10_000;
 
+/// REGISTER attempts from one source, with **no successful registration**, that mark it a
+/// registration scanner — enumerating extensions or brute-forcing without ever logging in.
+/// The "no success" gate is what spares a NAT or gateway behind one IP: a legitimate source
+/// registers at least one extension, an enumerator registers none. Catches the no-credential
+/// probe the auth-failure rule (which needs a credential) misses.
+pub const REG_SCAN_ATTEMPTS: usize = 6;
+
+/// Window for the registration-scan counter.
+pub const REG_SCAN_WINDOW_SECS: u32 = 600;
+
 /// Ceiling on remembered known-good peers, to bound memory.
 const MAX_KNOWN_PEERS: usize = 50_000;
 
@@ -187,6 +204,11 @@ struct PeerState {
     /// International INVITEs still waiting for a final response, so the completion arm can
     /// be fed when one arrives.
     pending_intl: PendingAuth,
+    /// REGISTER attempts in the window — the registration-scan counter.
+    reg_attempts: SlidingCount<REG_SCAN_ATTEMPTS>,
+    /// When this source last completed a registration (a `2xx` to a REGISTER). A source with
+    /// a recent success is not an enumerator.
+    last_reg_success: u32,
 }
 
 /// How many authenticated transactions per peer can be awaiting a response.
@@ -524,6 +546,15 @@ impl Engine {
             return Decision::OutOfScope("SIP response");
         };
 
+        // A successful registration (any 2xx to a REGISTER) clears the enumerator
+        // suspicion: a source that logs in even once is not scanning.
+        if r.is_success()
+            && r.cseq
+                .is_some_and(|c| c.to_ascii_uppercase().contains("REGISTER"))
+        {
+            st.last_reg_success = now.0;
+        }
+
         // Authentication path: a response to a REGISTER we recorded as an authenticated
         // attempt. This is where a rejected credential is counted.
         if st.pending.claim(&key) {
@@ -628,20 +659,35 @@ impl Engine {
         // password is stolen and `INVITE` is where it is spent, and both are challenged the
         // same way. What is recorded here is only the *attempt*; whether it was rejected is
         // decided when the response arrives, in `observe_response`.
-        if req.is_authenticated_attempt() {
-            self.stats.auth_attempts += 1;
-            if self.peers.len() < MAX_PEERS || self.peers.contains_key(&peer) {
-                let plan = self.default_plan.clone();
-                let params = self.params.clone();
-                let st = self.peers.entry(peer).or_insert_with(|| PeerState {
-                    dial_plan: plan,
-                    anomaly: SourceAnomaly::new(&params),
-                    ..Default::default()
-                });
+        if req.method == Method::Register
+            && (self.peers.len() < MAX_PEERS || self.peers.contains_key(&peer))
+        {
+            let plan = self.default_plan.clone();
+            let params = self.params.clone();
+            let credentialed = req.is_authenticated_attempt();
+            let st = self.peers.entry(peer).or_insert_with(|| PeerState {
+                dial_plan: plan,
+                anomaly: SourceAnomaly::new(&params),
+                ..Default::default()
+            });
+
+            // Registration scanning: count every REGISTER, block once the source has made
+            // too many with no registration succeeding in the window. A source that logged
+            // in even once is not an enumerator.
+            let (rn, reg_exceeded) = st.reg_attempts.record(now.0, REG_SCAN_WINDOW_SECS);
+            let succeeded_recently = st.last_reg_success != 0
+                && now.0.saturating_sub(st.last_reg_success) < REG_SCAN_WINDOW_SECS;
+            if reg_exceeded && !succeeded_recently {
+                self.stats.reg_scans += 1;
+                return Decision::RegScan { attempts: rn };
+            }
+
+            if credentialed {
+                self.stats.auth_attempts += 1;
                 if let Some(key) = sip::transaction_key(req.via_branch(), req.call_id, req.cseq) {
                     st.pending.remember(key, now.0);
                 }
-                // The volume backstop, for the deployments where no response is ever seen.
+                // The volume backstop, for deployments where no response is ever seen.
                 let (n, exceeded) = st.auth_attempts.record(now.0, AUTH_WINDOW_SECS);
                 if exceeded {
                     self.stats.auth_abuse += 1;
@@ -1081,6 +1127,61 @@ mod tests {
         ));
     }
     #[test]
+    fn registration_scanning_across_extensions_is_caught() {
+        // The user's case: an IP probes ext A four times (401), then ext B four times, never
+        // authenticating. Eight REGISTERs, no success -> registration scan.
+        let mut e = engine();
+        let mut fired = false;
+        for i in 0..8u32 {
+            let ext = if i < 4 { "1001" } else { "1002" };
+            // no-credential REGISTER probes (the enumeration the auth rule misses)
+            let reg = format!(
+                "REGISTER sip:pbx SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z{i}\r\n\
+                 From: <sip:{ext}@pbx>;tag=t\r\nTo: <sip:{ext}@pbx>\r\n\
+                 Call-ID: c{i}\r\nCSeq: {i} REGISTER\r\n\r\n"
+            );
+            if matches!(
+                e.observe(peer(), reg.as_bytes(), t(i * 10)),
+                Decision::RegScan { .. }
+            ) {
+                fired = true;
+            }
+        }
+        assert!(
+            fired,
+            "an IP probing extensions without ever registering must be caught"
+        );
+        assert!(e.stats.reg_scans >= 1);
+    }
+
+    #[test]
+    fn a_source_that_registers_successfully_is_not_a_reg_scanner() {
+        // A NAT/gateway behind one IP: many REGISTERs, but at least one succeeds. Never
+        // flagged, however many attempts.
+        let mut e = engine();
+        // one successful registration from this IP
+        e.observe_packet(peer(), switch(), &register(1, true), t(0));
+        e.observe_packet(switch(), peer(), &response(1, 200), t(1));
+        // then plenty more REGISTER attempts (e.g., other phones behind the NAT)
+        let mut ever = false;
+        for i in 2..20u32 {
+            let reg = format!(
+                "REGISTER sip:pbx SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z{i}\r\n\
+                 From: <sip:{i}@pbx>;tag=t\r\nTo: <sip:{i}@pbx>\r\n\
+                 Call-ID: c{i}\r\nCSeq: {i} REGISTER\r\n\r\n"
+            );
+            ever |= matches!(
+                e.observe(peer(), reg.as_bytes(), t(i * 5)),
+                Decision::RegScan { .. }
+            );
+        }
+        assert!(
+            !ever,
+            "a source with a successful registration is not an enumerator"
+        );
+    }
+
+    #[test]
     fn the_challenge_every_customer_receives_never_counts() {
         // The failure mode that would take a whole network offline: a `401` answering a
         // `REGISTER` that carried no credential is the *normal* digest handshake. Fifty of
@@ -1191,23 +1292,20 @@ mod tests {
     }
 
     #[test]
-    fn the_volume_backstop_still_fires_when_nothing_ever_answers() {
-        // The measured case on the reference server: opensips drops the junk before
-        // authenticating it, so no `401` is ever emitted and the failure rule has no
-        // evidence to work with. Something must still stop a credential-stuffing run.
+    fn a_register_flood_with_no_success_is_stopped() {
+        // Authenticated REGISTERs from one source that never complete — whether the
+        // softswitch answers 401 or (as on the reference server) drops them silently. The
+        // registration-scan rule catches it on "no success", without needing to see a
+        // response, and sooner than any volume backstop.
         let mut e = engine();
-        let mut fired = false;
+        let mut caught = false;
         for n in 0..20 {
             let (_, d) = e.observe_packet(peer(), switch(), &register(n, true), t(n));
-            fired |= matches!(d, Decision::AuthAbuse { .. });
+            caught |= matches!(d, Decision::RegScan { .. } | Decision::AuthAbuse { .. });
         }
         assert!(
-            fired,
-            "20 credentials in 20 s with no answer must still block"
-        );
-        assert_eq!(
-            e.stats.auth_failures, 0,
-            "and honestly report zero failures"
+            caught,
+            "a flood of REGISTERs that never succeed must be stopped"
         );
     }
 }

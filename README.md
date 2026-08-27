@@ -121,6 +121,13 @@ its next packets die at XDP and vanish from the capture.
   Censys announces itself as `censysinspect@censys.io`, and there are Shodan, LeakIX and the
   rest, plus tool/service domains like `sip5060.net`. A real caller is never `@censys.io`.
   Extend the built-in list with `scanners` in the config.
+- **Registration scanning** — a source that makes many `REGISTER` attempts and **never
+  completes a registration** (no `2xx`). This catches extension enumeration and slow
+  credential probing that the failed-auth rule misses: the attacker spreads a few attempts
+  across many extensions, or sends no credential at all, so no single extension crosses the
+  brute-force threshold — but from one source, six REGISTERs with zero successes is a scan.
+  A legitimate phone or gateway registers successfully, which exempts it however many
+  attempts it makes, so a NAT with many phones is safe.
 - **Failed authentication** — see below.
 - **APIBAN** — the collaborative bad-IP list, if a key is configured.
 

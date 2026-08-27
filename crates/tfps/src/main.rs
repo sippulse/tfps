@@ -684,6 +684,7 @@ fn main() -> ExitCode {
                         Decision::Scanner { id } => Some(("scanner", *id)),
                         Decision::Injection { pattern } => Some(("injection", *pattern)),
                         Decision::AuthFailure { .. } => Some(("auth-failed", "rejected")),
+                        Decision::RegScan { .. } => Some(("reg-scan", "no-success")),
                         Decision::AuthAbuse { .. } => Some(("auth-volume", "no-answer")),
                         _ => None,
                     };
@@ -951,6 +952,10 @@ fn report(dec: &Decision, peer: Ipv4Addr, verbose: bool) {
             // Always visible: a run of rejected credentials is the precursor of Chain A.
             say!("AUTH FAILURES peer={peer} rejected_credentials_in_window={failures}")
         }
+        Decision::RegScan { attempts } => {
+            // Always visible: registration scanning / extension enumeration.
+            say!("REG SCAN peer={peer} register_attempts_no_success={attempts}")
+        }
         Decision::AuthAbuse { attempts } => {
             // The backstop fired, which also says the softswitch never answered.
             say!("AUTH VOLUME peer={peer} authenticated_attempts_unanswered={attempts}")
@@ -1020,7 +1025,7 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
         }
     };
     say!(
-        "--- mode={mode_label} packets={} sip={} responses={} keepalive={} not_sip={} noise={} ({}%) injection={} scanners={} auth_att={} auth_fail={} auth_ok={} auth_chal={} auth_volume={} intl_ok={} intl_fail={} invites={} intl={} \
+        "--- mode={mode_label} packets={} sip={} responses={} keepalive={} not_sip={} noise={} ({}%) injection={} scanners={} reg_scan={} auth_att={} auth_fail={} auth_ok={} auth_chal={} auth_volume={} intl_ok={} intl_fail={} invites={} intl={} \
          unknown_country={} first_time={} blocks={} would_block={} sources={} ports={:?}",
         s.packets,
         s.sip_parsed,
@@ -1034,6 +1039,7 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
             .unwrap_or(0),
         s.injections,
         s.scanners,
+        s.reg_scans,
         s.auth_attempts,
         s.auth_failures,
         s.auth_ok,
