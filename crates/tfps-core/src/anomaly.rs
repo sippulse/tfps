@@ -191,6 +191,8 @@ pub struct Verdict {
     pub volume_bits: f64,
     /// Distinct countries this source has been seen to attempt.
     pub countries: u32,
+    /// This country was a first for the source.
+    pub first_time: bool,
     /// The fused evidence crossed the fire bound.
     pub fired: bool,
 }
@@ -223,6 +225,12 @@ pub const VOLUME_WINDOW_SECS: u32 = 3600;
 /// Half-life of the scan-arm walk. The burst that fires the scanner has to happen inside a
 /// few multiples of this; novelty spread wider than that leaks away.
 pub const SCAN_HALFLIFE_SECS: u32 = 600;
+
+impl Default for SourceAnomaly {
+    fn default() -> Self {
+        Self::new(&Params::default())
+    }
+}
 
 impl SourceAnomaly {
     pub fn new(p: &Params) -> Self {
@@ -303,9 +311,9 @@ impl SourceAnomaly {
         self.last_call = now;
 
         // Scan arms: novelty is the first-contact event.
-        let novel_country = !self.country_seen(country);
+        let first_time = !self.country_seen(country);
         self.mark_country(country);
-        let country_bits = self.country_scan.observe(novel_country);
+        let country_bits = self.country_scan.observe(first_time);
 
         let novel_prefix = self.prefix_first_contact(prefix);
         let prefix_bits = self.prefix_scan.observe(novel_prefix);
@@ -320,6 +328,7 @@ impl SourceAnomaly {
             prefix_bits,
             volume_bits,
             countries: self.n_countries,
+            first_time,
             fired: evidence >= self.fire_bits,
         }
     }
@@ -327,6 +336,37 @@ impl SourceAnomaly {
     pub fn distinct_countries(&self) -> u32 {
         self.n_countries
     }
+
+    /// The slow-moving state worth persisting: which countries this source has been seen to
+    /// call, and its learned rate posterior. The fast walk evidence is intra-burst and, like
+    /// the old debut window, is not persisted — a restart loses at most a burst's worth.
+    pub fn snapshot(&self) -> AnomalySnapshot {
+        AnomalySnapshot {
+            seen_countries: self.seen_countries,
+            n_countries: self.n_countries,
+            rate_a: self.rate.a,
+            rate_b: self.rate.b,
+        }
+    }
+
+    /// Rebuilds from a snapshot at boot.
+    pub fn from_snapshot(p: &Params, snap: AnomalySnapshot) -> Self {
+        let mut me = Self::new(p);
+        me.seen_countries = snap.seen_countries;
+        me.n_countries = snap.n_countries;
+        me.rate.a = snap.rate_a;
+        me.rate.b = snap.rate_b;
+        me
+    }
+}
+
+/// The durable part of a source's detector state.
+#[derive(Debug, Clone)]
+pub struct AnomalySnapshot {
+    pub seen_countries: [u64; 4],
+    pub n_countries: u32,
+    pub rate_a: f64,
+    pub rate_b: f64,
 }
 
 /// A minimal `ln Γ(x)` (Lanczos), so the module carries no numeric dependency. Accurate to

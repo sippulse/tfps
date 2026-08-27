@@ -68,6 +68,16 @@ impl DialPlan {
     /// classify and became 39% of all rejections, is the mistake this function exists to
     /// avoid.
     pub fn to_international(&self, dialed: &str) -> Option<InternationalDigits> {
+        self.to_international_with_prefix(dialed).map(|(d, _)| d)
+    }
+
+    /// As `to_international`, but also returns the **matched prefix** (`""` for a bare-E.164
+    /// peer). The prefix is a signal in its own right: a source probing routes cycles
+    /// through several, which the anomaly detector's prefix arm counts.
+    pub fn to_international_with_prefix(
+        &self,
+        dialed: &str,
+    ) -> Option<(InternationalDigits, String)> {
         let cleaned = strip_visual_separators(dialed);
 
         // Longest-match. This resolves the classic ambiguity on its own: a PBX using `0`
@@ -79,9 +89,9 @@ impl DialPlan {
             .filter(|p| !p.is_empty() && cleaned.starts_with(p.as_str()))
             .max_by_key(|p| p.len());
 
-        let rest = match best {
-            Some(p) => &cleaned[p.len()..],
-            None if self.bare_e164 => cleaned.as_str(),
+        let (rest, matched) = match best {
+            Some(p) => (&cleaned[p.len()..], p.clone()),
+            None if self.bare_e164 => (cleaned.as_str(), String::new()),
             None => return None,
         };
 
@@ -93,7 +103,7 @@ impl DialPlan {
         if !(E164_MIN_DIGITS..=E164_MAX_DIGITS).contains(&digits.len()) {
             return None;
         }
-        Some(InternationalDigits(digits))
+        Some((InternationalDigits(digits), matched))
     }
 
     /// Does the dialled string match any declared prefix? A cheap hot-path gate that

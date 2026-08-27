@@ -124,53 +124,27 @@ The attacker loses on both branches. This is what makes wholesale tractable: the
 
 ---
 
-## 6. The signal `[ticket 10]`
+## 6. The signal `[ticket 10]` `[superseded]`
 
-**There is no statistical model.** No Isolation Forest, no Random Forest, no z-score, no negative binomial. Only **novelty detection** — set membership.
+**This section is superseded by [`docs/anomaly-detection.md`](docs/anomaly-detection.md).**
+The original rotating-bitmap novelty engine described here has been retired. In brief, what
+replaced it and why:
 
-### Structures
+- The B-number cannot be classified statically — a real libphonenumber port validates classic
+  IRSF destinations as ordinary mobiles. Detection is behavioural, not per-number.
+- The fraud has two phases, each a solved problem: **scanning** (many countries/prefixes,
+  fast) is detected with a **Threshold Random Walk** sequential test; **exploitation** (a
+  volume spike against the source's own norm) with **hierarchical Gamma-Poisson surprise**.
+- Both yield evidence in log-likelihood units and are fused; enforcement fires when the total
+  crosses a bound set by the error rates (α, β), not a hand-picked threshold.
+- The unit is the **source IP**, not `(peer, A-number)` — non-forgeable, and it removes the
+  A-number-rotation bypass.
+- Behavioural detection is **opt-in** (`--behavioural`); the perimeter (noise reduction) is
+  the default product.
 
-| structure | where | size | content |
-|---|---|---|---|
-| **rotating bitmap** | per pair `(peer, A-number)` | **64 bytes** | two 256-bit bitmaps: countries seen in the current period and in the previous one |
-| **frequency distribution** | per peer | ~200 counters | how many calls per country — the prior |
-| dial plan | per peer | small | declared + learned prefixes |
-
-A million pairs ≈ **64 MB**. The bitmap is **exact**, with no sketch and no false positive — possible only because the alphabet holds ~200 countries.
-
-### Blocking predicate
-
-> **Count of first-time countries for the pair, within a 1-hour window, ≥ N.**
-
-- **Window = 1 hour** — a universal constant, derived from the physics of the fraud: seconds are the scale of a signalling flood, days dilute the episode.
-- **N = 10** — a universal constant in v1. It fired **4 times in 2,829 account-days** in the measurement, and those four windows were the most atypical in the corpus.
-
-**A single first-time country does not fire**: a country debut happens in **0.85% of calls** after warm-up (0.28% on a mature unit). Blocking that would be a catastrophe. The signal is **accumulation**.
-
-Both constants are **universal, not per customer**. The species of number that killed the 2023 TFPS was the per-customer one nobody ever tuned.
-
-### Prior for a new pair
-
-Inheriting the peer's **entire** country set would not work — a wholesale peer calls 200 countries and saturation would be back.
-
-- **mature pair** → is the country in its bitmap? an exact lookup;
-- **new pair** → how common is this country **for the peer**? Common does not surprise; rare does, even with no history of its own.
-
-The weight migrates continuously from the peer to the pair. This is hierarchical shrinkage (**Rubin, 1981**), and the prior comes from the **parallel units of the installation itself** — no cloud required.
-
-### Ageing
-
-Every `T` = **45 days**: discard the previous bitmap, promote the current one, zero the new one. Effective memory of 45 to 90 days. `T` must be larger than learning mode.
-
-**The effect that solves poisoned bootstrap**: if the PBX arrived already compromised and learning absorbed the fraud, the poisoned countries **age out on their own — the system heals itself**.
-
-### v1 features, a closed list
-
-Destination country, hour of day in **24 learned categories** (the evidence from both papers is that this beats any notion of "business hours" — AUC 0.96 against 0.92 — and "fraud happens at night" is a property of a dataset, not of the phenomenon), peer, A-number. From the learning path: duration and outcome.
-
-**Out, with the reason**: range novelty (would demand sketches to sustain an unmeasured bet); distance to test IPRN, dispersion digit, `IRSF likelihood` (all require a corpus); `Test call ratio` and `spreadness` (require test-call logs that do not exist); burst and fan-out ratio (**refuted by measurement** — see `CONTEXT.md`).
-
----
+Two decisions from the original section still stand: the **z-score reversal** is honoured
+with the minimum-samples guard now realised as the Bayesian population prior; and there is
+**no black-box model** — every block is an explainable sum of bits.
 
 ## 7. Perimeter
 

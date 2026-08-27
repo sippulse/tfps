@@ -25,7 +25,8 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 
 use rusqlite::{params, Connection};
-use tfps_core::engine::{Engine, PairRecord, PeerCountryRecord};
+use tfps_core::country;
+use tfps_core::engine::{Engine, PeerAnomalyRecord};
 
 pub const DEFAULT_PATH: &str = "/var/lib/tfps/tfps.db";
 
@@ -34,22 +35,21 @@ pub const DEFAULT_PATH: &str = "/var/lib/tfps/tfps.db";
 /// not.
 const SCHEMA: i64 = 1;
 
-/// A learned pair, as stored.
-pub struct PairRow {
+/// A source's learned state, as stored — for the control tool.
+pub struct SourceRow {
     pub peer: String,
-    pub a_number: String,
-    pub cur: Vec<u8>,
-    pub prev: Vec<u8>,
-    pub period: u32,
+    pub seen: Vec<u8>,
+    pub n_countries: u32,
+    pub rate_a: f64,
     pub last_seen: u32,
 }
 
-impl PairRow {
-    /// The countries this pair has called, as labels.
+impl SourceRow {
+    /// The countries this source has been seen to call, as labels.
     pub fn countries(&self) -> Vec<&'static str> {
-        match (blob_to_words(&self.cur), blob_to_words(&self.prev)) {
-            (Some(c), Some(p)) => tfps_core::country::decode_bitmap(c, p),
-            _ => Vec::new(),
+        match blob_to_words(&self.seen) {
+            Some(bits) => country::decode_bitmap(bits, [0; 4]),
+            None => Vec::new(),
         }
     }
 }
@@ -62,37 +62,27 @@ pub struct BlockRow {
     pub detail: String,
 }
 
-/// How an operator narrows a search.
-pub struct PairFilter<'a> {
+/// How an operator narrows a source search.
+pub struct SourceFilter<'a> {
     pub peer: Option<&'a str>,
-    /// Substring of the A-number, because an operator searching for an extension rarely
-    /// knows the exact string that was in the `From` header.
-    pub a_number: Option<&'a str>,
-    /// Only pairs that have called this country (ISO label, case-insensitive).
+    /// Only sources that have called this country (ISO label, case-insensitive).
     pub country: Option<&'a str>,
     pub limit: usize,
 }
 
-impl Default for PairFilter<'_> {
+impl Default for SourceFilter<'_> {
     fn default() -> Self {
         Self {
             peer: None,
-            a_number: None,
             country: None,
             limit: 50,
         }
     }
 }
 
-impl PairFilter<'_> {
-    fn matches(&self, r: &PairRow) -> bool {
+impl SourceFilter<'_> {
+    fn matches(&self, r: &SourceRow) -> bool {
         if self.peer.is_some_and(|p| r.peer != p) {
-            return false;
-        }
-        if self
-            .a_number
-            .is_some_and(|a| !r.a_number.to_lowercase().contains(&a.to_lowercase()))
-        {
             return false;
         }
         if let Some(c) = self.country {
@@ -136,7 +126,7 @@ impl Store {
             .unwrap_or(0);
         if found != 0 && found != SCHEMA {
             // Incompatible schema: start over. See the note on `SCHEMA`.
-            for t in ["pair", "peer_country", "meta", "block_log"] {
+            for t in ["peer_anomaly", "pair", "peer_country", "meta", "block_log"] {
                 let _ = self.conn.execute(&format!("DROP TABLE IF EXISTS {t}"), []);
             }
         }
@@ -146,20 +136,13 @@ impl Store {
                      k TEXT PRIMARY KEY,
                      v TEXT NOT NULL
                  );
-                 CREATE TABLE IF NOT EXISTS pair (
-                     peer      TEXT    NOT NULL,
-                     a_number  TEXT    NOT NULL,
-                     cur       BLOB    NOT NULL,
-                     prev      BLOB    NOT NULL,
-                     period    INTEGER NOT NULL,
-                     last_seen INTEGER NOT NULL,
-                     PRIMARY KEY (peer, a_number)
-                 );
-                 CREATE TABLE IF NOT EXISTS peer_country (
-                     peer    TEXT    NOT NULL,
-                     country INTEGER NOT NULL,
-                     calls   INTEGER NOT NULL,
-                     PRIMARY KEY (peer, country)
+                 CREATE TABLE IF NOT EXISTS peer_anomaly (
+                     peer        TEXT    PRIMARY KEY,
+                     seen        BLOB    NOT NULL,   -- 32 bytes: the 256-bit country set
+                     n_countries INTEGER NOT NULL,
+                     rate_a      REAL    NOT NULL,
+                     rate_b      REAL    NOT NULL,
+                     last_seen   INTEGER NOT NULL DEFAULT 0
                  );
                  -- Audit: every block records why, in human-readable form.
                  -- `SPEC.md` §12 requires the operator to be able to reconstruct it.
@@ -297,26 +280,25 @@ impl Store {
 
     /// Learned pairs, filtered the way an operator searches: by peer, by A-number
     /// substring, or by a country the pair has called.
-    pub fn find_pairs(&self, f: &PairFilter<'_>) -> Result<Vec<PairRow>, String> {
+    pub fn find_sources(&self, f: &SourceFilter<'_>) -> Result<Vec<SourceRow>, String> {
         let mut st = self
             .conn
             .prepare(
-                "SELECT peer, a_number, cur, prev, period, last_seen FROM pair
+                "SELECT peer, seen, n_countries, rate_a, last_seen FROM peer_anomaly
                  ORDER BY last_seen DESC",
             )
-            .map_err(|e| format!("reading pair: {e}"))?;
+            .map_err(|e| format!("reading peer_anomaly: {e}"))?;
         let rows = st
             .query_map([], |r| {
-                Ok(PairRow {
+                Ok(SourceRow {
                     peer: r.get(0)?,
-                    a_number: r.get(1)?,
-                    cur: r.get::<_, Vec<u8>>(2)?,
-                    prev: r.get::<_, Vec<u8>>(3)?,
-                    period: r.get(4)?,
-                    last_seen: r.get(5)?,
+                    seen: r.get::<_, Vec<u8>>(1)?,
+                    n_countries: r.get(2)?,
+                    rate_a: r.get(3)?,
+                    last_seen: r.get(4)?,
                 })
             })
-            .map_err(|e| format!("iterating pair: {e}"))?;
+            .map_err(|e| format!("iterating peer_anomaly: {e}"))?;
         Ok(rows
             .flatten()
             .filter(|r| f.matches(r))
@@ -324,13 +306,13 @@ impl Store {
             .collect())
     }
 
-    /// Per-peer totals: how many pairs, and when it was last heard from.
+    /// Sources by distinct-country breadth, and when last heard from.
     pub fn peers(&self) -> Result<Vec<(String, u32, u32)>, String> {
         let mut st = self
             .conn
             .prepare(
-                "SELECT peer, COUNT(*), MAX(last_seen) FROM pair
-                 GROUP BY peer ORDER BY COUNT(*) DESC",
+                "SELECT peer, n_countries, last_seen FROM peer_anomaly
+                 ORDER BY n_countries DESC",
             )
             .map_err(|e| format!("reading peers: {e}"))?;
         let rows = st
@@ -339,20 +321,21 @@ impl Store {
         Ok(rows.flatten().collect())
     }
 
-    /// A peer's country frequencies — the prior a new pair inherits, and the most direct
-    /// answer to "where does this customer actually call?".
-    pub fn peer_countries(&self, peer: &str) -> Result<Vec<(u16, u32)>, String> {
-        let mut st = self
+    /// The countries a source has been seen to call. The new model tracks membership, not
+    /// per-country counts, so this lists the set rather than frequencies.
+    pub fn peer_countries(&self, peer: &str) -> Result<Vec<&'static str>, String> {
+        let row = self
             .conn
-            .prepare(
-                "SELECT country, calls FROM peer_country WHERE peer = ?1
-                 ORDER BY calls DESC",
+            .query_row(
+                "SELECT seen FROM peer_anomaly WHERE peer = ?1",
+                params![peer],
+                |r| r.get::<_, Vec<u8>>(0),
             )
-            .map_err(|e| format!("reading peer_country: {e}"))?;
-        let rows = st
-            .query_map(params![peer], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(|e| format!("iterating peer_country: {e}"))?;
-        Ok(rows.flatten().collect())
+            .map_err(|e| format!("reading peer_anomaly: {e}"))?;
+        Ok(match blob_to_words(&row) {
+            Some(bits) => country::decode_bitmap(bits, [0; 4]),
+            None => Vec::new(),
+        })
     }
 
     /// The block audit log, newest first.
@@ -401,15 +384,17 @@ impl Store {
         Ok(rows.flatten().collect())
     }
 
-    /// Distinct destination countries across every peer — the breadth of the baseline.
+    /// Breadth of the baseline: the widest single-source country count, and the total
+    /// across sources. (The per-country call frequencies of the old model are gone.)
     pub fn country_spread(&self) -> Result<(u32, u32), String> {
         self.conn
             .query_row(
-                "SELECT COUNT(DISTINCT country), COALESCE(SUM(calls), 0) FROM peer_country",
+                "SELECT COALESCE(MAX(n_countries), 0), COALESCE(SUM(n_countries), 0) \
+                 FROM peer_anomaly",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .map_err(|e| format!("reading peer_country: {e}"))
+            .map_err(|e| format!("reading peer_anomaly: {e}"))
     }
 
     /// Totals for the status line: pairs, peers, and the newest thing the file knows about
@@ -417,7 +402,7 @@ impl Store {
     pub fn totals(&self) -> Result<(u32, u32, u32), String> {
         self.conn
             .query_row(
-                "SELECT COUNT(*), COUNT(DISTINCT peer), COALESCE(MAX(last_seen), 0) FROM pair",
+                "SELECT COUNT(*), COUNT(*), COALESCE(MAX(last_seen), 0) FROM peer_anomaly",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -429,132 +414,89 @@ impl Store {
     /// **Only meaningful with the daemon stopped.** A running process holds the working set
     /// in memory and would write it straight back at the next checkpoint, so the caller has
     /// to establish that before offering this.
-    pub fn forget(&self, peer: &str, a_number: Option<&str>) -> Result<usize, String> {
-        let n = match a_number {
-            Some(a) => self.conn.execute(
-                "DELETE FROM pair WHERE peer = ?1 AND a_number = ?2",
-                params![peer, a],
-            ),
-            None => {
-                let _ = self
-                    .conn
-                    .execute("DELETE FROM peer_country WHERE peer = ?1", params![peer]);
-                self.conn
-                    .execute("DELETE FROM pair WHERE peer = ?1", params![peer])
-            }
-        };
-        n.map_err(|e| format!("deleting: {e}"))
+    pub fn forget(&self, peer: &str, _a_number: Option<&str>) -> Result<usize, String> {
+        self.conn
+            .execute("DELETE FROM peer_anomaly WHERE peer = ?1", params![peer])
+            .map_err(|e| format!("deleting: {e}"))
     }
 
     /// Writes the learning state. Called at checkpoint time, never per packet.
     pub fn checkpoint(&mut self, engine: &Engine) -> Result<(usize, usize), String> {
+        let now = self.now_stamp();
         let tx = self
             .conn
             .transaction()
             .map_err(|e| format!("transaction: {e}"))?;
-        let mut pairs = 0usize;
-        let mut countries = 0usize;
+        let mut sources = 0usize;
         {
             let mut ins = tx
                 .prepare_cached(
-                    "INSERT OR REPLACE INTO pair
-                     (peer, a_number, cur, prev, period, last_seen)
+                    "INSERT OR REPLACE INTO peer_anomaly
+                     (peer, seen, n_countries, rate_a, rate_b, last_seen)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )
-                .map_err(|e| format!("preparing pair: {e}"))?;
-            for r in engine.export_pairs() {
+                .map_err(|e| format!("preparing peer_anomaly: {e}"))?;
+            for r in engine.export_anomaly() {
                 ins.execute(params![
                     r.peer.to_string(),
-                    r.a_number,
-                    words_to_blob(&r.cur),
-                    words_to_blob(&r.prev),
-                    r.period,
-                    r.last_seen
+                    words_to_blob(&r.seen_countries),
+                    r.n_countries,
+                    r.rate_a,
+                    r.rate_b,
+                    now
                 ])
-                .map_err(|e| format!("writing pair: {e}"))?;
-                pairs += 1;
-            }
-            let mut insc = tx
-                .prepare_cached(
-                    "INSERT OR REPLACE INTO peer_country (peer, country, calls)
-                     VALUES (?1, ?2, ?3)",
-                )
-                .map_err(|e| format!("preparing peer_country: {e}"))?;
-            for r in engine.export_peer_countries() {
-                insc.execute(params![r.peer.to_string(), r.country, r.calls])
-                    .map_err(|e| format!("writing country: {e}"))?;
-                countries += 1;
+                .map_err(|e| format!("writing peer_anomaly: {e}"))?;
+                sources += 1;
             }
         }
         tx.commit().map_err(|e| format!("commit: {e}"))?;
-        Ok((pairs, countries))
+        Ok((sources, 0))
+    }
+
+    /// A wall-clock stamp for `last_seen`. The core is clockless, so reading the clock here
+    /// at checkpoint time (never on the packet path) is harmless.
+    fn now_stamp(&self) -> u32 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0)
     }
 
     /// Loads the state at boot. An error here is **not fatal** — the system restarts
     /// learning, which is bad but recoverable; refusing to start would be worse.
     pub fn load_into(&self, engine: &mut Engine) -> Result<(usize, usize), String> {
-        let mut pairs = 0usize;
+        let mut sources = 0usize;
         let mut st = self
             .conn
-            .prepare("SELECT peer, a_number, cur, prev, period, last_seen FROM pair")
-            .map_err(|e| format!("reading pair: {e}"))?;
+            .prepare("SELECT peer, seen, n_countries, rate_a, rate_b FROM peer_anomaly")
+            .map_err(|e| format!("reading peer_anomaly: {e}"))?;
         let rows = st
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Vec<u8>>(2)?,
-                    r.get::<_, Vec<u8>>(3)?,
-                    r.get::<_, u32>(4)?,
-                    r.get::<_, u32>(5)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, u32>(2)?,
+                    r.get::<_, f64>(3)?,
+                    r.get::<_, f64>(4)?,
                 ))
             })
-            .map_err(|e| format!("iterating pair: {e}"))?;
+            .map_err(|e| format!("iterating peer_anomaly: {e}"))?;
         for row in rows.flatten() {
-            let (peer, a_number, cur, prev, period, last_seen) = row;
-            let (Ok(peer), Some(cur), Some(prev)) = (
-                peer.parse::<Ipv4Addr>(),
-                blob_to_words(&cur),
-                blob_to_words(&prev),
-            ) else {
+            let (peer, seen, n_countries, rate_a, rate_b) = row;
+            let (Ok(peer), Some(seen_countries)) = (peer.parse::<Ipv4Addr>(), blob_to_words(&seen))
+            else {
                 continue; // corrupt row: skip one, do not lose the whole database
             };
-            engine.import_pair(PairRecord {
+            engine.import_anomaly(PeerAnomalyRecord {
                 peer,
-                a_number,
-                cur,
-                prev,
-                period,
-                last_seen,
+                seen_countries,
+                n_countries,
+                rate_a,
+                rate_b,
             });
-            pairs += 1;
+            sources += 1;
         }
-
-        let mut countries = 0usize;
-        let mut st = self
-            .conn
-            .prepare("SELECT peer, country, calls FROM peer_country")
-            .map_err(|e| format!("reading peer_country: {e}"))?;
-        let rows = st
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, u16>(1)?,
-                    r.get::<_, u32>(2)?,
-                ))
-            })
-            .map_err(|e| format!("iterating peer_country: {e}"))?;
-        for (peer, country, calls) in rows.flatten() {
-            if let Ok(peer) = peer.parse::<Ipv4Addr>() {
-                engine.import_peer_country(PeerCountryRecord {
-                    peer,
-                    country,
-                    calls,
-                });
-                countries += 1;
-            }
-        }
-        Ok((pairs, countries))
+        Ok((sources, 0))
     }
 }
 
@@ -651,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bitmap_survives_a_restart() {
+    fn the_learned_state_survives_a_restart() {
         // The property that makes learning mode meaningful: without it a
         // `systemctl restart` would silently erase 30 days of baseline.
         let path = tmp();
@@ -664,9 +606,8 @@ mod tests {
         e1.observe(peer, &invite("200", "00351912345678"), t);
 
         let mut s = Store::open(&path).unwrap();
-        let (p, c) = s.checkpoint(&e1).unwrap();
-        assert_eq!(p, 1, "one pair");
-        assert!(c >= 2, "two countries");
+        let (sources, _) = s.checkpoint(&e1).unwrap();
+        assert_eq!(sources, 1, "one source persisted");
 
         // A fresh process, memory wiped.
         let mut e2 = Engine::new(DialPlan::new(["00"]), Mode::Active).with_behavioural();

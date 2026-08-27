@@ -44,7 +44,8 @@ fn invite(from: &str, dialed: &str) -> Vec<u8> {
 const POOL: usize = 65_536;
 
 fn run(label: &str, n: usize, rotate_a_number: bool) {
-    let mut engine = Engine::new(DialPlan::new(["+", "00", "011", "9011"]), Mode::Active);
+    let mut engine =
+        Engine::new(DialPlan::new(["+", "00", "011", "9011"]), Mode::Active).with_behavioural();
     let peer = Ipv4Addr::new(10, 0, 0, 5);
     // Build the payloads first: this measures deciding, not formatting strings.
     let payloads: Vec<Vec<u8>> = (0..POOL.min(n))
@@ -83,6 +84,6 @@ fn run(label: &str, n: usize, rotate_a_number: bool) {
 
 fn main() {
     println!("decision path only — no capture, no disk, single core\n");
-    run("settled customer", 1_000_000, false);
-    run("A-number rotation attack", 1_000_000, true);
+    run("settled source (one country)", 1_000_000, false);
+    run("varied A-numbers (same source)", 1_000_000, true);
 }

@@ -15,9 +15,10 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
+use crate::anomaly::{AnomalySnapshot, Params, SourceAnomaly};
 use crate::country::{self, Country};
 use crate::dialplan::DialPlan;
-use crate::novelty::{PairState, RotatingBitmap, Timestamp};
+use crate::novelty::Timestamp;
 use crate::perimeter::{
     AuthAttempts, AuthFailures, NoiseFilter, AUTH_FAILURE_WINDOW_SECS, AUTH_WINDOW_SECS,
 };
@@ -53,12 +54,15 @@ pub enum Decision {
     /// Would have blocked, but the behavioural layer is still learning.
     WouldBlock {
         country: &'static str,
-        novel_in_window: usize,
+        bits: u32,
+        countries: u32,
     },
-    /// Block: the pair accumulated too many first-time countries within the window.
+    /// Block: the source's fused evidence crossed the fire bound. `bits` is the evidence,
+    /// `countries` the distinct destinations it has attempted — both go in the audit line.
     Block {
         country: &'static str,
-        novel_in_window: usize,
+        bits: u32,
+        countries: u32,
     },
     /// Perimeter noise: a scanning tool identified by its user-agent.
     /// Under enforcement this dies at `XDP_DROP` and vanishes from sngrep.
@@ -132,98 +136,32 @@ pub struct Stats {
     pub peers_dropped: u64,
 }
 
-/// Ceiling of pairs per peer.
-///
-/// It exists because `SPEC.md` §5 states that **rotating the A-number is expected attacker
-/// behaviour** — and without a ceiling the system answers that by allocating until it dies.
-/// At ~150 bytes per pair, an attacker at 1000 INVITEs/s with unique A-numbers fills 192 MB
-/// in about 20 minutes. An anti-fraud system with a DoS vector described in its own
-/// specification does not meet the premise.
-const MAX_PAIRS_PER_PEER: usize = 50_000;
-
-/// Ceiling of pairs across **every** peer.
-///
-/// The per-peer ceiling alone is not a memory bound: `MAX_PEERS × MAX_PAIRS_PER_PEER` is
-/// 500 million pairs, some 80 GB, against a unit that declares `MemoryMax=192M`. The
-/// per-peer limit stops one peer starving the others; only this stops the sum starving the
-/// machine. Exceeding it costs learning about newcomers, never the integrity of the
-/// process.
-const MAX_PAIRS_TOTAL: usize = 200_000;
-
-/// Longest A-number kept as a key.
-///
-/// The `From` user part is attacker-controlled and a SIP datagram can carry tens of
-/// kilobytes of it, so an unbounded key turns the pair ceiling into a memory multiplier.
-/// Real A-numbers are E.164 or an extension; 64 characters is far past anything legitimate,
-/// and truncating (rather than rejecting) keeps the grouping working.
-const MAX_A_NUMBER_LEN: usize = 64;
-
-/// How often one peer's pair table may be swept.
-///
-/// Without this the sweep runs on **every packet** once the table is full, which hands an
-/// attacker rotating A-numbers an O(n) cost per packet: measured at 75.7 µs against 7.7 µs
-/// for ordinary traffic on the reference hardware — a tenfold CPU amplification, paid by
-/// the defender.
-const PRUNE_INTERVAL_SECS: u32 = 60;
-
 /// Ceiling of distinct peers. A peer is the source IP, which is not forgeable from the
 /// observation point — so this ceiling is far looser than the pair one.
 const MAX_PEERS: usize = 10_000;
 
-/// Truncates to at most `max` bytes, on a character boundary.
-///
-/// Truncation rather than rejection: an over-long `From` user is almost certainly an
-/// attack, but the call still deserves a verdict, and grouping under a bounded prefix is
-/// better than either unbounded memory or a blind spot.
-fn bounded(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
-}
-
-/// One row of a pair's state, as the durable store sees it.
+/// A peer's durable detector state, as the store sees it.
 #[derive(Debug, Clone)]
-pub struct PairRecord {
+pub struct PeerAnomalyRecord {
     pub peer: Ipv4Addr,
-    pub a_number: String,
-    pub cur: [u64; 4],
-    pub prev: [u64; 4],
-    pub period: u32,
-    pub last_seen: u32,
-}
-
-/// How often a peer calls one country.
-#[derive(Debug, Clone, Copy)]
-pub struct PeerCountryRecord {
-    pub peer: Ipv4Addr,
-    pub country: u16,
-    pub calls: u32,
+    pub seen_countries: [u64; 4],
+    pub n_countries: u32,
+    pub rate_a: f64,
+    pub rate_b: f64,
 }
 
 #[derive(Debug, Default)]
 struct PeerState {
     dial_plan: DialPlan,
-    /// Per-A-number state, with the last-seen instant so pruning is possible.
-    pairs: HashMap<String, (PairState, u32)>,
-    /// Per-country frequency distribution — the prior a brand-new pair inherits.
-    /// `SPEC.md` §6: inheriting the peer's whole set would not work, because a wholesale
-    /// peer calls 200 countries and saturation would come straight back.
-    country_calls: HashMap<u16, u32>,
-    total_calls: u32,
+    /// The sequential IRSF detector for this source. One per peer — the A-number is gone as
+    /// a key, which is what removes the rotation bypass. See `anomaly.rs`.
+    anomaly: SourceAnomaly,
     /// Authenticated attempts, regardless of outcome — the volume backstop.
     auth_attempts: AuthAttempts,
     /// Rejected credentials — the real brute-force signal.
     auth_failures: AuthFailures,
     /// Authenticated transactions still waiting for their response.
     pending: PendingAuth,
-    /// When this peer's pair table was last swept, so the sweep cannot be triggered per
-    /// packet by an attacker rotating A-numbers.
-    last_prune: u32,
 }
 
 /// How many authenticated transactions per peer can be awaiting a response.
@@ -275,8 +213,6 @@ impl PendingAuth {
 
 pub struct Engine {
     peers: HashMap<Ipv4Addr, PeerState>,
-    /// Running total of pairs, so the global ceiling costs no traversal to check.
-    total_pairs: usize,
     default_plan: DialPlan,
     mode: Mode,
     /// Whether behavioural fraud detection runs at all.
@@ -297,7 +233,6 @@ impl Engine {
     pub fn new(default_plan: DialPlan, mode: Mode) -> Self {
         Self {
             peers: HashMap::new(),
-            total_pairs: 0,
             default_plan,
             mode,
             behavioural: false,
@@ -334,46 +269,27 @@ impl Engine {
         self.peers.len()
     }
 
-    pub fn pair_count(&self) -> usize {
-        self.total_pairs
+    /// Distinct sources under watch.
+    pub fn source_count(&self) -> usize {
+        self.peers.len()
     }
 
-    /// A pair's state, in the shape the durable store writes.
-    ///
-    /// The core does **no I/O** — it exports and imports; the binary writes. That is what
-    /// keeps everything here deterministic and testable without a disk.
-    pub fn export_pairs(&self) -> impl Iterator<Item = PairRecord> + '_ {
-        self.peers.iter().flat_map(|(ip, st)| {
-            st.pairs.iter().map(move |(a, (pair, last))| {
-                let (cur, prev, period) = pair.bitmap().parts();
-                PairRecord {
-                    peer: *ip,
-                    a_number: a.clone(),
-                    cur,
-                    prev,
-                    period,
-                    last_seen: *last,
-                }
-            })
+    /// Each source's durable detector state, in the shape the store writes.
+    pub fn export_anomaly(&self) -> impl Iterator<Item = PeerAnomalyRecord> + '_ {
+        self.peers.iter().map(|(ip, st)| {
+            let snap = st.anomaly.snapshot();
+            PeerAnomalyRecord {
+                peer: *ip,
+                seen_countries: snap.seen_countries,
+                n_countries: snap.n_countries,
+                rate_a: snap.rate_a,
+                rate_b: snap.rate_b,
+            }
         })
     }
 
-    /// Per-peer country frequencies — the prior a brand-new pair inherits.
-    pub fn export_peer_countries(&self) -> impl Iterator<Item = PeerCountryRecord> + '_ {
-        self.peers.iter().flat_map(|(ip, st)| {
-            st.country_calls
-                .iter()
-                .map(move |(c, n)| PeerCountryRecord {
-                    peer: *ip,
-                    country: *c,
-                    calls: *n,
-                })
-        })
-    }
-
-    /// Restores a pair. It honours the memory ceilings: persisted state must not be used
-    /// to bypass the limit that protects against A-number rotation.
-    pub fn import_pair(&mut self, r: PairRecord) {
+    /// Restores a source's detector state. Honours the peer ceiling.
+    pub fn import_anomaly(&mut self, r: PeerAnomalyRecord) {
         if self.peers.len() >= MAX_PEERS && !self.peers.contains_key(&r.peer) {
             return;
         }
@@ -382,44 +298,23 @@ impl Engine {
             dial_plan: plan,
             ..Default::default()
         });
-        if st.pairs.len() >= MAX_PAIRS_PER_PEER || self.total_pairs >= MAX_PAIRS_TOTAL {
-            // Persisted state must not be a way around the ceilings that bound memory.
-            return;
-        }
-        self.total_pairs += 1;
-        st.pairs.insert(
-            r.a_number,
-            (
-                PairState::from_bitmap(RotatingBitmap::from_parts(r.cur, r.prev, r.period)),
-                r.last_seen,
-            ),
+        st.anomaly = SourceAnomaly::from_snapshot(
+            &Params::default(),
+            AnomalySnapshot {
+                seen_countries: r.seen_countries,
+                n_countries: r.n_countries,
+                rate_a: r.rate_a,
+                rate_b: r.rate_b,
+            },
         );
     }
 
-    pub fn import_peer_country(&mut self, r: PeerCountryRecord) {
-        let plan = self.default_plan.clone();
-        let st = self.peers.entry(r.peer).or_insert_with(|| PeerState {
-            dial_plan: plan,
-            ..Default::default()
-        });
-        *st.country_calls.entry(r.country).or_insert(0) += r.calls;
-        st.total_calls = st.total_calls.saturating_add(r.calls);
-    }
-
-    /// Approximate memory held by learning state, for the report. The operator needs to
-    /// watch this grow before the service is killed by a cgroup limit.
+    /// Approximate memory held by detector state, for the report.
     pub fn approx_state_bytes(&self) -> usize {
-        // Sized from what is actually held: the two bitmaps and the debut ring, the
-        // bounded key, and the table slot around them.
-        const PER_PAIR: usize = MAX_A_NUMBER_LEN + 104 + 48;
-        const PER_PEER: usize = 256 + MAX_PENDING_PER_PEER * (128 + 8 + 48);
+        // A SourceAnomaly is a fixed handful of words: two walks, a rate posterior, a
+        // 256-bit country set. Call it ~200 bytes per peer with map overhead.
+        const PER_PEER: usize = 200;
         self.peers.len() * PER_PEER
-            + self.total_pairs * PER_PAIR
-            + self
-                .peers
-                .values()
-                .map(|p| p.country_calls.len() * 12)
-                .sum::<usize>()
     }
 
     /// Processes a SIP datagram observed between `src` and `dst`.
@@ -584,7 +479,7 @@ impl Engine {
 
         // The cheapest filter on the hot path: whatever is not international leaves here,
         // without canonicalising and without touching any state.
-        let Some(digits) = state.dial_plan.to_international(dialed) else {
+        let Some((digits, prefix)) = state.dial_plan.to_international_with_prefix(dialed) else {
             return Decision::OutOfScope("not international for this peer");
         };
         self.stats.international += 1;
@@ -596,87 +491,45 @@ impl Engine {
             return Decision::UnknownCountry(digits.0);
         };
 
-        Self::decide(
-            state,
-            req,
-            c,
-            now,
-            self.mode,
-            &mut self.stats,
-            &mut self.total_pairs,
-        )
+        Self::decide(&prefix, state, req, c, now, self.mode, &mut self.stats)
     }
 
     fn decide(
+        prefix: &str,
         state: &mut PeerState,
-        req: &sip::Request<'_>,
+        _req: &sip::Request<'_>,
         c: Country,
         now: Timestamp,
         mode: Mode,
         stats: &mut Stats,
-        total: &mut usize,
     ) -> Decision {
-        // The A-number is an unverified assertion by the sender; it serves as a grouping
-        // key, never as identity. The trust anchor is the peer. `SPEC.md` §5.
-        let a_number = bounded(req.from_user().unwrap_or("<no-from>"), MAX_A_NUMBER_LEN);
+        // One observation feeds the source's sequential detector: the destination country
+        // and the dialling prefix, at this instant. All the state — novelty, prefix
+        // variety, volume — lives inside it.
+        let v = state.anomaly.observe(c.index, prefix, now.0);
+        // A first-time country registers as novelty for the report's thermometer.
+        stats.novel += u64::from(v.first_time);
+        let bits = v.evidence.round().max(0.0) as u32;
 
-        *state.country_calls.entry(c.index.0).or_insert(0) += 1;
-        state.total_calls += 1;
-
-        // Prune before inserting: pairs seen once and never again — the signature of
-        // A-number rotation — fall out on their own, while legitimate ones that come back
-        // stay.
-        let known = state.pairs.contains_key(&a_number);
-        if !known && (state.pairs.len() >= MAX_PAIRS_PER_PEER || *total >= MAX_PAIRS_TOTAL) {
-            // Sweep at most once a minute. Doing it per packet is what turned this defence
-            // into a CPU amplifier for the very attack it exists to survive: 75.7 us per
-            // INVITE against 7.7 us for ordinary traffic, measured on the reference host.
-            if now.0.saturating_sub(state.last_prune) >= PRUNE_INTERVAL_SECS {
-                state.last_prune = now.0;
-                let before = state.pairs.len();
-                let cutoff = now.0.saturating_sub(crate::novelty::WINDOW_SECS);
-                state.pairs.retain(|_, (_, last)| *last >= cutoff);
-                *total -= before - state.pairs.len();
-            }
-            if state.pairs.len() >= MAX_PAIRS_PER_PEER || *total >= MAX_PAIRS_TOTAL {
-                // Still full: refuse the new pair instead of growing. What is lost is
-                // learning about that A-number, not the process's integrity.
-                stats.pairs_dropped += 1;
-                return Decision::Pass {
-                    country: c.iso,
-                    novel: false,
-                };
-            }
-        }
-        if !known {
-            *total += 1;
-        }
-
-        let (pair, last) = state.pairs.entry(a_number).or_default();
-        *last = now.0;
-        let obs = pair.observe(c.index, now);
-
-        if obs.novel {
-            stats.novel += 1;
-        }
-
-        if !obs.triggered {
+        if !v.fired {
             return Decision::Pass {
                 country: c.iso,
-                novel: obs.novel,
+                novel: v.first_time,
             };
         }
         if mode.is_learning(now) {
             stats.would_block += 1;
             return Decision::WouldBlock {
                 country: c.iso,
-                novel_in_window: obs.novel_in_window,
+                bits,
+                countries: v.countries,
             };
         }
         stats.blocks += 1;
         Decision::Block {
             country: c.iso,
-            novel_in_window: obs.novel_in_window,
+            bits,
+            countries: v.countries,
         }
     }
 }
@@ -776,7 +629,7 @@ mod tests {
             e.observe(peer(), &invite("1001", "00442039967796"), t(1)),
             Decision::OutOfScope("behavioural detection off")
         ));
-        assert_eq!(e.pair_count(), 0, "no behavioural state when it is off");
+        assert_eq!(e.source_count(), 0, "no behavioural state when it is off");
     }
 
     fn t(s: u32) -> Timestamp {
@@ -788,8 +641,7 @@ mod tests {
         let mut e = engine();
         let d = e.observe(peer(), &invite("200", "2005"), t(0));
         assert!(matches!(d, Decision::OutOfScope(_)));
-        // It touched no state at all: neither pair nor peer.
-        assert_eq!(e.pair_count(), 0);
+        // The cheapest filter: it never reached the international path.
         assert_eq!(e.stats.international, 0);
     }
 
@@ -816,216 +668,40 @@ mod tests {
     }
 
     #[test]
-    fn ten_first_time_countries_in_an_hour_block() {
-        let mut e = engine();
-        let destinations = [
-            "00252612345678", // SO
-            "00371234567",    // LV
-            "0038761234567",  // BA
-            "0022012345678",  // GM
-            "002451234567",   // GW
-            "009601234567",   // MV
-            "0053512345678",  // CU
-            "002241234567",   // GN
-            "0021612345678",  // TN
-            "0037112345678",  // repeats LV on purpose: only 9 distinct countries
-        ];
-        let mut last = None;
-        for (i, d) in destinations.iter().enumerate() {
-            last = Some(e.observe(peer(), &invite("200", d), t(i as u32 * 60)));
-        }
-        // The tenth destination repeats Latvia, so only 9 first-time countries: no fire.
-        assert!(matches!(last, Some(Decision::Pass { .. })));
-
-        // One genuinely new country closes the count.
-        let d = e.observe(peer(), &invite("200", "0038912345678"), t(700));
-        assert!(
-            matches!(d, Decision::Block { .. }),
-            "expected a block, got {d:?}"
-        );
-        assert_eq!(e.stats.blocks, 1);
-    }
-
-    #[test]
-    fn learning_mode_does_not_block_but_records() {
+    fn learning_mode_records_would_block_not_block() {
+        // A scanner burst under learning mode is recorded, never enforced.
         let mut e = Engine::new(DialPlan::new(["00"]), Mode::Learning { until: t(100_000) })
             .with_behavioural();
-        let destinations = [
-            "00252612345678",
-            "00371234567",
-            "0038761234567",
-            "0022012345678",
-            "002451234567",
-            "009601234567",
-            "0053512345678",
-            "002241234567",
-            "0021612345678",
-            "0038912345678",
-        ];
-        let mut last = None;
-        for (i, d) in destinations.iter().enumerate() {
-            last = Some(e.observe(peer(), &invite("200", d), t(i as u32 * 60)));
-        }
-        assert!(
-            matches!(last, Some(Decision::WouldBlock { .. })),
-            "learning mode only records, got {last:?}"
-        );
-        assert_eq!(e.stats.blocks, 0);
-        assert_eq!(e.stats.would_block, 1);
-    }
-
-    #[test]
-    fn different_pairs_do_not_add_up_together() {
-        // Accumulation is per (peer, A-number) pair. Ten extensions each debuting one
-        // country is normal office traffic, not fraud.
-        let mut e = engine();
-        let destinations = [
-            "00252612345678",
-            "00371234567",
-            "0038761234567",
-            "0022012345678",
-            "002451234567",
-            "009601234567",
-            "0053512345678",
-            "002241234567",
-            "0021612345678",
-            "0038912345678",
-        ];
-        for (i, d) in destinations.iter().enumerate() {
-            let extension = format!("2{i:02}");
-            let dec = e.observe(peer(), &invite(&extension, d), t(i as u32 * 60));
-            assert!(
-                matches!(dec, Decision::Pass { .. }),
-                "extension {extension}: {dec:?}"
-            );
-        }
-        assert_eq!(e.pair_count(), 10);
-        assert_eq!(e.stats.blocks, 0);
-    }
-
-    #[test]
-    fn a_number_rotation_does_not_grow_without_bound() {
-        // The attack SPEC §5 describes as expected: a new A-number on every call. Without
-        // a ceiling this would kill the process on memory — a DoS vector described in the
-        // product's own specification.
-        let mut e = engine();
-        for i in 0..(MAX_PAIRS_PER_PEER + 5_000) {
-            let a = format!("spoof{i}");
-            // All in the same window, so pruning cannot remove them.
-            e.observe(peer(), &invite(&a, "00551199998888"), t(0));
-        }
-        assert!(
-            e.pair_count() <= MAX_PAIRS_PER_PEER,
-            "ceiling exceeded: {} pairs",
-            e.pair_count()
-        );
-        assert!(e.stats.pairs_dropped > 0, "refusals must be counted");
-    }
-
-    #[test]
-    fn after_the_attack_pruning_returns_space_to_newcomers() {
-        // A rotation attack fills the ceiling within one window. When the window passes
-        // and a genuinely new pair shows up, pruning clears the ones that never returned —
-        // the system recovers on its own, with no background sweep.
-        let mut e = engine();
-        for i in 0..MAX_PAIRS_PER_PEER {
-            e.observe(
-                peer(),
-                &invite(&format!("spoof{i}"), "00551199998888"),
-                t(0),
-            );
-        }
-        assert_eq!(
-            e.pair_count(),
-            MAX_PAIRS_PER_PEER,
-            "the attack must fill the ceiling"
-        );
-
-        // Two windows later a genuinely new customer arrives.
-        let dec = e.observe(
-            peer(),
-            &invite("new-customer", "00551199998888"),
-            t(crate::novelty::WINDOW_SECS * 2),
-        );
-        assert!(matches!(dec, Decision::Pass { .. }), "got {dec:?}");
-        assert!(
-            e.pair_count() < 10,
-            "pruning should have swept the ephemeral ones; {} remain",
-            e.pair_count()
-        );
-    }
-
-    #[test]
-    fn estimated_memory_is_reportable() {
-        let mut e = engine();
-        for i in 0..100 {
-            e.observe(peer(), &invite(&format!("r{i}"), "00551199998888"), t(0));
-        }
-        assert!(e.approx_state_bytes() > 0);
-
-        // The worst case has to fit the unit's MemoryMax=192M. The previous version of
-        // this test computed the ceiling, observed it was 80 GB, and asserted `> 0` — it
-        // documented the problem instead of failing on it.
-        const MEMORY_MAX: usize = 192 * 1024 * 1024;
-        const PER_PAIR: usize = MAX_A_NUMBER_LEN + 104 + 48;
-        const PER_PEER: usize = 256 + MAX_PENDING_PER_PEER * (128 + 8 + 48) + 240 * 12;
-        let ceiling = MAX_PEERS * PER_PEER + MAX_PAIRS_TOTAL * PER_PAIR;
-        assert!(
-            ceiling < MEMORY_MAX,
-            "worst-case state is {} MB, above the unit's {} MB limit",
-            ceiling / 1_048_576,
-            MEMORY_MAX / 1_048_576
-        );
-    }
-
-    #[test]
-    fn an_over_long_a_number_cannot_multiply_the_pair_ceiling() {
-        // The `From` user part is attacker-controlled and a datagram can carry tens of
-        // kilobytes of it. Unbounded, each pair would cost that much instead of ~64 bytes.
-        let mut e = engine();
-        let long = "9".repeat(40_000);
-        let payload = invite(&long, "00442039967796");
-        assert!(matches!(
-            e.observe(peer(), &payload, t(0)),
-            Decision::Pass { .. }
-        ));
-        let stored = e.export_pairs().next().expect("the pair was learned");
-        assert_eq!(stored.a_number.len(), MAX_A_NUMBER_LEN);
-    }
-
-    #[test]
-    fn the_global_pair_ceiling_bounds_the_sum_of_all_peers() {
-        // The per-peer ceiling stops one peer starving the others; only the global one
-        // stops the sum starving the machine.
-        let mut e = engine();
-        for p in 0..40u8 {
-            let peer = Ipv4Addr::new(10, 0, 0, p);
-            for i in 0..6_000 {
-                let payload = invite(&format!("a{p}-{i}"), "00442039967796");
-                e.observe(peer, &payload, t(i));
+        let mut saw_would = false;
+        for i in 0..30u16 {
+            // a fresh country each call, one per minute — a scan
+            let dest = format!("00{}12345678", 30 + i); // varied country codes
+            let d = e.observe(peer(), &invite("200", &dest), t(i as u32 * 60));
+            if matches!(d, Decision::WouldBlock { .. }) {
+                saw_would = true;
             }
+            assert!(
+                !matches!(d, Decision::Block { .. }),
+                "learning must not block"
+            );
         }
-        assert!(
-            e.pair_count() <= MAX_PAIRS_TOTAL,
-            "learned {} pairs, above the global ceiling",
-            e.pair_count()
-        );
-        assert!(e.stats.pairs_dropped > 0, "and it reported refusing them");
+        assert!(saw_would, "the scan should have produced a WouldBlock");
+        assert_eq!(e.stats.blocks, 0);
     }
 
     #[test]
-    fn the_pair_sweep_cannot_be_triggered_on_every_packet() {
-        // Sweeping per packet gave an attacker rotating A-numbers an O(n) cost per packet:
-        // 75.7 us against 7.7 us for ordinary traffic on the reference hardware.
-        let mut e = engine();
-        let p = peer();
-        for i in 0..(MAX_PAIRS_PER_PEER as u32 + 500) {
-            let payload = invite(&format!("rot{i}"), "00442039967796");
-            e.observe(p, &payload, t(i / 1000));
+    fn a_country_scan_burst_blocks_when_active() {
+        // The scanning phase: many distinct countries in minutes -> a block.
+        let mut e = engine(); // active + behavioural
+        let mut blocked = false;
+        for i in 0..30u16 {
+            let dest = format!("00{}12345678", 30 + i);
+            blocked |= matches!(
+                e.observe(peer(), &invite("200", &dest), t(i as u32 * 60)),
+                Decision::Block { .. }
+            );
         }
-        // Every packet past the ceiling arrives inside one PRUNE_INTERVAL_SECS window, so
-        // at most one sweep may have run.
-        assert!(e.pair_count() <= MAX_PAIRS_TOTAL);
+        assert!(blocked, "a rapid multi-country scan must block");
     }
 
     #[test]

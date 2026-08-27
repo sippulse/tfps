@@ -19,9 +19,8 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tfps::say;
-use tfps::store::{BlockRow, PairFilter, Store};
+use tfps::store::{BlockRow, SourceFilter, Store};
 use tfps::xdp::{monotonic_ns, Blocklist};
-use tfps_core::country;
 
 fn usage() -> String {
     format!(
@@ -34,17 +33,16 @@ USAGE: tfps_ctl <command> [options]
   banned [--why]               list condemned sources, with time left
   unban <ip>... | --all        lift a block. The precision measure of this product
   ban <ip> [--ttl N]           condemn a source by hand (default ttl: 3600s, 0 = forever)
-  pairs [filters]              list learned (peer, A-number) pairs
-  pair <peer> <a-number>       everything known about one pair
-  peers                        peers, their pair counts and when last heard
-  countries <peer>             where that peer actually calls, by volume
+  sources [filters]            list learned sources and the countries they call
+  source <peer>                everything known about one source
+  peers                        sources by country breadth, when last heard
+  countries <peer>             the countries a source has been seen to call
   log [--limit N] [--ip IP]    the block audit log, newest first
   forget <peer> [--a NUMBER]   erase learned state (requires tfps stopped)
 
-PAIR FILTERS:
+SOURCE FILTERS:
   --peer IP                    exactly this peer
-  --a TEXT                     A-number containing TEXT
-  --country ISO                pairs that have called this country, e.g. --country GB
+  --country ISO                sources that have called this country, e.g. --country GB
   --limit N                    stop after N rows (default 50)
 
 GLOBAL:
@@ -146,8 +144,8 @@ fn main() -> ExitCode {
         "banned" => banned(&args),
         "unban" => unban(&args),
         "ban" => ban(&args),
-        "pairs" => pairs(&args),
-        "pair" => pair(&args),
+        "sources" => sources(&args),
+        "source" => source(&args),
         "peers" => peers(&args),
         "countries" => countries(&args),
         "log" => log(&args),
@@ -367,77 +365,68 @@ fn ban(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-fn pairs(args: &Args) -> Result<(), String> {
+fn sources(args: &Args) -> Result<(), String> {
     let s = Store::open_readonly(&args.db)?;
-    let f = PairFilter {
+    let f = SourceFilter {
         peer: args.peer.as_deref(),
-        a_number: args.a_number.as_deref(),
         country: args.country.as_deref(),
         limit: args.limit,
     };
-    let rows = s.find_pairs(&f)?;
+    let rows = s.find_sources(&f)?;
     if rows.is_empty() {
-        say!("no pair matches");
+        say!("no source matches");
         return Ok(());
     }
-    say!(
-        "{:<16} {:<22} {:>6} {:>9}  COUNTRIES",
-        "PEER",
-        "A-NUMBER",
-        "SEEN",
-        "LAST"
-    );
+    say!("{:<16} {:>8} {:>9}  COUNTRIES", "PEER", "COUNTRIES", "LAST");
     let now = now();
     for r in &rows {
         let c = r.countries();
-        let shown: Vec<&str> = c.iter().take(8).copied().collect();
+        let shown: Vec<&str> = c.iter().take(10).copied().collect();
         let tail = if c.len() > shown.len() {
             format!(" +{}", c.len() - shown.len())
         } else {
             String::new()
         };
         say!(
-            "{:<16} {:<22} {:>6} {:>9}  {}{}",
+            "{:<16} {:>8} {:>9}  {}{}",
             r.peer,
-            truncate(&r.a_number, 22),
-            c.len(),
+            r.n_countries,
             ago(now.saturating_sub(r.last_seen)),
             shown.join(","),
             tail
         );
     }
-    say!("\n{} pairs", rows.len());
+    say!("\n{} sources", rows.len());
     Ok(())
 }
 
-fn pair(args: &Args) -> Result<(), String> {
-    let [peer, a_number] = args.positional.as_slice() else {
-        return Err("usage: tfps_ctl pair <peer> <a-number>".into());
+fn source(args: &Args) -> Result<(), String> {
+    let [peer] = args.positional.as_slice() else {
+        return Err("usage: tfps_ctl source <peer>".into());
     };
     let s = Store::open_readonly(&args.db)?;
-    let rows = s.find_pairs(&PairFilter {
+    let rows = s.find_sources(&SourceFilter {
         peer: Some(peer),
         limit: usize::MAX,
         ..Default::default()
     })?;
-    let Some(r) = rows.iter().find(|r| r.a_number == *a_number) else {
-        return Err(format!("no pair {peer} / {a_number} in the database"));
+    let Some(r) = rows.first() else {
+        return Err(format!("no source {peer} in the database"));
     };
     let c = r.countries();
     say!("peer              : {}", r.peer);
-    say!("a-number          : {}", r.a_number);
     say!(
         "last seen         : {} ago",
         ago(now().saturating_sub(r.last_seen))
     );
-    say!("rotation period   : {}", r.period);
+    say!("learned rate      : {:.2} intl calls / window", r.rate_a);
     say!("countries known   : {}", c.len());
     for chunk in c.chunks(12) {
         say!("                    {}", chunk.join(" "));
     }
     say!(
-        "\nA first-time country here is one absent from that list. Ten of them within an\n\
-         hour is what condemns the pair."
+        "\nThe detector fires when a source's evidence — a burst of novel countries, \
+         several prefixes, or a volume spike against this baseline — crosses the bound."
     );
     Ok(())
 }
@@ -449,24 +438,19 @@ fn peers(args: &Args) -> Result<(), String> {
         say!("no peer learned yet");
         return Ok(());
     }
-    say!("{:<16} {:>7} {:>9}  TOP COUNTRIES", "PEER", "PAIRS", "LAST");
+    say!("{:<16} {:>9} {:>9}  COUNTRIES", "PEER", "COUNTRIES", "LAST");
     let now = now();
-    for (peer, pairs, last) in rows.iter().take(args.limit) {
-        let top: Vec<String> = s
-            .peer_countries(peer)?
-            .into_iter()
-            .take(5)
-            .filter_map(|(idx, calls)| country::iso_for_index(idx).map(|c| format!("{c}:{calls}")))
-            .collect();
+    for (peer, ncoun, last) in rows.iter().take(args.limit) {
+        let seen: Vec<&str> = s.peer_countries(peer).unwrap_or_default();
         say!(
-            "{:<16} {:>7} {:>9}  {}",
+            "{:<16} {:>9} {:>9}  {}",
             peer,
-            pairs,
+            ncoun,
             ago(now.saturating_sub(*last)),
-            top.join(" ")
+            seen.iter().take(6).copied().collect::<Vec<_>>().join(" ")
         );
     }
-    say!("\n{} peers", rows.len());
+    say!("\n{} sources", rows.len());
     Ok(())
 }
 
@@ -475,24 +459,14 @@ fn countries(args: &Args) -> Result<(), String> {
         return Err("usage: tfps_ctl countries <peer>".into());
     };
     let s = Store::open_readonly(&args.db)?;
-    let rows = s.peer_countries(peer)?;
-    if rows.is_empty() {
-        return Err(format!("nothing learned for peer {peer}"));
+    let names = s.peer_countries(peer)?;
+    if names.is_empty() {
+        return Err(format!("nothing learned for source {peer}"));
     }
-    let total: u32 = rows.iter().map(|(_, n)| *n).sum();
-    say!("{:<10} {:>8} {:>7}", "COUNTRY", "CALLS", "SHARE");
-    for (idx, calls) in rows.iter().take(args.limit) {
-        say!(
-            "{:<10} {:>8} {:>6.1}%",
-            country::iso_for_index(*idx).unwrap_or("?"),
-            calls,
-            100.0 * f64::from(*calls) / f64::from(total.max(1))
-        );
+    say!("{peer} has been seen to call {} countries:", names.len());
+    for chunk in names.chunks(16) {
+        say!("  {}", chunk.join(" "));
     }
-    say!(
-        "\n{total} international calls across {} countries",
-        rows.len()
-    );
     Ok(())
 }
 
@@ -558,14 +532,6 @@ fn ago(secs: u32) -> String {
     }
 }
 
-fn truncate(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
-        return s.to_string();
-    }
-    let keep: String = s.chars().take(width.saturating_sub(1)).collect();
-    format!("{keep}…")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,7 +568,7 @@ mod tests {
     fn an_option_with_no_value_is_an_error_not_a_default() {
         // Silently defaulting would make `--limit` at the end of a line mean something the
         // operator did not ask for.
-        assert!(args(&["pairs", "--limit"]).is_err());
+        assert!(args(&["sources", "--limit"]).is_err());
         assert!(args(&["banned", "--bogus"]).is_err());
     }
 
@@ -634,11 +600,5 @@ mod tests {
             hits, 0,
             "use say!() instead of {needle}) so a closed pipe ends the run instead of panicking"
         );
-    }
-
-    #[test]
-    fn long_a_numbers_are_truncated_not_wrapped() {
-        assert_eq!(truncate("1001", 8), "1001");
-        assert_eq!(truncate("123456789012", 8), "1234567…");
     }
 }

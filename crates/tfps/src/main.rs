@@ -819,11 +819,11 @@ fn main() -> ExitCode {
 
 fn report(dec: &Decision, peer: Ipv4Addr, verbose: bool) {
     match dec {
-        Decision::Block { country, novel_in_window } => say!(
-            "BLOCK peer={peer} country={country} first_time_in_window={novel_in_window}"
+        Decision::Block { country, bits, countries } => say!(
+            "BLOCK peer={peer} country={country} evidence={bits}bits distinct_countries={countries}"
         ),
-        Decision::WouldBlock { country, novel_in_window } => say!(
-            "WOULD BLOCK (learning) peer={peer} country={country} first_time_in_window={novel_in_window}"
+        Decision::WouldBlock { country, bits, countries } => say!(
+            "WOULD BLOCK (learning) peer={peer} country={country} evidence={bits}bits distinct_countries={countries}"
         ),
         Decision::Noise { signature } if verbose => {
             say!("noise peer={peer} signature={signature}")
@@ -899,7 +899,7 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
     };
     say!(
         "--- mode={mode_label} packets={} sip={} responses={} keepalive={} not_sip={} noise={} ({}%) injection={} auth_att={} auth_fail={} auth_ok={} auth_chal={} auth_volume={} invites={} intl={} \
-         unknown_country={} first_time={} blocks={} would_block={} peers={} pairs={} ports={:?}",
+         unknown_country={} first_time={} blocks={} would_block={} sources={} ports={:?}",
         s.packets,
         s.sip_parsed,
         s.responses,
@@ -922,8 +922,7 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
         s.novel,
         s.blocks,
         s.would_block,
-        e.peer_count(),
-        e.pair_count(),
+        e.source_count(),
         ports
     );
 }
