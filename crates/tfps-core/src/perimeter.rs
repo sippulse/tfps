@@ -58,6 +58,50 @@ static INJECTION: &[&str] = &[
     "select", ";", // command separator outside a parameter
 ];
 
+/// Scanner **identities** — markers that give a scanning source away in its `From`, `To`,
+/// `Contact` or Request-URI, not in its `User-Agent`. Two kinds live here: research scanners
+/// that **self-identify** (Censys, Shodan, LeakIX and friends publish who they are so people
+/// can opt out — a real caller is never `@censys.io`), and tool/service domains that only a
+/// scanner uses. Matched case-insensitively as a substring, so `censysinspect@censys.io`
+/// and `<sip:...@sip5060.net>` are both caught.
+///
+/// The bar for adding one: it must not appear in legitimate traffic. Domains and tool names
+/// clear it; a bare word like `test` or an extension like `100` does not, and is left out.
+static SCANNER_IDS: &[&str] = &[
+    // Research / measurement scanners that announce themselves.
+    "censys.io",
+    "censysinspect",
+    "shodan.io",
+    "shodan",
+    "leakix",
+    "l9scan",
+    "l9tcpid",
+    "internet-measurement.com",
+    "internetmeasurement",
+    "projectdiscovery",
+    "binaryedge",
+    "bufferover",
+    "rapid7",
+    "stretchoid",
+    "netsystemsresearch",
+    "onyphe",
+    // Scanning tools/services that show up in From/To/Contact.
+    "sip5060.net",
+    "sipvicious",
+    "friendly-scanner",
+    "friendly-request",
+    "sundayddr",
+    "sipcli",
+    "sipsak",
+    "sip-scan",
+    "siposkope",
+    "sipptk",
+    "vaxsipuseragent",
+    "iwar",
+    "warvox",
+    "siprecon",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Match {
     /// Starts with the signature. Covers `^sipcli`, `^friendly`, and so on.
@@ -80,6 +124,9 @@ pub struct NoiseFilter {
     /// Injection patterns added from a file.
     extra_injection: Vec<String>,
     injections: u64,
+    /// Scanner identity markers added from a file.
+    extra_scanners: Vec<String>,
+    scanner_hits: u64,
 }
 
 impl Default for NoiseFilter {
@@ -95,6 +142,8 @@ impl NoiseFilter {
             extra: Vec::new(),
             extra_injection: Vec::new(),
             injections: 0,
+            extra_scanners: Vec::new(),
+            scanner_hits: 0,
         }
     }
 
@@ -219,6 +268,46 @@ impl NoiseFilter {
 
     pub fn injections(&self) -> u64 {
         self.injections
+    }
+
+    /// Does any field (`From`, `To`, `Contact`, Request-URI) carry a known scanner identity?
+    ///
+    /// Applies to **every method** — scanners announce themselves in `OPTIONS` as readily as
+    /// in `INVITE` — and catches the self-identifying research scanners the user-agent list
+    /// misses, because their tell is the domain, not the UA (Censys, Shodan, LeakIX…).
+    pub fn scanner_id(&mut self, fields: &[Option<&str>]) -> Option<&'static str> {
+        for field in fields.iter().flatten() {
+            let lower = field.to_ascii_lowercase();
+            for id in SCANNER_IDS {
+                if lower.contains(id) {
+                    self.scanner_hits += 1;
+                    return Some(id);
+                }
+            }
+            for id in &self.extra_scanners {
+                if lower.contains(id.as_str()) {
+                    self.scanner_hits += 1;
+                    return Some("<file>");
+                }
+            }
+        }
+        None
+    }
+
+    /// Adds a scanner identity marker from a file (lower-cased for case-insensitive match).
+    pub fn add_scanner(&mut self, raw: &str) {
+        let raw = raw.trim();
+        if !raw.is_empty() && !raw.starts_with('#') {
+            self.extra_scanners.push(raw.to_ascii_lowercase());
+        }
+    }
+
+    pub fn scanner_count(&self) -> (usize, usize) {
+        (SCANNER_IDS.len(), self.extra_scanners.len())
+    }
+
+    pub fn scanner_hits(&self) -> u64 {
+        self.scanner_hits
     }
 
     /// Signatures that never matched — the candidates for being rotten.
@@ -566,6 +655,40 @@ mod tests {
                 "attack no longer detected: {uri}"
             );
         }
+    }
+
+    #[test]
+    fn self_identifying_scanners_are_caught_by_identity() {
+        let mut f = NoiseFilter::new();
+        // The user's real example: Censys OPTIONS, identified by From/To, not the UA.
+        assert_eq!(
+            f.scanner_id(&[
+                Some("sip:test.echo@sip5060.net"),
+                Some("<sip:censysinspect@censys.io>")
+            ]),
+            Some("sip5060.net")
+        );
+        assert!(f
+            .scanner_id(&[Some("\"censysinspect\" <sip:probe@censys.io>")])
+            .is_some());
+        assert!(f.scanner_id(&[Some("<sip:100@shodan.io>")]).is_some());
+        assert!(f
+            .scanner_id(&[Some("<sip:s@internet-measurement.com>")])
+            .is_some());
+        assert!(f.scanner_id(&[Some("<sip:x@sipvicious.pro>")]).is_some());
+        // A legitimate caller is not a scanner.
+        assert!(f
+            .scanner_id(&[
+                Some("sip:5511999998888@carrier.com"),
+                Some("<sip:1001@pbx.example.com>")
+            ])
+            .is_none());
+        let mut g = NoiseFilter::new();
+        g.add_scanner("mynewscanner.example");
+        assert_eq!(
+            g.scanner_id(&[Some("<sip:a@mynewscanner.example>")]),
+            Some("<file>")
+        );
     }
 
     #[test]

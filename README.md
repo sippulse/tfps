@@ -115,6 +115,12 @@ its next packets die at XDP and vanish from the capture.
   `;` inside the user part), matched against the `user@host` of the Request-URI, `From` and
   `To` only — never the display name, so an Irish surname is not mistaken for SQL injection.
   Higher confidence than a user-agent: no real phone puts a single quote in a `From` header.
+- **Scanner identity** — a known scanner domain or tool name in the `From`/`To`/`Contact`/
+  Request-URI, matched on **every method** (scanners probe with `OPTIONS` as much as
+  `INVITE`). This catches the self-identifying research scanners the user-agent list misses —
+  Censys announces itself as `censysinspect@censys.io`, and there are Shodan, LeakIX and the
+  rest, plus tool/service domains like `sip5060.net`. A real caller is never `@censys.io`.
+  Extend the built-in list with `scanners` in the config.
 - **Failed authentication** — see below.
 - **APIBAN** — the collaborative bad-IP list, if a key is configured.
 
@@ -242,6 +248,7 @@ integrations. Never **policy** configuration, which would say what fraud is.
 
   "signatures": ["MyLocalScanner", "=sipsak"],
   "injection": ["xp_cmdshell"],
+  "scanners": ["newscanner.example.com"],
   "ignoreip": ["10.0.0.0/8", "203.0.113.7"],
   "home_countries": ["BR"],
 

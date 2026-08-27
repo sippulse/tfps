@@ -274,6 +274,7 @@ fn now() -> Timestamp {
 fn main() -> ExitCode {
     let mut extra_signatures: Vec<String> = Vec::new();
     let mut extra_injection: Vec<String> = Vec::new();
+    let mut extra_scanners: Vec<String> = Vec::new();
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -290,6 +291,7 @@ fn main() -> ExitCode {
             // File signatures are applied after the engine exists; kept here until then.
             extra_signatures = c.signatures.clone();
             extra_injection = c.injection.clone();
+            extra_scanners = c.scanners.clone();
         }
         config::Loaded::Absent => {}
         config::Loaded::Broken(e) => {
@@ -348,6 +350,9 @@ fn main() -> ExitCode {
     for pat in &extra_injection {
         engine.noise_filter.add_injection(pat);
     }
+    for id in &extra_scanners {
+        engine.noise_filter.add_scanner(id);
+    }
     for (ip, plan) in &args.peer_plans {
         engine.declare_dial_plan(*ip, plan.clone());
     }
@@ -365,6 +370,9 @@ fn main() -> ExitCode {
                             engine.noise_filter.add_injection(rest);
                             inj += 1;
                         }
+                        Some(("scanner", rest)) => {
+                            engine.noise_filter.add_scanner(rest);
+                        }
                         _ => {
                             engine.noise_filter.add_signature(line);
                             ua += 1;
@@ -381,6 +389,7 @@ fn main() -> ExitCode {
     }
     let (ua_int, ua_ext) = engine.noise_filter.signature_count();
     let (inj_int, inj_ext) = engine.noise_filter.injection_count();
+    let (scan_int, scan_ext) = engine.noise_filter.scanner_count();
 
     if engine.behavioural_enabled() {
         if let Some(d) = db.as_ref() {
@@ -483,7 +492,7 @@ fn main() -> ExitCode {
     };
     say!(
         "  perimeter         : {ua_int} user-agents (+{ua_ext} from file), \
-         {inj_int} injection patterns (+{inj_ext})"
+         {inj_int} injection patterns (+{inj_ext}), {scan_int} scanner ids (+{scan_ext})"
     );
 
     // Never condemn the machine we are defending. This is not configurable, because the
@@ -672,6 +681,7 @@ fn main() -> ExitCode {
                     // before the libpcap tap, and vanish from sngrep.
                     let reason = match &dec {
                         Decision::Noise { signature } => Some(("user-agent", *signature)),
+                        Decision::Scanner { id } => Some(("scanner", *id)),
                         Decision::Injection { pattern } => Some(("injection", *pattern)),
                         Decision::AuthFailure { .. } => Some(("auth-failed", "rejected")),
                         Decision::AuthAbuse { .. } => Some(("auth-volume", "no-answer")),
@@ -930,6 +940,10 @@ fn report(dec: &Decision, peer: Ipv4Addr, verbose: bool) {
         Decision::Noise { signature } if verbose => {
             say!("noise peer={peer} signature={signature}")
         }
+        Decision::Scanner { id } => {
+            // Always visible: a self-identifying scanner is a clean, high-confidence catch.
+            say!("SCANNER peer={peer} id={id}")
+        }
         Decision::Injection { pattern } if verbose => {
             say!("injection peer={peer} pattern={pattern}")
         }
@@ -1006,7 +1020,7 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
         }
     };
     say!(
-        "--- mode={mode_label} packets={} sip={} responses={} keepalive={} not_sip={} noise={} ({}%) injection={} auth_att={} auth_fail={} auth_ok={} auth_chal={} auth_volume={} intl_ok={} intl_fail={} invites={} intl={} \
+        "--- mode={mode_label} packets={} sip={} responses={} keepalive={} not_sip={} noise={} ({}%) injection={} scanners={} auth_att={} auth_fail={} auth_ok={} auth_chal={} auth_volume={} intl_ok={} intl_fail={} invites={} intl={} \
          unknown_country={} first_time={} blocks={} would_block={} sources={} ports={:?}",
         s.packets,
         s.sip_parsed,
@@ -1019,6 +1033,7 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
             .and_then(|n| n.checked_div(s.sip_parsed))
             .unwrap_or(0),
         s.injections,
+        s.scanners,
         s.auth_attempts,
         s.auth_failures,
         s.auth_ok,

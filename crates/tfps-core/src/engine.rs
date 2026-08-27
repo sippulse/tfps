@@ -67,6 +67,10 @@ pub enum Decision {
     /// Perimeter noise: a scanning tool identified by its user-agent.
     /// Under enforcement this dies at `XDP_DROP` and vanishes from sngrep.
     Noise { signature: &'static str },
+    /// A scanner identified by its **identity** — a known scanner domain or tool name in the
+    /// `From`/`To`/`Contact`/Request-URI (Censys, Shodan, friendly-scanner…), regardless of
+    /// method. Also condemned to `XDP_DROP`.
+    Scanner { id: &'static str },
     /// An injection pattern in the URI. **Higher** confidence than a user-agent: a
     /// scanning tool can forge a legitimate UA, but no real phone puts a single quote or
     /// `--` in the `From` header.
@@ -107,6 +111,8 @@ pub struct Stats {
     pub noise: u64,
     /// URIs carrying an injection pattern — rule R12 of the 2023 TFPS, revived.
     pub injections: u64,
+    /// Sources condemned by a known scanner identity (Censys, Shodan, friendly-scanner…).
+    pub scanners: u64,
     /// Sources condemned by the volume backstop.
     pub auth_abuse: u64,
     /// Authenticated attempts observed — a credential was presented.
@@ -604,6 +610,20 @@ impl Engine {
             return Decision::Injection { pattern: pat };
         }
 
+        // A known scanner identity in From/To/Contact/Request-URI — self-identifying research
+        // scanners (Censys, Shodan) and tools whose tell is the domain, not the UA. Applies
+        // to every method: friendly-scanner and Censys both probe with OPTIONS, and this runs
+        // before the INVITE gate so those are caught.
+        if let Some(id) = self.noise_filter.scanner_id(&[
+            Some(req.request_uri),
+            req.from,
+            req.to,
+            req.p_asserted_identity,
+        ]) {
+            self.stats.scanners += 1;
+            return Decision::Scanner { id };
+        }
+
         // A credential was presented. The method is irrelevant — `REGISTER` is where a
         // password is stolen and `INVITE` is where it is spent, and both are challenged the
         // same way. What is recorded here is only the *attempt*; whether it was rejected is
@@ -800,6 +820,23 @@ mod tests {
         // The tests here exercise the behavioural path, so they opt into it. The default
         // engine is perimeter-only — covered by `perimeter_runs_with_behavioural_off`.
         Engine::new(DialPlan::new(["+", "00", "011", "9011"]), Mode::Active).with_behavioural()
+    }
+
+    #[test]
+    fn a_censys_options_probe_is_condemned_as_a_scanner() {
+        // The exact case: an OPTIONS from a self-identifying scanner. Caught even with
+        // behavioural off, and even though it is not an INVITE.
+        let mut e = Engine::new(DialPlan::new(["00"]), Mode::Active);
+        let probe = b"OPTIONS sip:test.echo@sip5060.net SIP/2.0\r\n\
+                      Via: SIP/2.0/UDP h;branch=z\r\n\
+                      From: \"censysinspect\" <sip:censysinspect@censys.io>;tag=t\r\n\
+                      To: <sip:test.echo@sip5060.net>\r\n\
+                      Call-ID: c\r\nCSeq: 1 OPTIONS\r\n\r\n";
+        assert!(matches!(
+            e.observe(peer(), probe, t(0)),
+            Decision::Scanner { .. }
+        ));
+        assert_eq!(e.stats.scanners, 1);
     }
 
     #[test]

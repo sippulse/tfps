@@ -68,6 +68,10 @@ pub struct Config {
     /// URI injection patterns that add to the built-in ones.
     #[serde(default)]
     pub injection: Vec<String>,
+    /// Scanner identity markers (domains or tool names) that **add** to the built-in list,
+    /// matched in the From/To/Contact/Request-URI — e.g. a new research scanner's domain.
+    #[serde(default)]
+    pub scanners: Vec<String>,
     /// Sources never enforced against, e.g. `["10.0.0.0/8"]`. Named after `fail2ban`'s
     /// field of the same purpose.
     ///
