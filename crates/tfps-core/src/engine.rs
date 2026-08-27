@@ -148,6 +148,14 @@ pub struct Stats {
 /// observation point — so this ceiling is far looser than the pair one.
 const MAX_PEERS: usize = 10_000;
 
+/// Ceiling on remembered known-good peers, to bound memory.
+const MAX_KNOWN_PEERS: usize = 50_000;
+
+/// How long a successful authentication keeps a peer exempt. Longer than any registration
+/// interval, so a peer that is briefly offline is not forgotten — but a customer who leaves
+/// eventually ages out.
+pub const KNOWN_PEER_TTL_SECS: u32 = 7 * 24 * 3600;
+
 /// A peer's durable detector state, as the store sees it.
 #[derive(Debug, Clone)]
 pub struct PeerAnomalyRecord {
@@ -235,6 +243,11 @@ pub struct Engine {
     /// E.164 — so it is out of scope for the behavioural layer. This is what keeps an
     /// inbound call to your own DID from being judged as an international destination.
     home_countries: std::collections::HashSet<u16>,
+    /// IPs that have **successfully authenticated** — registered peers. They are known-good
+    /// and must not be banned by the perimeter or the APIBAN feed: a customer on a dynamic
+    /// IP proved it holds valid credentials. Value is the last-auth instant, so a peer that
+    /// stops registering eventually ages out.
+    known_peers: std::collections::HashMap<Ipv4Addr, u32>,
     /// Whether behavioural fraud detection runs at all.
     ///
     /// **Off by default.** The product is noise reduction — the perimeter and its clean
@@ -257,6 +270,7 @@ impl Engine {
             mode,
             params: Params::default(),
             home_countries: std::collections::HashSet::new(),
+            known_peers: std::collections::HashMap::new(),
             behavioural: false,
             noise_filter: NoiseFilter::new(),
             stats: Stats::default(),
@@ -313,6 +327,30 @@ impl Engine {
 
     pub fn home_country_count(&self) -> usize {
         self.home_countries.len()
+    }
+
+    /// Is this a registered peer that authenticated within `KNOWN_PEER_TTL_SECS`? Such a
+    /// source is never banned — it proved it holds valid credentials.
+    pub fn is_known_peer(&self, ip: Ipv4Addr, now: Timestamp) -> bool {
+        self.known_peers
+            .get(&ip)
+            .is_some_and(|last| now.0.saturating_sub(*last) < KNOWN_PEER_TTL_SECS)
+    }
+
+    pub fn known_peer_count(&self) -> usize {
+        self.known_peers.len()
+    }
+
+    /// Known-good peers, for persistence — they must survive a restart so the APIBAN feed,
+    /// re-applied at boot, cannot knock a registered customer off before it re-registers.
+    pub fn export_known_peers(&self) -> impl Iterator<Item = (Ipv4Addr, u32)> + '_ {
+        self.known_peers.iter().map(|(ip, ts)| (*ip, *ts))
+    }
+
+    pub fn import_known_peer(&mut self, ip: Ipv4Addr, last_auth: u32) {
+        if self.known_peers.len() < MAX_KNOWN_PEERS {
+            self.known_peers.insert(ip, last_auth);
+        }
     }
 
     /// Refits the benign hypotheses and the volume prior from the deployment's own
@@ -486,6 +524,12 @@ impl Engine {
             if r.is_success() {
                 self.stats.auth_ok += 1;
                 st.auth_failures.clear();
+                // A successful authentication marks this source a known-good registered
+                // peer, exempt from banning — the dynamic equivalent of `ignoreip`.
+                if self.known_peers.len() < MAX_KNOWN_PEERS || self.known_peers.contains_key(&peer)
+                {
+                    self.known_peers.insert(peer, now.0);
+                }
                 return Decision::OutOfScope("SIP response");
             }
             if r.is_digest_challenge() {
@@ -1032,6 +1076,22 @@ mod tests {
             "the fifth rejected password must condemn: {d:?}"
         );
         assert_eq!(e.stats.auth_failures, 5);
+    }
+
+    #[test]
+    fn a_successful_auth_marks_a_known_good_registered_peer() {
+        // pedro registers from a dynamic IP: REGISTER with credentials, 200 OK. That IP is
+        // now a known-good peer and must be exempt from banning.
+        let mut e = engine();
+        assert!(!e.is_known_peer(peer(), t(0)));
+        exchange(&mut e, 1, true, 200, 0); // authenticated REGISTER -> 200
+        assert!(
+            e.is_known_peer(peer(), t(1)),
+            "an authenticated peer is known-good"
+        );
+        assert_eq!(e.known_peer_count(), 1);
+        // It ages out after the TTL if it stops registering.
+        assert!(!e.is_known_peer(peer(), Timestamp(t(0).0 + KNOWN_PEER_TTL_SECS + 1)));
     }
 
     #[test]

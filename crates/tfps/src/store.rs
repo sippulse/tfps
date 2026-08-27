@@ -126,7 +126,14 @@ impl Store {
             .unwrap_or(0);
         if found != 0 && found != SCHEMA {
             // Incompatible schema: start over. See the note on `SCHEMA`.
-            for t in ["peer_anomaly", "pair", "peer_country", "meta", "block_log"] {
+            for t in [
+                "peer_anomaly",
+                "known_peer",
+                "pair",
+                "peer_country",
+                "meta",
+                "block_log",
+            ] {
                 let _ = self.conn.execute(&format!("DROP TABLE IF EXISTS {t}"), []);
             }
         }
@@ -158,6 +165,13 @@ impl Store {
                  -- minutes (`SPEC.md` 10); this is the exception, since the feed is
                  -- consumed through a forward-only cursor. Losing it would mean the
                  -- integration silently protects nothing after a restart.
+                 -- Registered peers that authenticated — known-good, never banned even by
+                 -- the APIBAN feed re-applied at boot. This is what protects a customer on a
+                 -- dynamic IP; it must persist so a restart does not knock them off.
+                 CREATE TABLE IF NOT EXISTS known_peer (
+                     ip        TEXT    PRIMARY KEY,
+                     last_auth INTEGER NOT NULL
+                 );
                  CREATE TABLE IF NOT EXISTS apiban_ip (
                      ip TEXT PRIMARY KEY,
                      ts INTEGER NOT NULL
@@ -221,6 +235,54 @@ impl Store {
             .query_map(params![since], |r| r.get::<_, String>(0))
             .map_err(|e| format!("iterating apiban_ip: {e}"))?;
         Ok(rows.flatten().filter_map(|s| s.parse().ok()).collect())
+    }
+
+    /// Persists the known-good registered peers.
+    pub fn save_known_peers(
+        &mut self,
+        peers: impl Iterator<Item = (std::net::Ipv4Addr, u32)>,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("transaction: {e}"))?;
+        {
+            let mut ins = tx
+                .prepare_cached("INSERT OR REPLACE INTO known_peer (ip, last_auth) VALUES (?1, ?2)")
+                .map_err(|e| format!("preparing known_peer: {e}"))?;
+            for (ip, ts) in peers {
+                ins.execute(params![ip.to_string(), ts])
+                    .map_err(|e| format!("writing known_peer: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| format!("commit: {e}"))
+    }
+
+    /// Loads the known-good peers newer than `since`, as (ip, last_auth).
+    pub fn known_peers_since(&self, since: u32) -> Result<Vec<(std::net::Ipv4Addr, u32)>, String> {
+        let mut st = self
+            .conn
+            .prepare("SELECT ip, last_auth FROM known_peer WHERE last_auth >= ?1")
+            .map_err(|e| format!("reading known_peer: {e}"))?;
+        let rows = st
+            .query_map(params![since], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?))
+            })
+            .map_err(|e| format!("iterating known_peer: {e}"))?;
+        Ok(rows
+            .flatten()
+            .filter_map(|(ip, ts)| ip.parse().ok().map(|ip| (ip, ts)))
+            .collect())
+    }
+
+    /// Drops known peers that have not authenticated within the retention window.
+    pub fn known_peers_prune(&self, older_than: u32) -> usize {
+        self.conn
+            .execute(
+                "DELETE FROM known_peer WHERE last_auth < ?1",
+                params![older_than],
+            )
+            .unwrap_or(0)
     }
 
     /// Every address currently on the APIBAN feed, for attributing a block to it.

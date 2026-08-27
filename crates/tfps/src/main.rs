@@ -558,6 +558,28 @@ fn main() -> ExitCode {
         apiban::spawn(k.clone(), resume)
     });
 
+    // Load the known-good registered peers first, so the APIBAN restore below never blocks
+    // one. This runs in prevention mode too — it is perimeter state, not behavioural.
+    if let Some(s) = db.as_ref() {
+        match s.known_peers_since(
+            start
+                .0
+                .saturating_sub(tfps_core::engine::KNOWN_PEER_TTL_SECS),
+        ) {
+            Ok(peers) if !peers.is_empty() => {
+                for (ip, ts) in &peers {
+                    engine.import_known_peer(*ip, *ts);
+                }
+                say!(
+                    "  registered peers  : {} known-good, exempt from banning",
+                    peers.len()
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("WARNING: could not load known peers: {e}"),
+        }
+    }
+
     // Re-apply what the feed already gave us. The map died with the previous process and
     // the feed cursor only moves forward, so without this the integration would come back
     // up protecting nothing — and would look perfectly healthy while doing it.
@@ -568,7 +590,7 @@ fn main() -> ExitCode {
                 Ok(ips) => {
                     let (mut restored, mut failed) = (0u64, 0u64);
                     for ip in ips {
-                        if ignoreip.exempt(ip).is_some() {
+                        if ignoreip.exempt(ip).is_some() || engine.is_known_peer(ip, start) {
                             continue;
                         }
                         match e.block(ip, 0) {
@@ -660,6 +682,14 @@ fn main() -> ExitCode {
                         // Judged, reported, not enforced. Staying silent here would hide a
                         // compromised trusted peer, which is when it matters most.
                         say!("EXEMPT peer={subject} reason={kind} detail={detail} ignoreip={rule}");
+                    } else if let (Some((kind, detail)), true) =
+                        (reason, engine.is_known_peer(subject, t))
+                    {
+                        // A registered peer that authenticated is known-good — never banned,
+                        // whatever a signature or the feed says. The dynamic ignoreip.
+                        say!(
+                            "EXEMPT peer={subject} reason={kind} detail={detail} (registered peer)"
+                        );
                     } else if let (Some((kind, detail)), Some(e)) = (reason, enforcer.as_mut()) {
                         match e.block(subject, args.block_ttl) {
                             Ok(()) => {
@@ -725,8 +755,13 @@ fn main() -> ExitCode {
                     // list is for: it is curated, but it is not yours.
                     if let Some(rule) = ignoreip.exempt(ip) {
                         say!("APIBAN: {ip} not blocked, ignoreip={rule}");
-                        // Counted out as well as skipped: reporting it as condemned would
-                        // overstate what the feed actually did.
+                        n -= 1;
+                        continue;
+                    }
+                    if engine.is_known_peer(ip, t) {
+                        // A registered customer's IP on the feed: it proved valid
+                        // credentials, so we do not knock it off.
+                        say!("APIBAN: {ip} not blocked, it is a registered peer");
                         n -= 1;
                         continue;
                     }
@@ -763,6 +798,11 @@ fn main() -> ExitCode {
                 // both apply whether or not behavioural detection is on.
                 s.prune_log(t.0.saturating_sub(90 * 24 * 3600));
                 s.apiban_prune(t.0.saturating_sub(APIBAN_RETENTION_SECS));
+                // Known-good peers persist in every mode — they are perimeter protection.
+                if let Err(e) = s.save_known_peers(engine.export_known_peers()) {
+                    eprintln!("WARNING: could not persist known peers: {e}");
+                }
+                s.known_peers_prune(t.0.saturating_sub(tfps_core::engine::KNOWN_PEER_TTL_SECS));
                 // Only the behavioural layer has learned state worth persisting.
                 if engine.behavioural_enabled() {
                     // Refit the benign hypotheses and the volume prior from the traffic seen
