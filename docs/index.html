@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="TFPS is an open-source SIP defense that detects scanners and brute force on the wire, then drops attackers in the Linux kernel before they reach sngrep."
+    />
+    <meta name="theme-color" content="#0c1722" />
+    <meta property="og:title" content="TFPS — SIP defense at wire speed" />
+    <meta
+      property="og:description"
+      content="A small, self-hosted Telephony Fraud Prevention System for Linux SIP networks."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="https://tfps.co/assets/tfps-logo.jpg" />
+    <title>TFPS — SIP defense at wire speed</title>
+    <link rel="icon" href="assets/tfps-logo.jpg" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="TFPS home">TFPS</a>
+      <nav aria-label="Primary navigation">
+        <a href="#how">How it works</a>
+        <a href="#install">Install</a>
+        <a href="https://github.com/sippulse/tfps/wiki">Docs</a>
+        <a class="nav-cta" href="https://github.com/sippulse/tfps">GitHub ↗</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero section-shell">
+        <div class="hero-copy">
+          <p class="eyebrow"><span></span> Open source · self-hosted · Linux</p>
+          <h1>Make hostile SIP traffic disappear.</h1>
+          <p class="lede">
+            TFPS reads SIP directly from the wire, identifies scanners and brute-force
+            sources, and drops them at XDP—before they reach your softswitch, logs, or
+            packet capture.
+          </p>
+          <div class="actions">
+            <a class="button primary" href="#install">Get started</a>
+            <a class="button secondary" href="https://github.com/sippulse/tfps">View source ↗</a>
+          </div>
+          <ul class="proof" aria-label="Project highlights">
+            <li><strong>≈ 4.3 MB</strong><span>static binary</span></li>
+            <li><strong>0 ports</strong><span>bound by TFPS</span></li>
+            <li><strong>Kernel-level</strong><span>enforcement</span></li>
+          </ul>
+        </div>
+        <div class="hero-mark" aria-label="TFPS Telephony Fraud Prevention Service logo">
+          <img src="assets/tfps-logo.jpg" alt="TFPS — Telephony Fraud Prevention Service" />
+        </div>
+      </section>
+
+      <section class="signal-strip" aria-label="Packet path">
+        <div class="section-shell packet-path">
+          <span>NIC</span><i>→</i><strong>XDP <small>DROP HERE</small></strong><i>→</i>
+          <span>sngrep / tcpdump</span><i>→</i><span>softswitch</span>
+        </div>
+      </section>
+
+      <section id="how" class="section-shell how">
+        <div class="section-heading">
+          <p class="eyebrow">Two layers, one binary</p>
+          <h2>Useful from the first packet.</h2>
+          <p>
+            Prevention is on by default. Behavioural detection is an explicit,
+            experimental second layer for compromised downstream PBXs.
+          </p>
+        </div>
+        <div class="feature-grid">
+          <article class="feature-card featured">
+            <p class="card-number">01 / DEFAULT</p>
+            <h3>Perimeter prevention</h3>
+            <p>
+              Recognizes scanner identities, hostile URI shapes, rejected credentials,
+              registration sweeps, and optional APIBAN sources.
+            </p>
+            <ul>
+              <li>Works without a learning period</li>
+              <li>No softswitch log configuration</li>
+              <li>Temporary, inspectable blocks</li>
+            </ul>
+          </article>
+          <article class="feature-card">
+            <p class="card-number">02 / EXPERIMENTAL</p>
+            <h3>Behavioural detection</h3>
+            <p>
+              Learns each source’s international calling pattern and reports anomalous
+              scans and volume—even when the attacker has valid credentials.
+            </p>
+            <ul>
+              <li>Opt-in with <code>--behavioural</code></li>
+              <li>30-day learning window by default</li>
+              <li>Detection and reporting today</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="why">
+        <div class="section-shell why-grid">
+          <div>
+            <p class="eyebrow">Built for operators</p>
+            <h2>Not another service in the call path.</h2>
+          </div>
+          <div class="reasons">
+            <article>
+              <b>01</b>
+              <div><h3>No cloud dependency</h3><p>One local binary, SQLite, and the Linux kernel. Your SIP stays on your network.</p></div>
+            </article>
+            <article>
+              <b>02</b>
+              <div><h3>No UDP bind</h3><p>AF_PACKET observes traffic without competing with your PBX or proxy for port 5060.</p></div>
+            </article>
+            <article>
+              <b>03</b>
+              <div><h3>Visible decisions</h3><p>Inspect blocks, reasons, counters, and learned state with <code>tfps_ctl</code>.</p></div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="install" class="section-shell install">
+        <div class="section-heading">
+          <p class="eyebrow">Build and install</p>
+          <h2>Small enough to understand.</h2>
+          <p>TFPS targets Linux kernel 5.15 or newer with BTF. Start in observe-only mode if you want to inspect decisions before enabling XDP enforcement.</p>
+        </div>
+        <div class="terminal" role="region" aria-label="Installation commands">
+          <div class="terminal-bar"><span></span><span></span><span></span><em>bash</em></div>
+          <pre><code><span class="comment"># Build the two static binaries</span>
+git clone https://github.com/sippulse/tfps.git
+cd tfps
+cargo build --release --target x86_64-unknown-linux-musl
+
+<span class="comment"># Install the service and XDP program as root</span>
+sudo ./packaging/install.sh
+
+<span class="comment"># Confirm traffic and enforcement</span>
+sudo tfps_ctl status</code></pre>
+        </div>
+        <p class="install-note">
+          Read the <a href="https://github.com/sippulse/tfps/wiki/Installation">installation guide</a>
+          for prerequisites, configuration, and a safe rollout checklist.
+        </p>
+      </section>
+
+      <section class="limits section-shell">
+        <p class="eyebrow">Honest boundaries</p>
+        <h2>Know what it does not inspect.</h2>
+        <div class="limit-list">
+          <span>SIP over TLS payloads</span><span>SIP/TCP detection</span><span>IPv6 traffic</span>
+          <span>Behavioural enforcement</span>
+        </div>
+        <p>Known-bad sources can still be enforced across configured TCP SIP ports. Full limitations are documented in the project README.</p>
+      </section>
+    </main>
+
+    <footer>
+      <div class="section-shell footer-inner">
+        <div><strong>TFPS</strong><p>Telephony Fraud Prevention System</p></div>
+        <div class="footer-links">
+          <a href="https://github.com/sippulse/tfps">GitHub</a>
+          <a href="https://github.com/sippulse/tfps/wiki">Documentation</a>
+          <a href="https://github.com/sippulse/tfps/blob/master/LICENSE">Apache-2.0</a>
+        </div>
+        <p class="copyright">Built by operators, for operators.</p>
+      </div>
+    </footer>
+  </body>
+</html>
