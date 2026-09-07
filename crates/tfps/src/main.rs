@@ -321,7 +321,15 @@ fn main() -> ExitCode {
 
     let learn_from = db
         .as_ref()
-        .map(|d| d.learning_started(start.0))
+        .map(|d| match d.learning_started(start.0) {
+            Ok(t) => t,
+            Err(e) => {
+                // Learning still starts now; what is lost is the record of when,
+                // which would silently restart the window on the next boot.
+                eprintln!("WARNING: could not record the learning start: {e}");
+                start.0
+            }
+        })
         .unwrap_or(start.0);
 
     let mode = if args.learn_secs == 0 {
@@ -711,7 +719,11 @@ fn main() -> ExitCode {
                                 // Durable audit: the operator must be able to reconstruct
                                 // the decision later, without relying on the journal.
                                 if let Some(s) = db.as_ref() {
-                                    s.log_block(t.0, subject, kind, detail);
+                                    if let Err(e) = s.log_block(t.0, subject, kind, detail) {
+                                        eprintln!(
+                                            "ALARM: blocked {subject} but could not record it: {e}"
+                                        );
+                                    }
                                 }
                             }
                             Err(err) => eprintln!("ALARM: could not block {subject}: {err}"),
@@ -754,7 +766,9 @@ fn main() -> ExitCode {
                 // Persist the resume point before the addresses: refetching a batch is
                 // harmless, whereas losing the id means starting the feed over.
                 if let (Some(id), Some(s)) = (&batch.next_id, db.as_ref()) {
-                    s.meta_set(APIBAN_ID_KEY, id);
+                    if let Err(e) = s.meta_set(APIBAN_ID_KEY, id) {
+                        eprintln!("ALARM: could not persist the APIBAN resume point: {e}");
+                    }
                 }
                 if let Some(s) = db.as_mut() {
                     if let Err(err) = s.apiban_add(&batch.ips, t.0) {
@@ -794,17 +808,24 @@ fn main() -> ExitCode {
                 // The control tool runs in another process and cannot read these
                 // counters from memory. Writing them at checkpoint is what lets
                 // `tfps_ctl stats` show the whole picture instead of only the kernel half.
-                s.meta_set("stats", &counter_line(&engine.stats));
-                s.meta_set("stats_ts", &t.0.to_string());
-                s.meta_set("started_at", &start.0.to_string());
-                s.meta_set(
-                    "ignoreip",
-                    &ignoreip
-                        .report()
-                        .map(|(label, _, hits)| format!("{label}={hits}"))
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                );
+                let ignoreip_line = ignoreip
+                    .report()
+                    .map(|(label, _, hits)| format!("{label}={hits}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                for (k, v) in [
+                    ("stats", counter_line(&engine.stats)),
+                    ("stats_ts", t.0.to_string()),
+                    ("started_at", start.0.to_string()),
+                    ("ignoreip", ignoreip_line),
+                ] {
+                    // Not fatal — the daemon keeps deciding — but not silent either:
+                    // these are what `tfps_ctl` reads, and a stale number there is
+                    // indistinguishable from a current one.
+                    if let Err(e) = s.meta_set(k, &v) {
+                        eprintln!("WARNING: could not write {k} at checkpoint: {e}");
+                    }
+                }
                 // A 90-day audit window for the block log, and the APIBAN retention prune;
                 // both apply whether or not behavioural detection is on.
                 s.prune_log(t.0.saturating_sub(90 * 24 * 3600));
@@ -821,13 +842,15 @@ fn main() -> ExitCode {
                     // error rates, never the traffic constants.
                     engine.recalibrate();
                     let p = engine.params();
-                    s.meta_set(
+                    if let Err(e) = s.meta_set(
                         "calibration",
                         &format!(
                             "theta0_prefix={:.3} theta0c={:.3} prior_mean={:.2}",
                             p.theta0_prefix, p.theta0c, p.prior_mean
                         ),
-                    );
+                    ) {
+                        eprintln!("WARNING: could not write calibration at checkpoint: {e}");
+                    }
                     match s.checkpoint(&engine) {
                         Ok((n, _)) if args.verbose => say!("    checkpoint: {n} sources written"),
                         Ok(_) => {}
