@@ -126,14 +126,21 @@ impl Store {
             .unwrap_or(0);
         if found != 0 && found != SCHEMA {
             // Incompatible schema: start over. See the note on `SCHEMA`.
-            for t in [
-                "peer_anomaly",
-                "known_peer",
-                "pair",
-                "peer_country",
-                "meta",
-                "block_log",
-            ] {
+            //
+            // `block_log` is deliberately NOT on this list, and neither is
+            // `apiban_ip`. The note on `SCHEMA` is about *learned* state, which
+            // rebuilds itself from traffic in days; an audit log rebuilds itself
+            // never. It is the operator's only record of what this system
+            // decided, which `SPEC.md` §12 requires them to be able to
+            // reconstruct, and on a host seeing a dozen new sources a day it is
+            // weeks of evidence. Dropping it to add a column elsewhere would
+            // destroy more than the change was worth.
+            //
+            // The consequence for a future schema version: a change to
+            // `block_log`'s own columns has to be an ALTER guarded by a presence
+            // check, because `CREATE TABLE IF NOT EXISTS` will not add one to a
+            // table that survived.
+            for t in ["peer_anomaly", "known_peer", "pair", "peer_country", "meta"] {
                 let _ = self.conn.execute(&format!("DROP TABLE IF EXISTS {t}"), []);
             }
         }
@@ -732,6 +739,113 @@ mod tests {
             .unwrap();
         assert_eq!(remaining, 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A version bump must not take the audit log with it.
+    ///
+    /// The migration recreates tables on an incompatible change, and the note on
+    /// `SCHEMA` justifies that well: losing a baseline is recoverable in days,
+    /// reading a bitmap with the wrong semantics is not. That reasoning is true
+    /// of learned state and false of an audit log. `block_log` cannot be
+    /// relearned from traffic at all — it is the operator's only record of what
+    /// this system decided, and `SPEC.md` §12 requires them to be able to
+    /// reconstruct it. `apiban_ip` is already exempt from the drop list for a
+    /// weaker version of the same reason.
+    #[test]
+    fn a_schema_change_keeps_the_audit_log_and_still_discards_learned_state() {
+        let path = tmp().with_extension("migrate.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = Store::open(&path).unwrap();
+            s.log_block(100, Ipv4Addr::new(203, 0, 113, 7), "user-agent", "friendly");
+            s.conn
+                .execute(
+                    "INSERT INTO peer_anomaly (peer, seen, n_countries, rate_a, rate_b, last_seen)
+                     VALUES ('10.0.0.9', ?1, 3, 0.5, 0.25, 100)",
+                    params![vec![0u8; 32]],
+                )
+                .unwrap();
+            // The fixture is only worth anything if both rows are really there
+            // before the upgrade; otherwise "gone afterwards" proves nothing.
+            assert_eq!(
+                count(&s, "block_log"),
+                1,
+                "fixture: the audit row was written"
+            );
+            assert_eq!(
+                count(&s, "peer_anomaly"),
+                1,
+                "fixture: learned state was written"
+            );
+            // A version this build does not recognise. The next open is an upgrade.
+            s.conn
+                .pragma_update(None, "user_version", SCHEMA + 1)
+                .unwrap();
+        }
+
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            count(&s, "block_log"),
+            1,
+            "the audit log cannot be relearned from traffic, so an upgrade must not drop it"
+        );
+        // NEGATIVE CONTROL. Learned state is still discarded on an incompatible
+        // change — that is the behaviour the drop list exists for, and widening
+        // the exemption to everything would be a different bug.
+        assert_eq!(
+            count(&s, "peer_anomaly"),
+            0,
+            "learned state is still discarded across an incompatible schema change"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Counting the row is not enough: a corpus you cannot read is not a corpus.
+    #[test]
+    fn the_surviving_audit_row_is_still_legible() {
+        let path = tmp().with_extension("migrate-content.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = Store::open(&path).unwrap();
+            s.log_block(100, Ipv4Addr::new(203, 0, 113, 7), "user-agent", "friendly");
+            s.conn
+                .pragma_update(None, "user_version", SCHEMA + 1)
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let rows = s.blocks(10, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ts, 100);
+        assert_eq!(rows[0].ip, "203.0.113.7");
+        assert_eq!(rows[0].reason, "user-agent");
+        assert_eq!(rows[0].detail, "friendly");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Opening twice more must not lose it either: an upgrade that is not
+    /// idempotent looks fine on the run that performs it and empty afterwards.
+    #[test]
+    fn the_audit_log_survives_every_later_open() {
+        let path = tmp().with_extension("migrate-idem.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = Store::open(&path).unwrap();
+            s.log_block(100, Ipv4Addr::new(203, 0, 113, 7), "user-agent", "friendly");
+            s.conn
+                .pragma_update(None, "user_version", SCHEMA + 1)
+                .unwrap();
+        }
+        for open in 1..=3 {
+            let s = Store::open(&path).unwrap();
+            assert_eq!(count(&s, "block_log"), 1, "gone after open #{open}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn count(s: &Store, table: &str) -> i64 {
+        s.conn
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
     }
 
     #[test]
