@@ -114,10 +114,20 @@ impl IgnoreList {
     /// Counting is the point: `SPEC.md` §12 requires a rule that never matches to be
     /// reportable, and an exemption is a rule.
     pub fn exempt(&mut self, ip: Ipv4Addr) -> Option<&str> {
+        self.exempt_entry(ip).map(|(label, _)| label)
+    }
+
+    /// The same lookup, keeping where the entry came from.
+    ///
+    /// A caller that has to explain a refusal to a person needs the difference: "this is
+    /// an address of the host" is a fact about the machine, and "you declared this range"
+    /// is a fact about their own configuration. One rule, one place — `exempt` delegates
+    /// here rather than matching a second time.
+    pub fn exempt_entry(&mut self, ip: Ipv4Addr) -> Option<(&str, Origin)> {
         let v = u32::from(ip);
         let hit = self.entries.iter_mut().find(|e| v & e.mask == e.net)?;
         hit.hits += 1;
-        Some(&hit.label)
+        Some((&hit.label, hit.origin))
     }
 
     /// Every entry, for the startup report: label, where it came from, how often it fired.
@@ -163,6 +173,29 @@ mod tests {
 
     fn ip(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
+    }
+
+    /// `exempt` and `exempt_entry` are one rule, so they cannot disagree about
+    /// what matched. Two copies agree today and drift silently.
+    #[test]
+    fn the_two_lookups_are_the_same_rule() {
+        let host = Ipv4Addr::new(10, 0, 0, 60);
+        let peer = Ipv4Addr::new(203, 0, 113, 7);
+        let mut a = IgnoreList::new();
+        a.add_local(host);
+        a.add("203.0.113.0/24").unwrap();
+        let mut b = a.clone();
+        for ip in [host, peer, Ipv4Addr::new(8, 8, 8, 8)] {
+            assert_eq!(
+                a.exempt(ip).map(str::to_string),
+                b.exempt_entry(ip).map(|(l, _)| l.to_string()),
+                "the two lookups disagreed about {ip}"
+            );
+        }
+        let mut c = a.clone();
+        assert_eq!(c.exempt_entry(host).map(|(_, o)| o), Some(Origin::Local));
+        assert_eq!(c.exempt_entry(peer).map(|(_, o)| o), Some(Origin::Declared));
+        assert_eq!(c.exempt_entry(Ipv4Addr::new(8, 8, 8, 8)), None);
     }
 
     #[test]
