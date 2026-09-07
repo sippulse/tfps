@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tfps_core::dialplan::DialPlan;
+use tfps_core::disposition::{disposition, Disposition};
 use tfps_core::engine::{Decision, Engine, Mode};
 use tfps_core::ignore::IgnoreList;
 use tfps_core::net::{classify_other, parse_ipv4_udp, tcp_ports, NotUdp};
@@ -689,32 +690,69 @@ fn main() -> ExitCode {
                         _ => None,
                     };
                     let exempt = reason.and_then(|_| ignoreip.exempt(subject).map(str::to_string));
-                    if let (Some((kind, detail)), Some(rule)) = (reason, exempt) {
-                        // Judged, reported, not enforced. Staying silent here would hide a
-                        // compromised trusted peer, which is when it matters most.
-                        say!("EXEMPT peer={subject} reason={kind} detail={detail} ignoreip={rule}");
-                    } else if let (Some((kind, detail)), true) =
-                        (reason, engine.is_known_peer(subject, t))
-                    {
-                        // A registered peer that authenticated is known-good — never banned,
-                        // whatever a signature or the feed says. The dynamic ignoreip.
-                        say!(
-                            "EXEMPT peer={subject} reason={kind} detail={detail} (registered peer)"
-                        );
-                    } else if let (Some((kind, detail)), Some(e)) = (reason, enforcer.as_mut()) {
-                        match e.block(subject, args.block_ttl) {
-                            Ok(()) => {
-                                say!(
-                                    "BLOCKED peer={subject} reason={kind} detail={detail} ttl={}s",
-                                    args.block_ttl
-                                );
-                                // Durable audit: the operator must be able to reconstruct
-                                // the decision later, without relying on the journal.
-                                if let Some(s) = db.as_ref() {
-                                    s.log_block(t.0, subject, kind, detail);
-                                }
+                    // A total match, not a chain: the defect this replaces was a
+                    // missing arm, and a chain can silently lack one where an
+                    // exhaustive match cannot. `SPEC.md` §12 makes silence an alarm.
+                    match disposition(
+                        reason,
+                        exempt.as_deref(),
+                        engine.is_known_peer(subject, t),
+                        enforcer.is_some(),
+                    ) {
+                        Disposition::Ignore => {}
+                        Disposition::ExemptIgnoreIp { kind, detail, rule } => {
+                            // Judged, reported, not enforced. Staying silent here would hide
+                            // a compromised trusted peer, which is when it matters most.
+                            say!(
+                                "EXEMPT peer={subject} reason={kind} detail={detail} ignoreip={rule}"
+                            );
+                        }
+                        Disposition::ExemptKnownPeer { kind, detail } => {
+                            // A registered peer that authenticated is known-good — never
+                            // banned, whatever a signature or the feed says. The dynamic
+                            // ignoreip.
+                            say!(
+                                "EXEMPT peer={subject} reason={kind} detail={detail} (registered peer)"
+                            );
+                        }
+                        Disposition::WouldBlock { kind, detail } => {
+                            // Observing only. Nothing is blocked and nothing is written to
+                            // the audit log, which has no column to say a block did not
+                            // happen — but the operator is told, which is the whole point of
+                            // running with --no-enforce. Same shape as the behavioural
+                            // layer's WOULD BLOCK (learning) line.
+                            say!(
+                                "WOULD BLOCK peer={subject} reason={kind} detail={detail} (observe only)"
+                            );
+                        }
+                        Disposition::Block { kind, detail } => {
+                            // The `None` arm is unreachable by construction: `disposition`
+                            // returns `Block` only when an enforcer exists, which its own
+                            // tests pin exhaustively. It alarms rather than being silent,
+                            // because an unreachable branch that says nothing is how this
+                            // defect happened in the first place.
+                            match enforcer.as_mut() {
+                                Some(e) => match e.block(subject, args.block_ttl) {
+                                    Ok(()) => {
+                                        say!(
+                                            "BLOCKED peer={subject} reason={kind} detail={detail} ttl={}s",
+                                            args.block_ttl
+                                        );
+                                        // Durable audit: the operator must be able to
+                                        // reconstruct the decision later, without relying
+                                        // on the journal.
+                                        if let Some(s) = db.as_ref() {
+                                            s.log_block(t.0, subject, kind, detail);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!("ALARM: could not block {subject}: {err}")
+                                    }
+                                },
+                                None => eprintln!(
+                                    "ALARM: condemned {subject} as Block with no enforcer attached"
+                                ),
                             }
-                            Err(err) => eprintln!("ALARM: could not block {subject}: {err}"),
                         }
                     }
                     if args.debug_unparsed
