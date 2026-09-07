@@ -750,7 +750,6 @@ fn main() -> ExitCode {
         // APIBAN batches, if any. Non-blocking: it only drains what has already arrived.
         if let (Some(rx), Some(e)) = (apiban_rx.as_ref(), enforcer.as_mut()) {
             while let Ok(batch) = rx.try_recv() {
-                let mut n = batch.ips.len();
                 // Persist the resume point before the addresses: refetching a batch is
                 // harmless, whereas losing the id means starting the feed over.
                 if let (Some(id), Some(s)) = (&batch.next_id, db.as_ref()) {
@@ -761,28 +760,32 @@ fn main() -> ExitCode {
                         eprintln!("WARNING: could not persist the APIBAN batch: {err}");
                     }
                 }
-                for ip in batch.ips {
-                    // A third-party feed listing your own range is exactly what the ignore
-                    // list is for: it is curated, but it is not yours.
-                    if let Some(rule) = ignoreip.exempt(ip) {
-                        say!("APIBAN: {ip} not blocked, ignoreip={rule}");
-                        n -= 1;
-                        continue;
-                    }
-                    if engine.is_known_peer(ip, t) {
-                        // A registered customer's IP on the feed: it proved valid
-                        // credentials, so we do not knock it off.
-                        say!("APIBAN: {ip} not blocked, it is a registered peer");
-                        n -= 1;
-                        continue;
-                    }
-                    // No expiry: the APIBAN list is curated, and re-applying it hourly
-                    // would only generate pointless writes.
-                    let _ = e.block(ip, 0);
+                // No expiry: the APIBAN list is curated, and re-applying it hourly
+                // would only generate pointless writes.
+                let applied = apiban::apply(
+                    &batch.ips,
+                    |ip| ignoreip.exempt(ip).map(str::to_string),
+                    |ip| engine.is_known_peer(ip, t),
+                    |ip| e.block(ip, 0),
+                );
+                for (ip, rule) in &applied.ignored {
+                    say!("APIBAN: {ip} not blocked, ignoreip={rule}");
                 }
-                if n > 0 {
-                    apiban_total += n as u64;
-                    say!("APIBAN: {n} addresses condemned (total {apiban_total})");
+                for ip in &applied.known {
+                    say!("APIBAN: {ip} not blocked, it is a registered peer");
+                }
+                // Same alarm the perimeter's own block path raises for the same
+                // failure. A feed that condemns nothing while reporting a total is
+                // an integration that looks healthy and protects nothing.
+                for (ip, err) in &applied.failed {
+                    eprintln!("ALARM: could not block {ip} from the APIBAN feed: {err}");
+                }
+                if applied.condemned > 0 {
+                    apiban_total += applied.condemned;
+                    say!(
+                        "APIBAN: {} addresses condemned (total {apiban_total})",
+                        applied.condemned
+                    );
                 }
             }
         }
