@@ -151,7 +151,16 @@ fn fetch(key: &str, id: &str) -> Result<Batch, String> {
 /// Anything else is reported with the status and the start of the body, so that the
 /// next surprise from the API is diagnosable from the journal alone.
 fn received(status: u16, body: &str) -> Result<Batch, String> {
-    let nothing_new = body.contains("\"none\"") || body.contains("no new bans");
+    // The quiet reply is {"ipaddress":["no new bans"],"ID":"none"}. Match the ID field
+    // itself, not the bare token: an unauthorized key answers
+    // {"ipaddress":"none","ID":"unauthorized"}, which also contains "none", and a revoked
+    // key that reads as a quiet feed would be silent forever.
+    let id_is_none = body
+        .split("\"ID\"")
+        .nth(1)
+        .and_then(|rest| between(rest, '"', '"'))
+        == Some("none");
+    let nothing_new = id_is_none || body.contains("no new bans");
     match status {
         200..=299 => Ok(parse(body)),
         400..=499 if nothing_new => Ok(Batch::default()),
@@ -422,9 +431,16 @@ mod tests {
     // status and the body, so the journal says what the API actually said.
     #[test]
     fn other_failures_are_still_reported_with_what_the_api_said() {
-        let e =
-            received(403, r#"{"error":"invalid key"}"#).expect_err("a refused key is an outage");
-        assert!(e.contains("403") && e.contains("invalid key"), "{e}");
+        // APIBAN's real unauthorized body, which also contains the token "none". Seen
+        // with status 503 in practice and documented as 403; loud either way.
+        let unauthorized = r#"{"ipaddress":"none","ID":"unauthorized"}"#;
+        for status in [403, 503] {
+            let e = received(status, unauthorized).expect_err("a refused key is an outage");
+            assert!(
+                e.contains(&status.to_string()) && e.contains("unauthorized"),
+                "{e}"
+            );
+        }
         let e = received(500, "no new bans").expect_err("a server error is an outage");
         assert!(e.contains("500"), "{e}");
     }
