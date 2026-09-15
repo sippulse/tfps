@@ -195,7 +195,7 @@ impl Store {
     /// **This is what makes learning mode mean anything.** Without persisting it, every
     /// restart would reset the 30 days and the countdown would promise something a
     /// `systemctl restart` erases.
-    pub fn learning_started(&self, default_now: u32) -> u32 {
+    pub fn learning_started(&self, default_now: u32) -> Result<u32, String> {
         if let Ok(v) =
             self.conn
                 .query_row("SELECT v FROM meta WHERE k = 'learning_started'", [], |r| {
@@ -203,14 +203,13 @@ impl Store {
                 })
         {
             if let Ok(t) = v.parse() {
-                return t;
+                return Ok(t);
             }
         }
-        let _ = self.conn.execute(
-            "INSERT OR REPLACE INTO meta (k, v) VALUES ('learning_started', ?1)",
-            params![default_now.to_string()],
-        );
-        default_now
+        // The same rule as the two above: the caller still gets a usable answer,
+        // and still gets told that it will not survive a restart.
+        self.meta_set("learning_started", &default_now.to_string())?;
+        Ok(default_now)
     }
 
     /// Records addresses from the feed, so they can be re-applied after a restart.
@@ -321,20 +320,45 @@ impl Store {
             .ok()
     }
 
-    /// Writes one. Failure is not fatal: the worst case is refetching a feed from the
-    /// start, which costs bandwidth, not correctness.
-    pub fn meta_set(&self, key: &str, value: &str) {
-        let _ = self.conn.execute(
-            "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, ?2)",
-            params![key, value],
-        );
+    /// Writes one.
+    ///
+    /// Failure is not fatal — the caller carries on — but it is not silent
+    /// either, which is a different claim and the one this used to get wrong.
+    /// The APIBAN cursor lives in this table, and the comment on the schema says
+    /// what losing it costs: the integration "silently protects nothing after a
+    /// restart". Whoever calls this is the only thing that can print it.
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("writing meta.{key}: {e}"))
     }
 
-    pub fn log_block(&self, ts: u32, ip: Ipv4Addr, reason: &str, detail: &str) {
-        let _ = self.conn.execute(
-            "INSERT INTO block_log (ts, ip, reason, detail) VALUES (?1, ?2, ?3, ?4)",
-            params![ts, ip.to_string(), reason, detail],
-        );
+    /// Records one block, durably.
+    ///
+    /// A failed audit write must never stop the block it describes — that part
+    /// was always right — but "not fatal" is not "not worth mentioning". This is
+    /// a tool that is quiet by design, so what it writes down is the only
+    /// evidence it works, and an audit table losing rows to a failure nobody
+    /// prints is a record with holes that read as "nothing happened".
+    /// `SPEC.md` §12 already says it: silence is an alarm.
+    pub fn log_block(
+        &self,
+        ts: u32,
+        ip: Ipv4Addr,
+        reason: &str,
+        detail: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO block_log (ts, ip, reason, detail) VALUES (?1, ?2, ?3, ?4)",
+                params![ts, ip.to_string(), reason, detail],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("writing block_log for {ip}: {e}"))
     }
 
     /// Deletes old audit rows. Without this the file grows forever — which is what
@@ -666,7 +690,7 @@ mod tests {
         {
             let s = Store::open(&path).unwrap();
             assert_eq!(s.meta_get("apiban_id"), None, "absent before it is written");
-            s.meta_set("apiban_id", "1698425647");
+            s.meta_set("apiban_id", "1698425647").unwrap();
         }
         let s = Store::open(&path).unwrap();
         assert_eq!(s.meta_get("apiban_id").as_deref(), Some("1698425647"));
@@ -713,12 +737,12 @@ mod tests {
         let path = tmp().with_extension("learn.db");
         let _ = std::fs::remove_file(&path);
         let s = Store::open(&path).unwrap();
-        let first = s.learning_started(1000);
+        let first = s.learning_started(1000).unwrap();
         assert_eq!(first, 1000);
         // A "restart" later, with the clock much further along.
         let s2 = Store::open(&path).unwrap();
         assert_eq!(
-            s2.learning_started(9_999_999),
+            s2.learning_started(9_999_999).unwrap(),
             1000,
             "restarting must not push the end of learning further out"
         );
@@ -730,8 +754,10 @@ mod tests {
         let path = tmp().with_extension("log.db");
         let _ = std::fs::remove_file(&path);
         let s = Store::open(&path).unwrap();
-        s.log_block(100, Ipv4Addr::new(1, 2, 3, 4), "user-agent", "pplsip");
-        s.log_block(200, Ipv4Addr::new(5, 6, 7, 8), "injection", "'");
+        s.log_block(100, Ipv4Addr::new(1, 2, 3, 4), "user-agent", "pplsip")
+            .unwrap();
+        s.log_block(200, Ipv4Addr::new(5, 6, 7, 8), "injection", "'")
+            .unwrap();
         assert_eq!(s.prune_log(150), 1, "only the oldest one goes");
         let remaining: i64 = s
             .conn
@@ -757,7 +783,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         {
             let s = Store::open(&path).unwrap();
-            s.log_block(100, Ipv4Addr::new(203, 0, 113, 7), "user-agent", "friendly");
+            s.log_block(100, Ipv4Addr::new(203, 0, 113, 7), "user-agent", "friendly")
+                .unwrap();
             s.conn
                 .execute(
                     "INSERT INTO peer_anomaly (peer, seen, n_countries, rate_a, rate_b, last_seen)
@@ -807,7 +834,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         {
             let s = Store::open(&path).unwrap();
-            s.log_block(100, Ipv4Addr::new(203, 0, 113, 7), "user-agent", "friendly");
+            s.log_block(100, Ipv4Addr::new(203, 0, 113, 7), "user-agent", "friendly")
+                .unwrap();
             s.conn
                 .pragma_update(None, "user_version", SCHEMA + 1)
                 .unwrap();
@@ -830,7 +858,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         {
             let s = Store::open(&path).unwrap();
-            s.log_block(100, Ipv4Addr::new(203, 0, 113, 7), "user-agent", "friendly");
+            s.log_block(100, Ipv4Addr::new(203, 0, 113, 7), "user-agent", "friendly")
+                .unwrap();
             s.conn
                 .pragma_update(None, "user_version", SCHEMA + 1)
                 .unwrap();
@@ -846,6 +875,117 @@ mod tests {
         s.conn
             .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
             .unwrap()
+    }
+
+    /// A store whose audit table is gone, to drive the failure path.
+    ///
+    /// The real failures are a full disk, a revoked permission or a corrupt
+    /// page, none of which a unit test can arrange. Dropping the table produces
+    /// the same thing the caller sees — `execute` returning `Err` — which is the
+    /// part of the behaviour under test.
+    fn store_without(path: &std::path::Path, table: &str) -> Store {
+        let s = Store::open(path).unwrap();
+        s.conn
+            .execute(&format!("DROP TABLE {table}"), [])
+            .expect("fixture: the table was there to drop");
+        s
+    }
+
+    // THE DEFECT, half one. `log_block` discarded its own failure, justified as
+    // "best effort: a failed audit write must never stop the block it
+    // describes". The first half is right and the second does not follow. This
+    // is a tool that is quiet by design, so what it writes down is the only
+    // evidence it works; an audit table losing rows to a failure nobody prints
+    // is a record with holes that read as "nothing happened". `SPEC.md` §12
+    // already says it: silence is an alarm.
+    #[test]
+    fn a_failed_audit_write_is_reported_not_swallowed() {
+        let path = tmp().with_extension("silent-log.db");
+        let _ = std::fs::remove_file(&path);
+        let s = store_without(&path, "block_log");
+        let r = s.log_block(100, Ipv4Addr::new(203, 0, 113, 7), "user-agent", "friendly");
+        assert!(
+            r.is_err(),
+            "a lost audit row must reach the caller, which is the only thing that can print it"
+        );
+        // Deliberately not `contains("block_log")`: SQLite's own "no such
+        // table: block_log" would satisfy that, so the assertion would pass
+        // whether or not this code added any context of its own. The address is
+        // the part only the caller knows, and the part the operator needs.
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("203.0.113.7"),
+            "the error must name the block that went unrecorded, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // THE DEFECT, half two. `meta` writes were silent too, and the schema
+    // comment above that table says what losing them costs: the APIBAN cursor
+    // lives there, so the integration "silently protects nothing after a
+    // restart".
+    #[test]
+    fn a_failed_meta_write_is_reported_not_swallowed() {
+        let path = tmp().with_extension("silent-meta.db");
+        let _ = std::fs::remove_file(&path);
+        let s = store_without(&path, "meta");
+        let r = s.meta_set("apiban_id", "1698425647");
+        assert!(r.is_err(), "losing the feed cursor cannot be silent");
+        // Same reasoning: "no such table: meta" contains "meta". The KEY does
+        // not appear in SQLite's message, so this pins the added context.
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("apiban_id"),
+            "the error must name the key that was lost, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The same discard, third site: the learning start. Losing it does not lose
+    // learning, but it restarts the window on the next boot, which is the exact
+    // thing `the_learning_start_does_not_reset_on_every_boot` exists to prevent.
+    #[test]
+    fn a_failed_learning_start_write_is_reported_not_swallowed() {
+        let path = tmp().with_extension("silent-learn.db");
+        let _ = std::fs::remove_file(&path);
+        let s = store_without(&path, "meta");
+        assert!(
+            s.learning_started(1000).is_err(),
+            "a learning window that will silently restart is worth a line"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // NEGATIVE CONTROL. Reporting the failure must not turn a success into one,
+    // and the row must still actually be written.
+    #[test]
+    fn a_successful_write_still_succeeds_and_still_lands() {
+        let path = tmp().with_extension("silent-ok.db");
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+        assert!(s
+            .log_block(100, Ipv4Addr::new(203, 0, 113, 7), "user-agent", "friendly")
+            .is_ok());
+        assert!(s.meta_set("apiban_id", "1698425647").is_ok());
+        assert_eq!(s.learning_started(1000).unwrap(), 1000);
+        assert_eq!(s.blocks(10, None).unwrap().len(), 1);
+        assert_eq!(s.meta_get("apiban_id").as_deref(), Some("1698425647"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // NEGATIVE CONTROL for the fixture. `store_without` has to produce a store
+    // where the OTHER table still works, or the two failure tests above would
+    // pass against a database that was broken in some entirely different way.
+    #[test]
+    fn dropping_one_table_leaves_the_others_working() {
+        let path = tmp().with_extension("silent-fixture.db");
+        let _ = std::fs::remove_file(&path);
+        let s = store_without(&path, "block_log");
+        assert!(
+            s.meta_set("apiban_id", "1698425647").is_ok(),
+            "only block_log is missing; meta must still take a write"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
