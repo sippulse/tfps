@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tfps::say;
 use tfps::store::{BlockRow, SourceFilter, Store};
 use tfps::xdp::{monotonic_ns, Blocklist};
+use tfps_core::ignore::{IgnoreList, Origin};
 
 fn usage() -> String {
     format!(
@@ -48,11 +49,13 @@ SOURCE FILTERS:
 GLOBAL:
   --db PATH                    database (default: {db})
   --map PATH                   an explicitly pinned block map
+  --config PATH                configuration, for ignoreip (default: {cfg})
   -h, --help                   this help
 
 Reading blocks needs CAP_BPF (run as root). Reading learned state only needs the database.
 ",
-        db = tfps::store::DEFAULT_PATH
+        db = tfps::store::DEFAULT_PATH,
+        cfg = tfps::config::DEFAULT_PATH
     )
 }
 
@@ -69,6 +72,7 @@ struct Args {
     ttl: u64,
     all: bool,
     why: bool,
+    config: PathBuf,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -85,6 +89,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         ttl: 3600,
         all: false,
         why: false,
+        config: PathBuf::from(tfps::config::DEFAULT_PATH),
     };
     let mut it = argv.iter();
     let value = |name: &str, it: &mut std::slice::Iter<'_, String>| -> Result<String, String> {
@@ -96,6 +101,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         match arg.as_str() {
             "--db" => a.db = PathBuf::from(value("--db", &mut it)?),
             "--map" => a.map = Some(PathBuf::from(value("--map", &mut it)?)),
+            "--config" => a.config = PathBuf::from(value("--config", &mut it)?),
             "--peer" => a.peer = Some(value("--peer", &mut it)?),
             "--a" => a.a_number = Some(value("--a", &mut it)?),
             "--country" => a.country = Some(value("--country", &mut it)?),
@@ -410,22 +416,141 @@ fn unban(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Why a hand-placed block was refused, and by which rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Refusal {
+    origin: Origin,
+    rule: String,
+}
+
+/// What `place` did with a list of addresses. Every address lands in exactly one.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Placed {
+    blocked: Vec<Ipv4Addr>,
+    refused: Vec<(Ipv4Addr, Refusal)>,
+    failed: Vec<(Ipv4Addr, String)>,
+}
+
+/// Places blocks by hand, refusing what the daemon refuses.
+///
+/// The guard is consulted **before** the kernel, and a refused address touches
+/// nothing at all. `xdp::local_addresses` says why in its own doc comment: it
+/// exists "so the system cannot condemn the machine it is defending", and a
+/// command placing a block from outside the daemon has exactly the same
+/// obligation. One typo at a root prompt blackholes the box, and on a remote
+/// host that is the last command anybody gets to run.
+///
+/// Every input is an argument so the whole decision is drivable from a test:
+/// the kernel map needs `CAP_BPF` and a pinned path and cannot be opened by one.
+fn place(
+    ips: &[Ipv4Addr],
+    guard: &mut IgnoreList,
+    mut block: impl FnMut(Ipv4Addr) -> Result<(), String>,
+) -> Placed {
+    let mut out = Placed::default();
+    for &ip in ips {
+        if let Some((rule, origin)) = guard.exempt_entry(ip) {
+            out.refused.push((
+                ip,
+                Refusal {
+                    origin,
+                    rule: rule.to_string(),
+                },
+            ));
+            continue;
+        }
+        match block(ip) {
+            Ok(()) => out.blocked.push(ip),
+            Err(e) => out.failed.push((ip, e)),
+        }
+    }
+    out
+}
+
 fn ban(args: &Args) -> Result<(), String> {
-    let mut b = Blocklist::open(args.map.as_deref())?;
     if args.positional.is_empty() {
         return Err("give at least one address".into());
     }
+    let mut ips = Vec::with_capacity(args.positional.len());
     for raw in &args.positional {
-        let ip: Ipv4Addr = raw.parse().map_err(|e| format!("{raw}: {e}"))?;
-        b.insert(ip, args.ttl)?;
-        let how = if args.ttl == 0 {
-            "with no expiry".to_string()
-        } else {
-            format!("for {}", ago(args.ttl as u32))
-        };
+        ips.push(raw.parse::<Ipv4Addr>().map_err(|e| format!("{raw}: {e}"))?);
+    }
+    let mut guard = enforcement_guard(&args.config)?;
+    // The map is opened on the first address that survives the guard, not before.
+    // Refusing to blackhole the host is a decision this tool can make on its own,
+    // and making it conditional on CAP_BPF and a running daemon would mean the
+    // answer to "would this have blocked my box?" depends on who is asking.
+    let mut b: Option<Blocklist> = None;
+    let out = place(&ips, &mut guard, |ip| {
+        if b.is_none() {
+            b = Some(Blocklist::open(args.map.as_deref())?);
+        }
+        b.as_mut()
+            .expect("just opened above, or returned")
+            .insert(ip, args.ttl)
+    });
+
+    let how = if args.ttl == 0 {
+        "with no expiry".to_string()
+    } else {
+        format!("for {}", ago(args.ttl as u32))
+    };
+    for ip in &out.blocked {
         say!("blocked {ip} {how}");
     }
-    Ok(())
+    for (ip, why) in &out.refused {
+        match why.origin {
+            Origin::Local => eprintln!("refusing to block {ip}: it is an address of this host"),
+            Origin::Declared => {
+                eprintln!(
+                    "refusing to block {ip}: ignoreip={} says never enforce against it",
+                    why.rule
+                )
+            }
+        }
+    }
+    for (ip, e) in &out.failed {
+        eprintln!("could not block {ip}: {e}");
+    }
+    // NOT recorded in block_log, deliberately. A hand-placed block still leaves
+    // no trace, so `banned --why` cannot explain it — that is a real gap, and
+    // fixing it means opening the database read-write from this tool, which the
+    // note on `Store::open_readonly` forbids on purpose and which would run a
+    // migration from a binary that is not the daemon. That is a decision about
+    // this tool's contract, not a bug fix, so it is left alone here.
+    if out.refused.is_empty() && out.failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} of {} addresses were not blocked",
+            out.refused.len() + out.failed.len(),
+            ips.len()
+        ))
+    }
+}
+
+/// The exemptions the daemon would apply, rebuilt from the same two sources.
+///
+/// The host's own addresses come from the kernel exactly as `xdp::local_addresses`
+/// gives them to the daemon, and the declared ranges from the same configuration
+/// file. A malformed entry is announced rather than dropped, for the reason
+/// `IgnoreList::add` gives: an operator who mistypes a network must not be left
+/// believing a range is exempt when it is not.
+fn enforcement_guard(config: &Path) -> Result<IgnoreList, String> {
+    let mut guard = IgnoreList::new();
+    for ip in tfps::xdp::local_addresses() {
+        guard.add_local(ip);
+    }
+    match tfps::config::load(config) {
+        tfps::config::Loaded::File(c, _) => {
+            for entry in &c.ignoreip {
+                guard.add(entry)?;
+            }
+        }
+        tfps::config::Loaded::Absent => {}
+        tfps::config::Loaded::Broken(e) => return Err(e),
+    }
+    Ok(guard)
 }
 
 fn sources(args: &Args) -> Result<(), String> {
@@ -601,6 +726,128 @@ mod tests {
 
     fn args(v: &[&str]) -> Result<Args, String> {
         parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    fn ip(last: u8) -> Ipv4Addr {
+        Ipv4Addr::new(203, 0, 113, last)
+    }
+
+    /// The guard the daemon builds: this host's addresses, plus what the
+    /// operator declared.
+    fn guard(local: &[Ipv4Addr], declared: &[&str]) -> IgnoreList {
+        let mut g = IgnoreList::new();
+        for a in local {
+            g.add_local(*a);
+        }
+        for d in declared {
+            g.add(d).expect("fixture: the declared entry must parse");
+        }
+        g
+    }
+
+    // THE DEFECT, half one. `xdp::local_addresses` exists, in its own words, "so
+    // the system cannot condemn the machine it is defending" — and `ban` never
+    // asked. One typo at a root prompt blackholes the box, and on a remote host
+    // that is the last command you get to run.
+    #[test]
+    fn the_host_is_never_condemned_by_hand() {
+        let host = Ipv4Addr::new(10, 0, 0, 60);
+        let mut g = guard(&[host], &[]);
+        let mut written = Vec::new();
+        let out = place(&[host], &mut g, |a| {
+            written.push(a);
+            Ok(())
+        });
+        assert!(
+            written.is_empty(),
+            "the host's own address must never reach the kernel map"
+        );
+        assert_eq!(out.blocked, Vec::<Ipv4Addr>::new());
+        assert_eq!(out.refused.len(), 1);
+        assert_eq!(out.refused[0].1.origin, Origin::Local);
+    }
+
+    // THE DEFECT, half two. The operator declared "never enforce against this
+    // range". A hand-placed block went round it without a word.
+    #[test]
+    fn a_declared_ignoreip_range_is_refused_by_hand_too() {
+        let mut g = guard(&[], &["203.0.113.0/24"]);
+        let mut written = Vec::new();
+        let out = place(&[ip(7)], &mut g, |a| {
+            written.push(a);
+            Ok(())
+        });
+        assert!(
+            written.is_empty(),
+            "a declared range must not be overridden silently"
+        );
+        assert_eq!(out.refused.len(), 1);
+        assert_eq!(out.refused[0].1.origin, Origin::Declared);
+        assert_eq!(
+            out.refused[0].1.rule, "203.0.113.0/24",
+            "the refusal must name the entry, so the operator knows what to change"
+        );
+    }
+
+    // NEGATIVE CONTROL. The command still has to work. An address nothing
+    // exempts is blocked exactly once and reported as blocked.
+    #[test]
+    fn an_ordinary_address_is_still_blocked() {
+        let mut g = guard(&[Ipv4Addr::new(10, 0, 0, 60)], &["192.168.0.0/16"]);
+        let mut written = Vec::new();
+        let out = place(&[ip(7)], &mut g, |a| {
+            written.push(a);
+            Ok(())
+        });
+        assert_eq!(written, vec![ip(7)]);
+        assert_eq!(out.blocked, vec![ip(7)]);
+        assert!(out.refused.is_empty());
+        assert!(out.failed.is_empty());
+    }
+
+    // A refusal must not take the rest of the batch down with it, and the
+    // outcomes must stay disjoint: every address lands in exactly one bucket.
+    #[test]
+    fn one_refusal_does_not_stop_the_others() {
+        let host = Ipv4Addr::new(10, 0, 0, 60);
+        let mut g = guard(&[host], &["192.168.0.0/16"]);
+        let batch = [ip(1), host, Ipv4Addr::new(192, 168, 1, 5), ip(2)];
+        let mut written = Vec::new();
+        let out = place(&batch, &mut g, |a| {
+            written.push(a);
+            Ok(())
+        });
+        assert_eq!(written, vec![ip(1), ip(2)]);
+        assert_eq!(out.blocked, vec![ip(1), ip(2)]);
+        assert_eq!(out.refused.len(), 2);
+        assert_eq!(
+            out.blocked.len() + out.refused.len() + out.failed.len(),
+            batch.len(),
+            "every address must land in exactly one outcome"
+        );
+    }
+
+    // NEGATIVE CONTROL. A kernel refusal is not an exemption. Conflating them
+    // would tell the operator their own configuration stopped a write that the
+    // map actually rejected.
+    #[test]
+    fn a_kernel_failure_is_not_an_exemption() {
+        let mut g = guard(&[], &[]);
+        let out = place(&[ip(7)], &mut g, |_| Err("map is full".into()));
+        assert!(out.refused.is_empty());
+        assert_eq!(out.failed, vec![(ip(7), "map is full".to_string())]);
+        assert!(out.blocked.is_empty());
+    }
+
+    // An empty guard refuses nothing: the fixture must be able to say "no" only
+    // because something was put in it, not by construction.
+    #[test]
+    fn an_empty_guard_refuses_nothing() {
+        let host = Ipv4Addr::new(10, 0, 0, 60);
+        let mut g = guard(&[], &[]);
+        let out = place(&[host, ip(7)], &mut g, |_| Ok(()));
+        assert_eq!(out.blocked, vec![host, ip(7)]);
+        assert!(out.refused.is_empty());
     }
 
     #[test]
