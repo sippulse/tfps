@@ -22,7 +22,6 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tfps_core::dialplan::DialPlan;
 use tfps_core::disposition::{disposition, Disposition};
 use tfps_core::engine::{Decision, Engine, Mode};
-use tfps_core::ignore::IgnoreList;
 use tfps_core::net::{classify_other, parse_ipv4_udp, tcp_ports, NotUdp};
 use tfps_core::novelty::Timestamp;
 
@@ -327,7 +326,7 @@ fn main() -> ExitCode {
             Err(e) => {
                 // Learning still starts now; what is lost is the record of when,
                 // which would silently restart the window on the next boot.
-                eprintln!("WARNING: could not record the learning start: {e}");
+                eprintln!("WARNING: learning window: {e}");
                 start.0
             }
         })
@@ -504,22 +503,15 @@ fn main() -> ExitCode {
          {inj_int} injection patterns (+{inj_ext}), {scan_int} scanner ids (+{scan_ext})"
     );
 
-    // Never condemn the machine we are defending. This is not configurable, because the
-    // one time it happened during development it was a test firing from the host itself —
-    // and no operator would have guessed to switch it on beforehand.
-    let mut ignoreip = IgnoreList::new();
+    // One assembly, shared with `tfps_ctl ban` (`tfps::guard`). The daemon's policy on a
+    // refused entry: announce it and carry on, because there are hours of traffic ahead
+    // and a startup report to say it in.
     let local = xdp::local_addresses();
-    for ip in &local {
-        ignoreip.add_local(*ip);
+    let guard = tfps::guard::assemble(&local, args.ignoreip.iter().map(String::as_str));
+    for e in &guard.rejected {
+        eprintln!("ALARM: ignoreip entry rejected — {e}");
     }
-    for entry in &args.ignoreip {
-        // A refused entry is announced, never dropped quietly: an operator who believes a
-        // range is exempt when it is not would draw exactly the wrong conclusion from a
-        // block.
-        if let Err(e) = ignoreip.add(entry) {
-            eprintln!("ALARM: ignoreip entry rejected — {e}");
-        }
-    }
+    let mut ignoreip = guard.list;
     // §12 requires the operator to see which rules exist, not just how many.
     say!(
         "  ignoreip          : {} local, {} declared",
@@ -527,11 +519,7 @@ fn main() -> ExitCode {
         ignoreip.declared()
     );
     for (label, origin, _) in ignoreip.report() {
-        let kind = match origin {
-            tfps_core::ignore::Origin::Local => "this host",
-            tfps_core::ignore::Origin::Declared => "declared",
-        };
-        say!("                      {label} ({kind})");
+        say!("                      {label} ({})", origin.describe());
     }
 
     let sock = match Socket::new(
@@ -821,7 +809,7 @@ fn main() -> ExitCode {
                     |ip| engine.is_known_peer(ip, t),
                     |ip| e.block(ip, 0),
                 );
-                for (ip, rule) in &applied.ignored {
+                for (ip, rule) in &applied.exempt {
                     say!("APIBAN: {ip} not blocked, ignoreip={rule}");
                 }
                 for ip in &applied.known {
@@ -840,11 +828,11 @@ fn main() -> ExitCode {
                         batch.ips.len()
                     );
                 }
-                if applied.condemned > 0 {
-                    apiban_total += applied.condemned;
+                if applied.blocked > 0 {
+                    apiban_total += applied.blocked;
                     say!(
                         "APIBAN: {} addresses condemned (total {apiban_total})",
-                        applied.condemned
+                        applied.blocked
                     );
                 }
             }

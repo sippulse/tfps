@@ -34,6 +34,16 @@ pub enum Origin {
     Declared,
 }
 
+impl Origin {
+    /// How a person reads it, in the startup report and in a refusal.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Origin::Local => "this host",
+            Origin::Declared => "declared",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Entry {
     label: String,

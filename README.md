@@ -333,12 +333,11 @@ never fires is rotten.
 The equivalent of `fail2ban`'s field of the same name. The host's **own addresses are always
 exempt** and need no entry — that is not configuration, it is read from the machine, and it
 exists because a defence that can condemn its own host will eventually do so. Declared
-entries add trusted carriers and management ranges. `tfps_ctl ban` applies the host's
-addresses and the file's entries too: placing a block by hand cannot reach the host or a
-range you declared in the file. It does not see `--ignoreip` given on the daemon's command
-line, and it does not exempt registered peers — a hand ban is the explicit override of that
-heuristic. An exempt source is still evaluated, counted and reported; only the block is
-withheld. Two rules keep it from becoming a policy knob: **`0.0.0.0/0` is refused** (use
+entries add trusted carriers and management ranges. `tfps_ctl ban` applies the same list:
+the host's addresses, the file's entries, and the entries the daemon persisted at its last
+checkpoint (which is how a `--ignoreip` given on its command line reaches a hand ban). It
+does not exempt registered peers — a hand ban is the explicit override of that heuristic.
+An exempt source is still evaluated, counted and reported; only the block is withheld. Two rules keep it from becoming a policy knob: **`0.0.0.0/0` is refused** (use
 `--no-enforce`, which announces itself), and every entry counts its hits, so a stale
 exemption shows as cold.
 
@@ -386,13 +385,9 @@ On the target machine:
 curl -fsSL https://tfps.co/install.sh | sh
 ```
 
-That fetches the latest release, compiles the XDP program against the running kernel's BTF,
-installs `tfps` and `tfps_ctl`, drops in the systemd unit, writes a starting
-`/etc/tfps/config.json` **only if one is not already there**, and starts the service. Run it
-again to upgrade — idempotent, and it never overwrites your configuration. It installs
-`clang` and `bpftool` itself when they are missing. From a checkout, `sudo
-./packaging/install.sh` does the same with what you built. [INSTALL.md](INSTALL.md) has the
-details, the knobs and the uninstall.
+Idempotent: run it again to upgrade, and it never overwrites `/etc/tfps/config.json`. From
+a checkout, `sudo ./packaging/install.sh` does the same with what you built. Every step,
+the knobs and the uninstall are in [INSTALL.md](INSTALL.md).
 
 ```sh
 journalctl -u tfps -f      # watch it decide, live

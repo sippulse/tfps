@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt --all --check)",
+      "Bash(journalctl *)",
+      "Bash(tfps_ctl status *)",
+      "Bash(npx tsc --noEmit)",
+      "Bash(npm run check)",
+      "Bash(npm test)",
+      "Bash(npx vitest run)",
+      "Bash(gbrain --version)",
+      "mcp__gbrain__recall"
+    ]
+  }
+}

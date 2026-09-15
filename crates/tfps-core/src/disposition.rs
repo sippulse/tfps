@@ -1,20 +1,20 @@
-// What the perimeter does with a condemnation, as a pure function.
-//
-// The rule this file exists for: a condemnation must never be computed and then
-// silently dropped. `SPEC.md` §12 makes silence an alarm, and the shape that
-// broke it was an `if / else if / else if` chain in `main.rs` with no `else` —
-// the third arm guarded on an enforcer that is `None` under `--no-enforce`. The
-// two exemption arms printed, the enforcement arm printed, and the fourth case,
-// "condemned while observing", fell off the end of the chain saying nothing.
-//
-// A chain can silently lack an arm. A total match over an enum cannot: adding a
-// state without handling it stops the build. That is the actual repair, and it
-// is why this is an enum rather than a fourth `else if`.
-//
-// It is also the only way to get the behaviour under test. The chain lived
-// inside a 660-line `fn main` with no tests of its own; every input that
-// matters is an argument here, including the enforcement state, which in the
-// caller comes from whether an XDP program could be attached.
+//! What the perimeter does with a condemnation, as a pure function.
+//!
+//! The rule this file exists for: a condemnation must never be computed and then
+//! silently dropped. `SPEC.md` §12 makes silence an alarm, and the shape that
+//! broke it was an `if / else if / else if` chain in `main.rs` with no `else` —
+//! the third arm guarded on an enforcer that is `None` under `--no-enforce`. The
+//! two exemption arms printed, the enforcement arm printed, and the fourth case,
+//! "condemned while observing", fell off the end of the chain saying nothing.
+//!
+//! A chain can silently lack an arm. A total match over an enum cannot: adding a
+//! state without handling it stops the build. That is the actual repair, and it
+//! is why this is an enum rather than a fourth `else if`.
+//!
+//! It is also the only way to get the behaviour under test. The chain lived
+//! inside a 660-line `fn main` with no tests of its own; every input that
+//! matters is an argument here, including the enforcement state, which in the
+//! caller comes from whether an XDP program could be attached.
 
 /// What should happen to a source the perimeter has judged.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,12 +37,40 @@ pub enum Disposition<'a> {
     WouldBlock { kind: &'a str, detail: &'a str },
 }
 
+/// The gate in front of every block, whoever is asking for it.
+///
+/// The perimeter's verdict, the APIBAN feed and a hand-placed `tfps_ctl ban`
+/// all pass here before an address reaches the kernel, and this is the only
+/// place the order is written down: the curated ignore list first, then a
+/// registered peer that authenticated, then whatever the caller does with what
+/// is left. `E` is whatever the caller needs to explain the exemption -- a rule
+/// label, or the label with its origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gate<E> {
+    /// On the ignore list: never enforce against it, and say which entry matched.
+    Exempt(E),
+    /// A registered peer that authenticated: known-good, never banned.
+    KnownPeer,
+    /// Nothing shields it; the caller decides what enforcement means.
+    Enforce,
+}
+
+/// Apply the gate. The ignore list outranks a learned registration.
+pub fn gate<E>(exempt: Option<E>, known_peer: bool) -> Gate<E> {
+    if let Some(why) = exempt {
+        return Gate::Exempt(why);
+    }
+    if known_peer {
+        return Gate::KnownPeer;
+    }
+    Gate::Enforce
+}
+
 /// Decide what to do with a judged source.
 ///
-/// Precedence is deliberate and matches the order an operator expects: a
-/// curated ignore list outranks a learned registration, and both outrank the
-/// verdict. Enforcement is consulted last, because whether we *act* must never
-/// change whether we *judged*.
+/// Precedence is `gate`'s, and both exemptions outrank the verdict. Enforcement
+/// is consulted last, because whether we *act* must never change whether we
+/// *judged*.
 pub fn disposition<'a>(
     reason: Option<(&'a str, &'a str)>,
     ignore_rule: Option<&'a str>,
@@ -52,17 +80,13 @@ pub fn disposition<'a>(
     let Some((kind, detail)) = reason else {
         return Disposition::Ignore;
     };
-    if let Some(rule) = ignore_rule {
-        return Disposition::ExemptIgnoreIp { kind, detail, rule };
+    match gate(ignore_rule, known_peer) {
+        Gate::Exempt(rule) => Disposition::ExemptIgnoreIp { kind, detail, rule },
+        Gate::KnownPeer => Disposition::ExemptKnownPeer { kind, detail },
+        Gate::Enforce if enforcing => Disposition::Block { kind, detail },
+        // Observing. The judgement stands and is reported; only the acting stops.
+        Gate::Enforce => Disposition::WouldBlock { kind, detail },
     }
-    if known_peer {
-        return Disposition::ExemptKnownPeer { kind, detail };
-    }
-    if enforcing {
-        return Disposition::Block { kind, detail };
-    }
-    // Observing. The judgement stands and is reported; only the acting stops.
-    Disposition::WouldBlock { kind, detail }
 }
 
 #[cfg(test)]
@@ -70,6 +94,16 @@ mod tests {
     use super::*;
 
     const INJECTION: Option<(&str, &str)> = Some(("injection", "'"));
+
+    // The one order every enforcement path shares. A registered peer never
+    // outranks the operator's list, and nothing shields an address the caller
+    // has not vouched for.
+    #[test]
+    fn the_gate_puts_the_ignore_list_before_a_registered_peer() {
+        assert_eq!(gate(Some("10.0.0.0/8"), true), Gate::Exempt("10.0.0.0/8"));
+        assert_eq!(gate::<&str>(None, true), Gate::KnownPeer);
+        assert_eq!(gate::<&str>(None, false), Gate::Enforce);
+    }
 
     // THE DEFECT. `--no-enforce` is documented as "observe only" and the banner
     // prints `enforcement: OFF`, but a condemnation under it produced no line at

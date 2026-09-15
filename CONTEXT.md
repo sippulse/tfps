@@ -128,6 +128,13 @@ what is not *ours to punish*. Two kinds: **local** entries (the host's own addre
 discovered, never configured) and **declared** entries (the operator's). A declared entry
 that has never matched is **cold**, and reported as such.
 
+**Disposition** — what the perimeter does with a source it has judged, given the verdict
+and the exemptions: **ignore** (nothing tripped), **exempt** (ignoreip or a registered
+peer; reported, never enforced), **would-block** (condemned while observing only) or
+**block**. The same **gate** — ignoreip first, then registered peer — stands in front of
+every block, whether the perimeter, the APIBAN feed or a hand-placed `tfps_ctl ban` asks
+for it. In code: `tfps_core::disposition`.
+
 **Volume backstop** — the authentication rule that fires on *authenticated attempts* when
 no digest challenge is ever seen, as opposed to the primary rule that fires on *failed
 authentications*. In code: `AuthAbuse`, reported as `auth_volume`. Distinct from a *failed

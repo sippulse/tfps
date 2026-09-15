@@ -198,18 +198,29 @@ impl Store {
     /// restart would reset the 30 days and the countdown would promise something a
     /// `systemctl restart` erases.
     pub fn learning_started(&self, default_now: u32) -> Result<u32, String> {
-        if let Ok(v) =
-            self.conn
-                .query_row("SELECT v FROM meta WHERE k = 'learning_started'", [], |r| {
-                    r.get::<_, String>(0)
-                })
-        {
-            if let Ok(t) = v.parse() {
-                return Ok(t);
-            }
+        // Three ways to have no usable value, and only one of them is quiet by right:
+        // no row is a first boot. A read that fails or a value that is not a
+        // timestamp both restart the window -- the safe direction, but a silent
+        // restart is exactly what `SPEC.md` 12 forbids, so each says what it found.
+        match self
+            .conn
+            .query_row("SELECT v FROM meta WHERE k = 'learning_started'", [], |r| {
+                r.get::<_, String>(0)
+            }) {
+            Ok(v) => match v.parse() {
+                Ok(t) => return Ok(t),
+                Err(_) => {
+                    self.meta_set("learning_started", &default_now.to_string())?;
+                    return Err(format!(
+                        "learning_started held {v:?}, not a timestamp; the window restarts now"
+                    ));
+                }
+            },
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(format!("reading learning_started: {e}")),
         }
-        // The same rule as the two above: the caller still gets a usable answer,
-        // and still gets told that it will not survive a restart.
+        // First boot: record it. The caller still gets a usable answer if the write
+        // fails, and is told that it will not survive a restart.
         self.meta_set("learning_started", &default_now.to_string())?;
         Ok(default_now)
     }
@@ -948,6 +959,29 @@ mod tests {
     // The same discard, third site: the learning start. Losing it does not lose
     // learning, but it restarts the window on the next boot, which is the exact
     // thing `the_learning_start_does_not_reset_on_every_boot` exists to prevent.
+    // A value that is not a timestamp restarts the window, which is the safe
+    // direction -- and says so, which is the part that used to be missing.
+    #[test]
+    fn a_corrupt_learning_start_is_replaced_and_reported() {
+        let path = tmp().with_extension("corrupt-learning.db");
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+        s.meta_set("learning_started", "yesterday").unwrap();
+        let e = s
+            .learning_started(1_700_000_000)
+            .expect_err("not a timestamp");
+        assert!(
+            e.contains("yesterday"),
+            "the operator sees what was there: {e}"
+        );
+        assert_eq!(
+            s.learning_started(1_800_000_000).unwrap(),
+            1_700_000_000,
+            "the replacement was written, so the next boot reads it back"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_failed_learning_start_write_is_reported_not_swallowed() {
         let path = tmp().with_extension("silent-learn.db");

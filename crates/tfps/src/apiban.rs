@@ -11,8 +11,10 @@
 //! field that enables it is the key.
 
 use std::net::Ipv4Addr;
+
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
+use tfps_core::disposition::{gate, Gate};
 
 /// Interval between fetches. APIBAN is incremental by ID, so each fetch brings only what
 /// appeared since the previous one.
@@ -31,15 +33,15 @@ pub struct Batch {
 /// What applying one batch actually did.
 ///
 /// Four disjoint outcomes, and every address in the batch lands in exactly one.
-/// `condemned` is a tally of writes the kernel accepted, not the batch size less
+/// `blocked` is a tally of writes the kernel accepted, not the batch size less
 /// what we refused ourselves — counting the second and reporting it as the first
 /// is what let the feed claim addresses it had never blocked.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Applied {
     /// Addresses the kernel is now dropping.
-    pub condemned: u64,
-    /// Refused before the kernel: the operator's ignore list, and the rule that matched.
-    pub ignored: Vec<(Ipv4Addr, String)>,
+    pub blocked: u64,
+    /// Exempt before the kernel: the operator's ignore list, and the rule that matched.
+    pub exempt: Vec<(Ipv4Addr, String)>,
     /// Refused before the kernel: a registered peer that authenticated.
     pub known: Vec<Ipv4Addr>,
     /// Reached the kernel and was rejected, with the reason.
@@ -59,23 +61,18 @@ where
 {
     let mut out = Applied::default();
     for &ip in ips {
-        // A third-party feed listing your own range is exactly what the ignore
-        // list is for: it is curated, but it is not yours.
-        if let Some(rule) = exempt(ip) {
-            out.ignored.push((ip, rule));
-            continue;
-        }
-        if known_peer(ip) {
-            // A registered customer's IP on the feed: it proved valid
-            // credentials, so we do not knock it off.
-            out.known.push(ip);
-            continue;
-        }
-        // The kernel is the only party that can say the address is now blocked.
-        // Its answer is the count.
-        match block(ip) {
-            Ok(()) => out.condemned += 1,
-            Err(e) => out.failed.push((ip, e)),
+        // The same gate as the perimeter's verdict (`tfps_core::disposition::gate`): a
+        // third-party feed listing your own range is exactly what the ignore list is
+        // for, and a registered customer's IP on the feed proved valid credentials.
+        match gate(exempt(ip), known_peer(ip)) {
+            Gate::Exempt(rule) => out.exempt.push((ip, rule)),
+            Gate::KnownPeer => out.known.push(ip),
+            // The kernel is the only party that can say the address is now blocked.
+            // Its answer is the count.
+            Gate::Enforce => match block(ip) {
+                Ok(()) => out.blocked += 1,
+                Err(e) => out.failed.push((ip, e)),
+            },
         }
     }
     out
@@ -470,21 +467,11 @@ mod tests {
         let body = format!("{{\"ID\":\"5\",\"ipaddress\":[{}]}}", many.join(","));
         assert_eq!(parse(&body).ips.len(), MAX_PER_FETCH);
     }
-}
 
-#[cfg(test)]
-mod apply_tests {
-    use super::*;
-    use std::cell::RefCell;
+    // ---- applying a batch ----
 
-    fn ip(last: u8) -> Ipv4Addr {
+    fn feed_ip(last: u8) -> Ipv4Addr {
         Ipv4Addr::new(45, 134, 144, last)
-    }
-
-    /// Records every address the kernel write was actually attempted on, so a
-    /// test can assert what never reached it as well as what did.
-    fn recorder() -> (RefCell<Vec<Ipv4Addr>>, ()) {
-        (RefCell::new(Vec::new()), ())
     }
 
     // THE DEFECT. The kernel write's result was discarded, and the count was the
@@ -495,13 +482,13 @@ mod apply_tests {
     // the silent one is on the path fed by a third party.
     #[test]
     fn a_refused_kernel_write_is_not_counted_as_condemned() {
-        let batch = [ip(1), ip(2), ip(3)];
+        let batch = [feed_ip(1), feed_ip(2), feed_ip(3)];
         let out = apply(
             &batch,
             |_| None,
             |_| false,
             |a| {
-                if a == ip(2) {
+                if a == feed_ip(2) {
                     Err("map is full".into())
                 } else {
                     Ok(())
@@ -509,12 +496,12 @@ mod apply_tests {
             },
         );
         assert_eq!(
-            out.condemned, 2,
+            out.blocked, 2,
             "an address the kernel refused was never condemned"
         );
         assert_eq!(
             out.failed,
-            vec![(ip(2), "map is full".to_string())],
+            vec![(feed_ip(2), "map is full".to_string())],
             "and the refusal must be reportable, with its reason"
         );
     }
@@ -523,9 +510,9 @@ mod apply_tests {
     // looks healthy and protects nothing.
     #[test]
     fn a_feed_that_blocks_nothing_reports_nothing_condemned() {
-        let batch = [ip(1), ip(2), ip(3)];
+        let batch = [feed_ip(1), feed_ip(2), feed_ip(3)];
         let out = apply(&batch, |_| None, |_| false, |_| Err("no map".into()));
-        assert_eq!(out.condemned, 0);
+        assert_eq!(out.blocked, 0);
         assert_eq!(out.failed.len(), 3);
     }
 
@@ -533,11 +520,11 @@ mod apply_tests {
     // kernel accepted is still counted exactly once.
     #[test]
     fn every_accepted_address_is_still_counted_once() {
-        let batch = [ip(1), ip(2), ip(3)];
+        let batch = [feed_ip(1), feed_ip(2), feed_ip(3)];
         let out = apply(&batch, |_| None, |_| false, |_| Ok(()));
-        assert_eq!(out.condemned, 3);
+        assert_eq!(out.blocked, 3);
         assert!(out.failed.is_empty());
-        assert!(out.ignored.is_empty());
+        assert!(out.exempt.is_empty());
         assert!(out.known.is_empty());
     }
 
@@ -545,29 +532,29 @@ mod apply_tests {
     // would turn every ignore-list hit into an alarm.
     #[test]
     fn a_local_refusal_is_not_a_kernel_failure() {
-        let batch = [ip(1), ip(2)];
+        let batch = [feed_ip(1), feed_ip(2)];
         let out = apply(
             &batch,
-            |a| (a == ip(1)).then(|| "10.0.0.0/8".to_string()),
-            |a| a == ip(2),
+            |a| (a == feed_ip(1)).then(|| "10.0.0.0/8".to_string()),
+            |a| a == feed_ip(2),
             |_| Ok(()),
         );
-        assert_eq!(out.condemned, 0, "neither address reached the kernel");
+        assert_eq!(out.blocked, 0, "neither address reached the kernel");
         assert!(out.failed.is_empty(), "a refusal we made is not a failure");
-        assert_eq!(out.ignored, vec![(ip(1), "10.0.0.0/8".to_string())]);
-        assert_eq!(out.known, vec![ip(2)]);
+        assert_eq!(out.exempt, vec![(feed_ip(1), "10.0.0.0/8".to_string())]);
+        assert_eq!(out.known, vec![feed_ip(2)]);
     }
 
     // Precedence, and that a refused address touches nothing. The ignore list
     // outranks a learned registration, and neither reaches the map.
     #[test]
     fn a_refused_address_never_reaches_the_kernel() {
-        let (seen, ()) = recorder();
-        let batch = [ip(1), ip(2), ip(3)];
+        let seen = std::cell::RefCell::new(Vec::new());
+        let batch = [feed_ip(1), feed_ip(2), feed_ip(3)];
         let out = apply(
             &batch,
-            |a| (a == ip(1)).then(|| "10.0.0.0/8".to_string()),
-            |a| a == ip(1) || a == ip(2),
+            |a| (a == feed_ip(1)).then(|| "10.0.0.0/8".to_string()),
+            |a| a == feed_ip(1) || a == feed_ip(2),
             |a| {
                 seen.borrow_mut().push(a);
                 Ok(())
@@ -575,16 +562,16 @@ mod apply_tests {
         );
         assert_eq!(
             *seen.borrow(),
-            vec![ip(3)],
+            vec![feed_ip(3)],
             "only the address nothing refused is written"
         );
         assert_eq!(
-            out.ignored.len(),
+            out.exempt.len(),
             1,
             "the curated list outranks the learned registration"
         );
-        assert!(out.known.iter().all(|a| *a != ip(1)));
-        assert_eq!(out.condemned, 1);
+        assert!(out.known.iter().all(|a| *a != feed_ip(1)));
+        assert_eq!(out.blocked, 1);
     }
 
     // An empty batch says nothing at all -- there is no line to print, and the
@@ -593,7 +580,7 @@ mod apply_tests {
     fn an_empty_batch_condemns_nothing() {
         let out = apply(&[], |_| None, |_| false, |_| Ok(()));
         assert_eq!(out, Applied::default());
-        assert_eq!(out.condemned, 0);
+        assert_eq!(out.blocked, 0);
     }
 
     // The counter and the report must agree. A count that is not the number of
@@ -601,7 +588,7 @@ mod apply_tests {
     #[test]
     fn the_count_always_equals_the_writes_the_kernel_accepted() {
         for failing in 0..=4usize {
-            let batch: Vec<Ipv4Addr> = (1..=4).map(ip).collect();
+            let batch: Vec<Ipv4Addr> = (1..=4).map(feed_ip).collect();
             let out = apply(
                 &batch,
                 |_| None,
@@ -615,7 +602,7 @@ mod apply_tests {
                 },
             );
             assert_eq!(
-                out.condemned as usize,
+                out.blocked as usize,
                 4 - failing,
                 "failing={failing}: condemned must equal the accepted writes"
             );
