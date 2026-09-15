@@ -417,7 +417,7 @@ fn unban(args: &Args) -> Result<(), String> {
 }
 
 /// Why a hand-placed block was refused, and by which rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct Refusal {
     origin: Origin,
     rule: String,
@@ -475,19 +475,21 @@ fn ban(args: &Args) -> Result<(), String> {
     for raw in &args.positional {
         ips.push(raw.parse::<Ipv4Addr>().map_err(|e| format!("{raw}: {e}"))?);
     }
-    let mut guard = enforcement_guard(&args.config)?;
+    let mut guard = enforcement_guard(
+        &tfps::xdp::local_addresses(),
+        tfps::config::load(&args.config),
+    )?;
     // The map is opened on the first address that survives the guard, not before.
     // Refusing to blackhole the host is a decision this tool can make on its own,
     // and making it conditional on CAP_BPF and a running daemon would mean the
     // answer to "would this have blocked my box?" depends on who is asking.
     let mut b: Option<Blocklist> = None;
     let out = place(&ips, &mut guard, |ip| {
-        if b.is_none() {
-            b = Some(Blocklist::open(args.map.as_deref())?);
-        }
-        b.as_mut()
-            .expect("just opened above, or returned")
-            .insert(ip, args.ttl)
+        let bl = match b.as_mut() {
+            Some(bl) => bl,
+            None => b.insert(Blocklist::open(args.map.as_deref())?),
+        };
+        bl.insert(ip, args.ttl)
     });
 
     let how = if args.ttl == 0 {
@@ -533,15 +535,38 @@ fn ban(args: &Args) -> Result<(), String> {
 ///
 /// The host's own addresses come from the kernel exactly as `xdp::local_addresses`
 /// gives them to the daemon, and the declared ranges from the same configuration
-/// file. A malformed entry is announced rather than dropped, for the reason
+/// file. Both arrive as arguments so the assembly is drivable from a test; `ban`
+/// is the only caller and passes the real ones.
+///
+/// An empty host set is refused, not accepted. `local_addresses` returns nothing
+/// when `/proc/net/fib_trie` cannot be read, and a real host is never empty --
+/// loopback alone is a LOCAL route whenever `lo` is up. So empty means the read
+/// failed, and a guard built without the host's addresses is exactly the guard
+/// that lets a typo blackhole the box. The daemon differs here on purpose: it
+/// announces `ignoreip: 0 local` and carries on, because it has a whole startup
+/// report to say so in and hours of traffic ahead of it; this command has one
+/// line and one write.
+///
+/// A malformed entry is announced rather than dropped, for the reason
 /// `IgnoreList::add` gives: an operator who mistypes a network must not be left
-/// believing a range is exempt when it is not.
-fn enforcement_guard(config: &Path) -> Result<IgnoreList, String> {
+/// believing a range is exempt when it is not. A broken file aborts for the same
+/// reason, where the daemon alarms and continues without it.
+fn enforcement_guard(
+    local: &[Ipv4Addr],
+    loaded: tfps::config::Loaded,
+) -> Result<IgnoreList, String> {
+    if local.is_empty() {
+        return Err(
+            "could not read this host's addresses from /proc/net/fib_trie; \
+             refusing to place a block without the host guard"
+                .into(),
+        );
+    }
     let mut guard = IgnoreList::new();
-    for ip in tfps::xdp::local_addresses() {
+    for &ip in local {
         guard.add_local(ip);
     }
-    match tfps::config::load(config) {
+    match loaded {
         tfps::config::Loaded::File(c, _) => {
             for entry in &c.ignoreip {
                 guard.add(entry)?;
@@ -848,6 +873,84 @@ mod tests {
         let out = place(&[host, ip(7)], &mut g, |_| Ok(()));
         assert_eq!(out.blocked, vec![host, ip(7)]);
         assert!(out.refused.is_empty());
+    }
+
+    // The seam the tests above do not reach: `place` honours whatever guard it
+    // is handed, so the guard has to be shown to contain the two real sources.
+    // Dropping either loop in `enforcement_guard` would pass every test above.
+    #[test]
+    fn the_guard_is_built_from_the_host_and_the_file() {
+        let host = Ipv4Addr::new(10, 0, 0, 60);
+        let cfg = tfps::config::Config {
+            ignoreip: vec!["203.0.113.0/24".to_string()],
+            ..Default::default()
+        };
+        let mut g = enforcement_guard(
+            &[host],
+            tfps::config::Loaded::File(Box::new(cfg), PathBuf::new()),
+        )
+        .expect("a readable host and a well-formed file build a guard");
+        assert_eq!(
+            g.exempt_entry(host).map(|(_, o)| o),
+            Some(Origin::Local),
+            "the host's own address comes from the kernel"
+        );
+        assert_eq!(
+            g.exempt_entry(Ipv4Addr::new(203, 0, 113, 7))
+                .map(|(_, o)| o),
+            Some(Origin::Declared),
+            "the declared range comes from the file"
+        );
+        assert!(
+            g.exempt_entry(Ipv4Addr::new(8, 8, 8, 8)).is_none(),
+            "nothing else is exempt"
+        );
+    }
+
+    // A fresh install has no file at all. That must not weaken the host guard.
+    #[test]
+    fn an_absent_file_still_guards_the_host() {
+        let host = Ipv4Addr::new(10, 0, 0, 60);
+        let mut g = enforcement_guard(&[host], tfps::config::Loaded::Absent)
+            .expect("no file is the normal case");
+        assert!(g.exempt_entry(host).is_some());
+        assert!(g.exempt_entry(ip(8)).is_none(), "nothing was declared");
+    }
+
+    // `local_addresses` returns nothing only when /proc/net/fib_trie could not be
+    // read: loopback alone is a LOCAL route on any host with `lo` up. A guard
+    // built without the host is the guard that lets a typo blackhole the box, so
+    // the command refuses to run rather than run unguarded.
+    #[test]
+    fn an_unreadable_host_set_refuses_to_place_anything() {
+        let err = enforcement_guard(&[], tfps::config::Loaded::Absent)
+            .expect_err("no host addresses must not become no host guard");
+        assert!(
+            err.contains("fib_trie"),
+            "the operator is told what failed: {err}"
+        );
+    }
+
+    // A broken file and a malformed entry both abort, where the daemon alarms
+    // and continues. This tool has one write to make and the alternative is
+    // making it while an exemption the operator believes in is silently absent.
+    #[test]
+    fn a_broken_file_or_entry_aborts_rather_than_weakening_the_guard() {
+        let host = Ipv4Addr::new(10, 0, 0, 60);
+        assert!(enforcement_guard(
+            &[host],
+            tfps::config::Loaded::Broken("EOF while parsing".into())
+        )
+        .is_err());
+        let cfg = tfps::config::Config {
+            ignoreip: vec!["203.0.113.0/33".to_string()],
+            ..Default::default()
+        };
+        assert!(enforcement_guard(
+            &[host],
+            tfps::config::Loaded::File(Box::new(cfg), PathBuf::new())
+        )
+        .is_err());
     }
 
     #[test]

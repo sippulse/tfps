@@ -30,9 +30,11 @@ use tfps_core::engine::{Engine, PeerAnomalyRecord};
 
 pub const DEFAULT_PATH: &str = "/var/lib/tfps/tfps.db";
 
-/// Schema version. An incompatible change recreates the tables rather than corrupting —
-/// losing a baseline is recoverable in days; reading a bitmap with the wrong semantics is
-/// not.
+/// Schema version. An incompatible change recreates the *learned* tables rather than
+/// corrupting — losing a baseline is recoverable in days; reading a bitmap with the wrong
+/// semantics is not. Two tables survive a bump because traffic cannot rebuild them:
+/// `block_log` (the audit record) and `apiban_ip` (a feed behind a forward-only cursor).
+/// See `migrate()` for what that means when their own columns change.
 const SCHEMA: i64 = 1;
 
 /// A source's learned state, as stored — for the control tool.
@@ -324,9 +326,11 @@ impl Store {
     ///
     /// Failure is not fatal — the caller carries on — but it is not silent
     /// either, which is a different claim and the one this used to get wrong.
-    /// The APIBAN cursor lives in this table, and the comment on the schema says
-    /// what losing it costs: the integration "silently protects nothing after a
-    /// restart". Whoever calls this is the only thing that can print it.
+    /// What a lost write costs depends on the key: the APIBAN cursor costs a
+    /// refetch of the feed from the start (bandwidth, not correctness), and
+    /// `learning_started` restarts the learning window on the next boot. Whoever
+    /// calls this is the only thing that knows the key, so it is the only thing
+    /// that can print it.
     pub fn meta_set(&self, key: &str, value: &str) -> Result<(), String> {
         self.conn
             .execute(
@@ -920,10 +924,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // THE DEFECT, half two. `meta` writes were silent too, and the schema
-    // comment above that table says what losing them costs: the APIBAN cursor
-    // lives there, so the integration "silently protects nothing after a
-    // restart".
+    // THE DEFECT, half two. `meta` writes were silent too. The APIBAN cursor
+    // lives there, so a lost write means the whole feed is refetched on the
+    // next boot -- harmless, but worth a line -- and `learning_started` lives
+    // there too, so a lost write restarts the learning window.
     #[test]
     fn a_failed_meta_write_is_reported_not_swallowed() {
         let path = tmp().with_extension("silent-meta.db");

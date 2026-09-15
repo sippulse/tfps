@@ -16,8 +16,6 @@
 // matters is an argument here, including the enforcement state, which in the
 // caller comes from whether an XDP program could be attached.
 
-use core::fmt;
-
 /// What should happen to a source the perimeter has judged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Disposition<'a> {
@@ -37,32 +35,6 @@ pub enum Disposition<'a> {
     /// still has to be reported -- that report is the entire point of an
     /// observe-only run.
     WouldBlock { kind: &'a str, detail: &'a str },
-}
-
-impl Disposition<'_> {
-    /// The rule that fired, for any disposition that has one.
-    pub fn kind(&self) -> Option<&str> {
-        match self {
-            Disposition::Ignore => None,
-            Disposition::ExemptIgnoreIp { kind, .. }
-            | Disposition::ExemptKnownPeer { kind, .. }
-            | Disposition::Block { kind, .. }
-            | Disposition::WouldBlock { kind, .. } => Some(kind),
-        }
-    }
-}
-
-impl fmt::Display for Disposition<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Disposition::Ignore => write!(f, "ignore"),
-            Disposition::ExemptIgnoreIp { .. } | Disposition::ExemptKnownPeer { .. } => {
-                write!(f, "exempt")
-            }
-            Disposition::Block { .. } => write!(f, "blocked"),
-            Disposition::WouldBlock { .. } => write!(f, "would-block"),
-        }
-    }
 }
 
 /// Decide what to do with a judged source.
@@ -118,18 +90,6 @@ mod tests {
         );
     }
 
-    // The name an operator reads in the log line, and greps for afterwards.
-    #[test]
-    fn the_observed_verdict_has_a_name_of_its_own() {
-        let d = disposition(INJECTION, None, false, false);
-        assert_eq!(d.to_string(), "would-block");
-        assert_eq!(
-            d.kind(),
-            Some("injection"),
-            "an observed verdict names the rule that fired, like every other"
-        );
-    }
-
     // NEGATIVE CONTROL for the fix above. Widening the not-enforcing path is how
     // you silently change the enforcing one; this pins it.
     #[test]
@@ -140,10 +100,6 @@ mod tests {
                 kind: "injection",
                 detail: "'"
             }
-        );
-        assert_eq!(
-            disposition(INJECTION, None, false, true).to_string(),
-            "blocked"
         );
     }
 

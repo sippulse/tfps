@@ -804,8 +804,8 @@ fn main() -> ExitCode {
                 // Persist the resume point before the addresses: refetching a batch is
                 // harmless, whereas losing the id means starting the feed over.
                 if let (Some(id), Some(s)) = (&batch.next_id, db.as_ref()) {
-                    if let Err(e) = s.meta_set(APIBAN_ID_KEY, id) {
-                        eprintln!("ALARM: could not persist the APIBAN resume point: {e}");
+                    if let Err(err) = s.meta_set(APIBAN_ID_KEY, id) {
+                        eprintln!("WARNING: could not persist the APIBAN resume point: {err}");
                     }
                 }
                 if let Some(s) = db.as_mut() {
@@ -829,9 +829,16 @@ fn main() -> ExitCode {
                 }
                 // Same alarm the perimeter's own block path raises for the same
                 // failure. A feed that condemns nothing while reporting a total is
-                // an integration that looks healthy and protects nothing.
-                for (ip, err) in &applied.failed {
-                    eprintln!("ALARM: could not block {ip} from the APIBAN feed: {err}");
+                // an integration that looks healthy and protects nothing. One line
+                // per batch, as the boot-time restore does: a missing or full map
+                // fails every address in a 5,000-entry batch the same way, and a
+                // burst that size would drown the alarms that matter more.
+                if let Some((first_ip, first_err)) = applied.failed.first() {
+                    eprintln!(
+                        "ALARM: {} of {} APIBAN addresses could not be blocked, first {first_ip}: {first_err}",
+                        applied.failed.len(),
+                        batch.ips.len()
+                    );
                 }
                 if applied.condemned > 0 {
                     apiban_total += applied.condemned;

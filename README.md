@@ -323,11 +323,14 @@ never fires is rotten.
 The equivalent of `fail2ban`'s field of the same name. The host's **own addresses are always
 exempt** and need no entry — that is not configuration, it is read from the machine, and it
 exists because a defence that can condemn its own host will eventually do so. Declared
-entries add trusted carriers and management ranges. `tfps_ctl ban` applies the same list:
-placing a block by hand cannot reach the host or a range you declared. An exempt source is still evaluated,
-counted and reported; only the block is withheld. Two rules keep it from becoming a policy
-knob: **`0.0.0.0/0` is refused** (use `--no-enforce`, which announces itself), and every
-entry counts its hits, so a stale exemption shows as cold.
+entries add trusted carriers and management ranges. `tfps_ctl ban` applies the host's
+addresses and the file's entries too: placing a block by hand cannot reach the host or a
+range you declared in the file. It does not see `--ignoreip` given on the daemon's command
+line, and it does not exempt registered peers — a hand ban is the explicit override of that
+heuristic. An exempt source is still evaluated, counted and reported; only the block is
+withheld. Two rules keep it from becoming a policy knob: **`0.0.0.0/0` is refused** (use
+`--no-enforce`, which announces itself), and every entry counts its hits, so a stale
+exemption shows as cold.
 
 ### `apiban_key` — optional integration
 
@@ -416,7 +419,8 @@ tfps_ctl stats                        every counter: kernel drops, traffic mix, 
 tfps_ctl banned [--why]               condemned sources, with time left and the reason
 tfps_ctl unban <ip>... | --all        lift a block — takes effect on the next packet
 tfps_ctl ban <ip> [--ttl N]           condemn by hand (default 3600s, 0 = no expiry)
-                                      refuses this host's addresses and anything in ignoreip
+                                      refuses this host's addresses and anything in ignoreip;
+                                      exits non-zero if any address was refused or failed
 tfps_ctl sources [--peer --country]   learned sources and the countries they call
 tfps_ctl source <peer>                everything known about one source
 tfps_ctl peers                        sources by country breadth, when last heard
