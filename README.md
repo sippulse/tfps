@@ -91,7 +91,7 @@ configured on the softswitch at all.
 
 ---
 
-## Status — v0.1.0
+## Status — v0.2.0
 
 | working | not yet |
 |---|---|
