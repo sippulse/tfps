@@ -22,6 +22,7 @@ const POLL_SECS: u64 = 300;
 const MAX_PER_FETCH: usize = 5_000;
 
 /// A batch of addresses to condemn, plus the ID to resume from.
+#[derive(Debug, Default)]
 pub struct Batch {
     pub ips: Vec<Ipv4Addr>,
     pub next_id: Option<String>,
@@ -122,21 +123,43 @@ fn fetch(key: &str, id: &str) -> Result<Batch, String> {
     // binary the system resolver cannot talk to the systemd-resolved stub (127.0.0.53) and
     // fails with EAI_AGAIN; and returning an IPv6 address on a host with no v6 route yields
     // EHOSTUNREACH. Our resolver skips the stub and returns only IPv4, sidestepping both.
+    //
+    // A 4xx is returned, not raised: APIBAN answers "no new bans" with status 400, and
+    // treating that as an error turned every quiet poll into a WARNING (one per five
+    // minutes, two thousand a week on a real host). `received` decides what a status means.
     let agent = ureq::Agent::with_parts(
         ureq::config::Config::builder()
             .timeout_global(Some(Duration::from_secs(20)))
+            .http_status_as_error(false)
             .build(),
         ureq::unversioned::transport::DefaultConnector::default(),
         MuslSafeResolver,
     );
-    let body = agent
-        .get(&url)
-        .call()
-        .map_err(|e| format!("{e}"))?
+    let mut response = agent.get(&url).call().map_err(|e| format!("{e}"))?;
+    let status = response.status().as_u16();
+    let body = response
         .body_mut()
         .read_to_string()
         .map_err(|e| format!("reading response: {e}"))?;
-    Ok(parse(&body))
+    received(status, &body)
+}
+
+/// What a reply means, decided from the status and the body together.
+///
+/// A 200 is a batch. A 4xx whose body is APIBAN's own "nothing new" reply is an empty
+/// batch, because that is what it is — the feed is reachable, current, and quiet.
+/// Anything else is reported with the status and the start of the body, so that the
+/// next surprise from the API is diagnosable from the journal alone.
+fn received(status: u16, body: &str) -> Result<Batch, String> {
+    let nothing_new = body.contains("\"none\"") || body.contains("no new bans");
+    match status {
+        200..=299 => Ok(parse(body)),
+        400..=499 if nothing_new => Ok(Batch::default()),
+        _ => {
+            let head: String = body.chars().take(80).collect();
+            Err(format!("http status: {status}, body: {head:?}"))
+        }
+    }
 }
 
 /// A resolver that does its own DNS, independent of the C library's `getaddrinfo`.
@@ -381,6 +404,36 @@ mod tests {
         let b = parse(r#"{"ID":"none","ipaddress":["no new bans"]}"#);
         assert!(b.next_id.is_none(), "`none` is not an ID to resume from");
         assert!(b.ips.is_empty(), "text that is not an IP is discarded");
+    }
+
+    // THE DEFECT. APIBAN says "nothing new" with HTTP 400, and the client raised every
+    // 4xx before the body was read, so the parser above -- which already understood the
+    // reply -- never saw it. Every quiet poll became `WARNING: APIBAN unreachable`.
+    #[test]
+    fn nothing_new_with_a_400_status_is_an_empty_batch_not_an_outage() {
+        let b = received(400, r#"{"ipaddress":["no new bans"],"ID":"none"}"#)
+            .expect("a quiet feed is not an unreachable one");
+        assert!(b.ips.is_empty());
+        assert!(b.next_id.is_none(), "there is no ID to advance to");
+    }
+
+    // NEGATIVE CONTROLS. A 4xx that is not the quiet reply is still an error, and so is
+    // anything 5xx even with a body that mentions bans -- and the message carries the
+    // status and the body, so the journal says what the API actually said.
+    #[test]
+    fn other_failures_are_still_reported_with_what_the_api_said() {
+        let e =
+            received(403, r#"{"error":"invalid key"}"#).expect_err("a refused key is an outage");
+        assert!(e.contains("403") && e.contains("invalid key"), "{e}");
+        let e = received(500, "no new bans").expect_err("a server error is an outage");
+        assert!(e.contains("500"), "{e}");
+    }
+
+    #[test]
+    fn a_normal_batch_is_still_a_batch() {
+        let b = received(200, r#"{"ipaddress":["195.96.139.178"],"ID":"1789480638"}"#).unwrap();
+        assert_eq!(b.ips, vec![Ipv4Addr::new(195, 96, 139, 178)]);
+        assert_eq!(b.next_id.as_deref(), Some("1789480638"));
     }
 
     #[test]
