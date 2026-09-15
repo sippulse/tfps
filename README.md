@@ -9,6 +9,16 @@ parsing log files, so it reacts in packets rather than log-flush intervals, and 
 attacks the logs never record. As a side effect the banned traffic vanishes from your
 `sngrep`.
 
+## Install
+
+```sh
+curl -fsSL https://tfps.co/install.sh | sh
+```
+
+Linux x86_64, kernel 5.15 or newer with BTF, systemd. That is the whole install; it asks for
+`sudo` if needed, and running it again upgrades. Pinning a version, air-gapped hosts, building
+from source and uninstalling are in [INSTALL.md](INSTALL.md).
+
 Two layers, and the first is the product:
 
 - **Prevention** (default, on): drops SIP scanning, brute-force and known-bad sources —
@@ -370,17 +380,19 @@ BTF.
 
 ## Installing and running
 
-On the target machine, as root, from a checkout with the binaries built:
+On the target machine:
 
 ```sh
-./packaging/install.sh
+curl -fsSL https://tfps.co/install.sh | sh
 ```
 
-That compiles the XDP program against the running kernel's BTF, installs `tfps` and
-`tfps_ctl`, drops in the systemd unit, writes a starting `/etc/tfps/config.json` **only if
-one is not already there**, and starts the service. Run it again to upgrade — idempotent,
-and it never overwrites your configuration. It needs `clang` and `bpftool` (Debian/Ubuntu:
-`apt install clang linux-tools-common`).
+That fetches the latest release, compiles the XDP program against the running kernel's BTF,
+installs `tfps` and `tfps_ctl`, drops in the systemd unit, writes a starting
+`/etc/tfps/config.json` **only if one is not already there**, and starts the service. Run it
+again to upgrade — idempotent, and it never overwrites your configuration. It installs
+`clang` and `bpftool` itself when they are missing. From a checkout, `sudo
+./packaging/install.sh` does the same with what you built. [INSTALL.md](INSTALL.md) has the
+details, the knobs and the uninstall.
 
 ```sh
 journalctl -u tfps -f      # watch it decide, live

@@ -126,26 +126,22 @@
 
       <section id="install" class="section-shell install">
         <div class="section-heading">
-          <p class="eyebrow">Build and install</p>
-          <h2>Small enough to understand.</h2>
-          <p>TFPS targets Linux kernel 5.15 or newer with BTF. Start in observe-only mode if you want to inspect decisions before enabling XDP enforcement.</p>
+          <p class="eyebrow">Install</p>
+          <h2>One line. Two minutes.</h2>
+          <p>Linux x86_64, kernel 5.15 or newer with BTF, systemd. The installer fetches the latest release, compiles the XDP program against your kernel, installs the service and starts it. Run it again to upgrade; your configuration is never overwritten.</p>
         </div>
         <div class="terminal" role="region" aria-label="Installation commands">
-          <div class="terminal-bar"><span></span><span></span><span></span><em>bash</em></div>
-          <pre><code><span class="comment"># Build the two static binaries</span>
-git clone https://github.com/sippulse/tfps.git
-cd tfps
-cargo build --release --target x86_64-unknown-linux-musl
+          <div class="terminal-bar"><span></span><span></span><span></span><em>sh</em></div>
+          <pre><code><span class="comment"># Install or upgrade, on the machine that runs your SIP service</span>
+curl -fsSL https://tfps.co/install.sh | sh
 
-<span class="comment"># Install the service and XDP program as root</span>
-sudo ./packaging/install.sh
-
-<span class="comment"># Confirm traffic and enforcement</span>
-sudo tfps_ctl status</code></pre>
+<span class="comment"># Watch it decide, and ask what it knows</span>
+journalctl -u tfps -f
+tfps_ctl status</code></pre>
         </div>
         <p class="install-note">
-          Read the <a href="https://github.com/sippulse/tfps/wiki/Installation">installation guide</a>
-          for prerequisites, configuration, and a safe rollout checklist.
+          Read <a href="https://github.com/sippulse/tfps/blob/master/INSTALL.md">INSTALL.md</a>
+          for prerequisites, pinning a version, air-gapped hosts, observe-only rollout and uninstalling.
         </p>
       </section>
 

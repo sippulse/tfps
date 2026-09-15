@@ -1,0 +1,63 @@
+# Builds the static musl binaries and attaches them to a GitHub release whenever a
+# version tag is pushed. The one-line installer (packaging/install.sh) downloads
+# tfps-x86_64-linux-musl.tar.gz and its .sha256 from the latest release, so the tarball
+# layout here is the layout the installer expects:
+#
+#   tfps-x86_64-linux-musl/
+#     tfps  tfps_ctl
+#     ebpf/tfps_xdp.c                      compiled on the target against its own BTF
+#     packaging/tfps.service  config.example.json  install.sh
+#
+# Cut a release with:   git tag v0.2.0 && git push origin v0.2.0
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: musl toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: gate
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
+      - name: build
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: package
+        run: |
+          set -eu
+          out=tfps-x86_64-linux-musl
+          mkdir -p "$out/ebpf" "$out/packaging"
+          cp target/x86_64-unknown-linux-musl/release/tfps \
+             target/x86_64-unknown-linux-musl/release/tfps_ctl "$out/"
+          cp ebpf/tfps_xdp.c "$out/ebpf/"
+          cp packaging/tfps.service packaging/config.example.json packaging/install.sh "$out/packaging/"
+          tar czf "$out.tar.gz" "$out"
+          sha256sum "$out.tar.gz" > "$out.tar.gz.sha256"
+          ls -l "$out.tar.gz" && cat "$out.tar.gz.sha256"
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "TFPS $GITHUB_REF_NAME" \
+            --generate-notes \
+            tfps-x86_64-linux-musl.tar.gz \
+            tfps-x86_64-linux-musl.tar.gz.sha256
