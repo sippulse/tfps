@@ -343,13 +343,12 @@ struct CondemnationDoc {
 /// summary, and the checkpointed TRAFFIC block, as one document instead of
 /// three.
 ///
-/// That is three of what the human path below prints, not all of it. The human
-/// path also prints IGNOREIP, CALIBRATION, LEARNED and BLOCKS BY REASON, plus a
-/// `running for` line, and none of those is in this document. Adding them is a
-/// wider change than this one; what matters here is that the omission is
-/// stated, so nobody reads `stats --json` as the whole of `stats`.
+/// The rest of what the human path prints follows them: `running_for_secs`,
+/// `ignoreip`, `calibration`, `learned` and `blocks`. `stats --json` is the
+/// whole of `stats`, so nobody has to fall back to parsing the columns for the
+/// half a program could not otherwise reach.
 ///
-/// All three are `null`, never zeroed, when their source cannot be read:
+/// The first three are `null`, never zeroed, when their source cannot be read:
 /// `kernel` when the counters are unreachable, `condemnation` when
 /// `Blocklist::open` fails (a *different* kernel map from the one `kernel`
 /// reads — see `xdp::Blocklist::open` vs `xdp::live_counters`, either can
@@ -363,16 +362,119 @@ struct StatsDoc {
     kernel: Option<KernelDoc>,
     condemnation: Option<CondemnationDoc>,
     traffic: Option<TrafficDoc>,
+    /// Seconds since the daemon started, from `meta.started_at`; `null` when it
+    /// has not written one yet.
+    running_for_secs: Option<u32>,
+    /// `label -> hit count` for the exempt entries. `null` for a count that
+    /// will not parse, so a corrupt line is distinguishable from an absent one.
+    ignoreip: Option<std::collections::BTreeMap<String, Option<u64>>>,
+    /// The benign hypotheses the engine has learned. Values are floats and
+    /// share `rate`'s non-finite rule.
+    calibration: Option<std::collections::BTreeMap<String, Option<f64>>>,
+    learned: LearnedDoc,
+    blocks: BlocksDoc,
+}
+
+/// The four totals the human `LEARNED` block prints.
+///
+/// `pairs` and `peers` come from `Store::totals`, which counts the same column
+/// twice — they are always equal today. Both are carried because both are what
+/// the human view shows; if that query is ever split, these fields start
+/// carrying two different numbers without a contract change.
+#[derive(Serialize)]
+struct LearnedDoc {
+    pairs: u32,
+    peers: u32,
+    countries: u32,
+    intl_calls: u32,
+}
+
+/// One block-counting window: the total, and the split by reason behind it.
+#[derive(Serialize)]
+struct WindowDoc {
+    total: u32,
+    by_reason: std::collections::BTreeMap<String, u32>,
+}
+
+/// What the human `BLOCKS BY REASON` block prints. The APIBAN feed is counted
+/// apart from the windows because it is permanent and never audit-logged.
+#[derive(Serialize)]
+struct BlocksDoc {
+    apiban_feed: usize,
+    last_hour: WindowDoc,
+    last_day: WindowDoc,
+    last_week: WindowDoc,
+}
+
+fn learned_doc(pairs: u32, peers: u32, countries: u32, intl_calls: u32) -> LearnedDoc {
+    LearnedDoc {
+        pairs,
+        peers,
+        countries,
+        intl_calls,
+    }
+}
+
+fn window_doc(rows: Vec<(String, u32)>) -> WindowDoc {
+    WindowDoc {
+        total: rows.iter().map(|(_, n)| n).sum(),
+        by_reason: rows.into_iter().collect(),
+    }
+}
+
+fn blocks_doc(
+    apiban_feed: usize,
+    hour: Vec<(String, u32)>,
+    day: Vec<(String, u32)>,
+    week: Vec<(String, u32)>,
+) -> BlocksDoc {
+    BlocksDoc {
+        apiban_feed,
+        last_hour: window_doc(hour),
+        last_day: window_doc(day),
+        last_week: window_doc(week),
+    }
+}
+
+/// `label=hits` pairs, split from the right because the label is operator text.
+/// A count that will not parse is `null`, never dropped.
+fn ignoreip_doc(line: Option<&str>) -> Option<std::collections::BTreeMap<String, Option<u64>>> {
+    let line = line.filter(|l| !l.trim().is_empty())?;
+    Some(
+        line.split_whitespace()
+            .filter_map(|e| e.rsplit_once('='))
+            .map(|(label, hits)| (label.to_string(), hits.parse::<u64>().ok()))
+            .collect(),
+    )
+}
+
+/// `key=value` pairs whose values are floats, through the same `finite()` rule
+/// `rate` uses — `"inf".parse::<f64>()` succeeds, and an infinity is not a
+/// number a reader can use.
+fn calibration_doc(line: Option<&str>) -> Option<std::collections::BTreeMap<String, Option<f64>>> {
+    let line = line.filter(|l| !l.trim().is_empty())?;
+    Some(
+        line.split_whitespace()
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.parse::<f64>().ok().and_then(finite)))
+            .collect(),
+    )
 }
 
 /// Built from already-computed values, the same way `status_doc` is: no
 /// transformation happens here beyond wrapping. The nontrivial pieces —
 /// `condemnation_counts`'s perimeter/feed split and `traffic_doc`'s
 /// checkpoint parsing — are computed and tested on their own below.
+#[allow(clippy::too_many_arguments)]
 fn stats_doc(
     kernel: Option<(u64, u64, u64)>,
     condemnation: Option<(usize, usize, usize)>,
     traffic: Option<TrafficDoc>,
+    running_for_secs: Option<u32>,
+    ignoreip: Option<std::collections::BTreeMap<String, Option<u64>>>,
+    calibration: Option<std::collections::BTreeMap<String, Option<f64>>>,
+    learned: LearnedDoc,
+    blocks: BlocksDoc,
 ) -> StatsDoc {
     StatsDoc {
         kernel: kernel.map(|(seen, dropped, expired)| KernelDoc {
@@ -388,6 +490,11 @@ fn stats_doc(
             }
         }),
         traffic,
+        running_for_secs,
+        ignoreip,
+        calibration,
+        learned,
+        blocks,
     }
 }
 
@@ -464,12 +571,40 @@ fn stats(args: &Args) -> Result<(), String> {
         let condemnation = Blocklist::open(args.map.as_deref())
             .ok()
             .map(|b| condemnation_counts(&b.entries(), &audit, &apiban));
+        let now = now();
         let stats_line = s.meta_get("stats");
         let stats_ts = s.meta_get("stats_ts").and_then(|t| t.parse::<u32>().ok());
-        let traffic = traffic_doc(stats_line.as_deref(), stats_ts, now());
+        let traffic = traffic_doc(stats_line.as_deref(), stats_ts, now);
+        let running_for_secs = s
+            .meta_get("started_at")
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|t| now.saturating_sub(t));
+        let ignoreip = ignoreip_doc(s.meta_get("ignoreip").as_deref());
+        let calibration = calibration_doc(s.meta_get("calibration").as_deref());
+        // `?` here, not `unwrap_or_default`: the human path below propagates
+        // these two the same way, and a JSON reader is better served by no
+        // document and a non-zero exit than by a document with invented totals.
+        let (pairs, peers, _) = s.totals()?;
+        let (countries, intl_calls) = s.country_spread()?;
+        let window = |since: u32| s.blocks_by_reason(now.saturating_sub(since));
+        let blocks = blocks_doc(
+            apiban.len(),
+            window(3600)?,
+            window(86_400)?,
+            window(604_800)?,
+        );
         say!(
             "{}",
-            tfps::json_line(&stats_doc(kernel, condemnation, traffic))?
+            tfps::json_line(&stats_doc(
+                kernel,
+                condemnation,
+                traffic,
+                running_for_secs,
+                ignoreip,
+                calibration,
+                learned_doc(pairs, peers, countries, intl_calls),
+                blocks,
+            ))?
         );
         return Ok(());
     }
@@ -2610,10 +2745,92 @@ mod tests {
     /// Unreachable kernel counters are null, not zero. A tool that cannot read a
     /// counter and a counter that reads zero are different answers, and a
     /// consumer that cannot tell them apart will report "nothing was dropped"
+    /// `ignoreip` is written by the daemon as `label=hits` pairs. A hit count
+    /// that will not parse becomes `null` rather than vanishing, for the same
+    /// reason the traffic counters do: a reader must be able to tell "the
+    /// daemon never wrote this" from "this line is corrupt".
+    ///
+    /// The label is split from the RIGHT, because a CIDR label is arbitrary
+    /// operator text and the human path splits it the same way.
+    #[test]
+    fn ignoreip_doc_keeps_a_corrupt_hit_count_as_null() {
+        let d = ignoreip_doc(Some("10.0.0.0/24=5 192.168.0.0/16=0 weird=xx")).unwrap();
+        assert_eq!(d.get("10.0.0.0/24"), Some(&Some(5)));
+        assert_eq!(
+            d.get("192.168.0.0/16"),
+            Some(&Some(0)),
+            "zero is a real count"
+        );
+        assert_eq!(
+            d.get("weird"),
+            Some(&None),
+            "unparseable is null, not dropped"
+        );
+        assert_eq!(d.len(), 3, "no entry may be silently discarded");
+        assert_eq!(ignoreip_doc(None), None, "absent is absent");
+        assert_eq!(
+            ignoreip_doc(Some("")),
+            None,
+            "empty is absent, not an empty map"
+        );
+    }
+
+    /// `calibration` is written as `theta0_prefix={:.3} theta0c={:.3}
+    /// prior_mean={:.2}` — floats. `"inf".parse::<f64>()` succeeds, so the
+    /// non-finite hazard that made `rate` nullable applies here too: route it
+    /// through the same `finite()` rule rather than letting serde decide.
+    #[test]
+    fn calibration_doc_nulls_a_non_finite_value() {
+        let d =
+            calibration_doc(Some("theta0_prefix=0.125 theta0c=inf prior_mean=nonsense")).unwrap();
+        assert_eq!(d.get("theta0_prefix"), Some(&Some(0.125)));
+        assert_eq!(d.get("theta0c"), Some(&None), "an infinity is not a number");
+        assert_eq!(d.get("prior_mean"), Some(&None), "nor is unparseable text");
+        assert_eq!(d.len(), 3, "no entry may be silently discarded");
+        assert_eq!(calibration_doc(Some("")), None);
+    }
+
+    /// The four learned totals and the three block windows the human view
+    /// prints, as data. `pairs` and `peers` come from one query that counts the
+    /// same column twice — see the doc comment on `LearnedDoc`.
+    #[test]
+    fn learned_and_blocks_carry_the_human_views_numbers() {
+        let l = learned_doc(12, 12, 40, 300);
+        assert_eq!(
+            tfps::json_line(&l).unwrap(),
+            r#"{"pairs":12,"peers":12,"countries":40,"intl_calls":300}"#
+        );
+        let b = blocks_doc(
+            9,
+            vec![("scanner".to_string(), 3), ("injection".to_string(), 1)],
+            vec![("scanner".to_string(), 30)],
+            vec![],
+        );
+        assert_eq!(
+            b.last_hour.total, 4,
+            "the window total is the sum of its reasons"
+        );
+        assert_eq!(b.last_week.total, 0);
+        assert_eq!(
+            tfps::json_line(&b.last_hour).unwrap(),
+            r#"{"total":4,"by_reason":{"injection":1,"scanner":3}}"#
+        );
+        assert_eq!(b.apiban_feed, 9);
+    }
+
     /// about a box whose enforcement is broken.
     #[test]
     fn stats_doc_nulls_the_kernel_block_when_counters_are_unreachable() {
-        let d = stats_doc(None, Some((7, 5, 2)), None);
+        let d = stats_doc(
+            None,
+            Some((7, 5, 2)),
+            None,
+            None,
+            None,
+            None,
+            learned_doc(0, 0, 0, 0),
+            blocks_doc(0, vec![], vec![], vec![]),
+        );
         let line = tfps::json_line(&d).unwrap();
         assert!(line.contains(r#""kernel":null"#), "{line}");
         assert!(line.contains(r#""condemned_now":7"#), "{line}");
@@ -2621,7 +2838,16 @@ mod tests {
 
     #[test]
     fn stats_doc_reports_live_counters_when_they_are_readable() {
-        let d = stats_doc(Some((100, 40, 3)), Some((7, 5, 2)), None);
+        let d = stats_doc(
+            Some((100, 40, 3)),
+            Some((7, 5, 2)),
+            None,
+            None,
+            None,
+            None,
+            learned_doc(0, 0, 0, 0),
+            blocks_doc(0, vec![], vec![], vec![]),
+        );
         let line = tfps::json_line(&d).unwrap();
         assert!(line.contains(r#""seen":100"#), "{line}");
         assert!(line.contains(r#""dropped":40"#), "{line}");
@@ -2636,7 +2862,16 @@ mod tests {
     /// blocked" — about a box this tool simply could not check.
     #[test]
     fn stats_doc_nulls_the_condemnation_block_when_the_blocklist_is_unreachable() {
-        let d = stats_doc(Some((100, 40, 3)), None, None);
+        let d = stats_doc(
+            Some((100, 40, 3)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            learned_doc(0, 0, 0, 0),
+            blocks_doc(0, vec![], vec![], vec![]),
+        );
         let line = tfps::json_line(&d).unwrap();
         assert!(line.contains(r#""condemnation":null"#), "{line}");
         assert!(
