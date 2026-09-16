@@ -1199,7 +1199,13 @@ fn enforcement_guard(
 struct SourceRowDoc {
     peer: String,
     countries: u32,
-    rate: f64,
+    /// `null` when the stored rate is not a finite number.
+    ///
+    /// `rate_a` is `REAL NOT NULL` and SQLite stores an infinity faithfully, so
+    /// a non-finite value can reach here. JSON cannot spell one — `serde_json`
+    /// renders it `null` whatever the field is declared as — so the type says so
+    /// rather than promising a number it cannot always supply.
+    rate: Option<f64>,
     last_seen: u32,
 }
 
@@ -1209,9 +1215,15 @@ fn source_row_doc(peer: &str, countries: u32, rate: f64, last_seen: u32) -> Sour
     SourceRowDoc {
         peer: peer.to_string(),
         countries,
-        rate,
+        rate: finite(rate),
         last_seen,
     }
+}
+
+/// A rate a reader can use, or `None`. One rule in one place, so the two
+/// documents carrying this field cannot disagree about a non-finite value.
+fn finite(v: f64) -> Option<f64> {
+    v.is_finite().then_some(v)
 }
 
 fn sources(args: &Args) -> Result<(), String> {
@@ -1290,7 +1302,13 @@ fn sources(args: &Args) -> Result<(), String> {
 struct SourceDoc {
     peer: String,
     countries: u32,
-    rate: f64,
+    /// `null` when the stored rate is not a finite number.
+    ///
+    /// `rate_a` is `REAL NOT NULL` and SQLite stores an infinity faithfully, so
+    /// a non-finite value can reach here. JSON cannot spell one — `serde_json`
+    /// renders it `null` whatever the field is declared as — so the type says so
+    /// rather than promising a number it cannot always supply.
+    rate: Option<f64>,
     last_seen: u32,
     countries_known: Vec<String>,
 }
@@ -1308,7 +1326,7 @@ fn source_doc(
     SourceDoc {
         peer: peer.to_string(),
         countries,
-        rate,
+        rate: finite(rate),
         last_seen,
         countries_known: countries_known.iter().map(|c| c.to_string()).collect(),
     }
@@ -2307,6 +2325,86 @@ mod tests {
     /// has already wrapped: `--ttl 4294967296` would report an expiry of *now*,
     /// i.e. a block that has already elapsed, for a ban that in the kernel lasts
     /// essentially forever.
+    /// A rate that is not a finite number must say so as `null`, and the field
+    /// must be TYPED nullable so the contract and the wire agree.
+    ///
+    /// `rate_a` is a `REAL NOT NULL` column and SQLite stores an infinity
+    /// faithfully, so a non-finite value is reachable from the database. JSON
+    /// has no way to spell one: `serde_json` renders it `null` regardless of
+    /// what the field is declared as. Left as a bare `f64`, the document would
+    /// promise a number and hand back `null` — a consumer deserialising into
+    /// `f64` gets a parse error rather than a value, with nothing on stderr and
+    /// exit 0. Making it `Option<f64>` changes no wire byte; it stops the type
+    /// from lying about what can arrive.
+    #[test]
+    fn a_non_finite_rate_is_null_and_the_field_admits_it() {
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let d = source_row_doc("203.0.113.9", 3, bad, 1756800000);
+            assert_eq!(d.rate, None, "a non-finite rate is not a number: {bad}");
+            assert_eq!(
+                tfps::json_line(&d).unwrap(),
+                r#"{"peer":"203.0.113.9","countries":3,"rate":null,"last_seen":1756800000}"#
+            );
+        }
+        let ok = source_row_doc("203.0.113.9", 3, 1.5, 1756800000);
+        assert_eq!(ok.rate, Some(1.5), "a finite rate is unchanged");
+        assert_eq!(
+            tfps::json_line(&ok).unwrap(),
+            r#"{"peer":"203.0.113.9","countries":3,"rate":1.5,"last_seen":1756800000}"#,
+            "the wire bytes for a finite rate must not move"
+        );
+        // `source` carries the same field and must answer the same way.
+        let one = source_doc("203.0.113.9", 3, f64::INFINITY, 1756800000, &["GB"]);
+        assert_eq!(one.rate, None);
+        assert!(tfps::json_line(&one).unwrap().contains(r#""rate":null"#));
+    }
+
+    /// `detail` is a SIP `User-Agent`: an attacker writes it. The contract is
+    /// one JSON document per line, so a raw newline in that field would end the
+    /// line early and every following field would land in a record the consumer
+    /// never sees as malformed — it would just parse as a shorter object.
+    ///
+    /// The human rendering genuinely is broken this way today (a newline splits
+    /// the column layout across lines); this pins that the JSON one is not.
+    #[test]
+    fn a_hostile_detail_cannot_break_the_one_document_per_line_contract() {
+        let row = BlockRow {
+            ts: 1756800000,
+            ip: "10.0.0.1".to_string(),
+            reason: "scanner".to_string(),
+            detail: "friendly\nscanner\r\n\"quoted\" \\slash\\ \u{1}ctrl\t{\"ip\":\"1.2.3.4\"}"
+                .to_string(),
+        };
+        // Guard the fixture before trusting the assertions below: a `detail`
+        // that did not actually contain the hostile bytes would make every
+        // check here pass while proving nothing.
+        assert!(row.detail.contains('\n') && row.detail.contains('\r'));
+        assert!(row.detail.contains('"') && row.detail.contains('\\'));
+        assert!(
+            row.detail.contains('\u{1}'),
+            "fixture must carry a control char"
+        );
+
+        let line = tfps::json_line(&log_doc(&row, None, None, true, "block")).unwrap();
+        assert!(
+            !line.contains('\n'),
+            "a raw newline would split the record: {line}"
+        );
+        assert!(!line.contains('\r'), "a bare CR would too: {line}");
+        assert!(
+            !line.contains('\u{1}'),
+            "a raw control character is not valid inside a JSON string: {line}"
+        );
+        // and the value must survive exactly, not merely be made safe
+        let back: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            back["detail"].as_str().unwrap(),
+            row.detail,
+            "escaping must be lossless"
+        );
+        assert_eq!(back["ip"].as_str().unwrap(), "10.0.0.1");
+    }
+
     #[test]
     fn ban_expires_saturates_a_ttl_too_large_for_the_field() {
         assert_eq!(
