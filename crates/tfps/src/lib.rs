@@ -29,3 +29,42 @@ macro_rules! say {
         }
     }};
 }
+
+/// Renders one value as a single-line JSON document.
+///
+/// The newline is deliberately **not** here. Every caller hands the result to
+/// `say!`, which adds it and which already owns what happens when the reader
+/// goes away — see the macro above. Keeping that decision in one place is the
+/// whole point of this function existing rather than each command calling
+/// `serde_json` for itself.
+pub fn json_line<T: serde::Serialize>(value: &T) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|e| format!("serialising output: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(serde::Serialize)]
+    struct Doc {
+        a: u8,
+        b: Option<&'static str>,
+    }
+
+    /// Compact, and in declaration order — a consumer pinning bytes depends on
+    /// both. serde_json::to_string gives us this; the test is here so a switch
+    /// to to_string_pretty is caught rather than shipped.
+    #[test]
+    fn json_line_is_compact_and_in_declaration_order() {
+        let s = json_line(&Doc { a: 1, b: None }).unwrap();
+        assert_eq!(s, r#"{"a":1,"b":null}"#);
+    }
+
+    /// The newline belongs to say!, which also owns the broken-pipe decision.
+    /// Two sources of newline would double-space every JSONL stream.
+    #[test]
+    fn json_line_carries_no_newline_of_its_own() {
+        let s = json_line(&Doc { a: 1, b: Some("x") }).unwrap();
+        assert!(!s.contains('\n'), "the newline is say!'s to add");
+    }
+}
