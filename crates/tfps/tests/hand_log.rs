@@ -319,3 +319,143 @@ fn pruning_never_deletes_the_current_month() {
     assert_eq!(removed, 0);
     assert!(hand_log::path_for(&db, SEP_28).exists());
 }
+
+// ── what `banned` asks: the latest action for the addresses it lists ─────
+
+fn wanted(ips: &[[u8; 4]]) -> std::collections::HashSet<Ipv4Addr> {
+    ips.iter().map(|o| Ipv4Addr::from(*o)).collect()
+}
+
+#[test]
+fn latest_for_answers_only_the_addresses_asked_about() {
+    let dir = tempdir();
+    let db = dir.path().join("tfps.db");
+    hand_log::append(
+        &db,
+        &[
+            ban(SEP_28, [198, 51, 100, 20], "sipnab", Some("a")),
+            ban(SEP_28, [198, 51, 100, 21], "sipnab", Some("b")),
+        ],
+    )
+    .expect("append");
+    let found = hand_log::latest_for(&db, &wanted(&[[198, 51, 100, 20]]));
+    assert_eq!(found.by_ip.len(), 1);
+    assert_eq!(
+        found.by_ip[&Ipv4Addr::new(198, 51, 100, 20)]
+            .reason
+            .as_deref(),
+        Some("a")
+    );
+}
+
+#[test]
+fn latest_for_takes_the_newest_month_over_an_older_one() {
+    let dir = tempdir();
+    let db = dir.path().join("tfps.db");
+    hand_log::append(
+        &db,
+        &[ban(SEP_28 - 40 * DAY, [198, 51, 100, 20], "old", None)],
+    )
+    .expect("append");
+    hand_log::append(&db, &[ban(SEP_28, [198, 51, 100, 20], "new", None)]).expect("append");
+    let found = hand_log::latest_for(&db, &wanted(&[[198, 51, 100, 20]]));
+    assert_eq!(found.by_ip[&Ipv4Addr::new(198, 51, 100, 20)].source, "new");
+}
+
+#[test]
+fn latest_for_still_searches_older_months_for_an_address_not_yet_found() {
+    let dir = tempdir();
+    let db = dir.path().join("tfps.db");
+    hand_log::append(
+        &db,
+        &[ban(SEP_28 - 40 * DAY, [198, 51, 100, 21], "august", None)],
+    )
+    .expect("append");
+    hand_log::append(&db, &[ban(SEP_28, [198, 51, 100, 20], "september", None)]).expect("append");
+    let found = hand_log::latest_for(&db, &wanted(&[[198, 51, 100, 20], [198, 51, 100, 21]]));
+    assert_eq!(found.by_ip.len(), 2);
+    assert_eq!(
+        found.by_ip[&Ipv4Addr::new(198, 51, 100, 21)].source,
+        "august"
+    );
+}
+
+#[test]
+fn latest_for_goes_by_time_when_lines_landed_out_of_order() {
+    // Two tfps_ctl runs: one takes its time first and writes second.
+    let dir = tempdir();
+    let db = dir.path().join("tfps.db");
+    hand_log::append(
+        &db,
+        &[
+            ban(SEP_28 + 120, [198, 51, 100, 20], "later", None),
+            ban(SEP_28 + 60, [198, 51, 100, 20], "earlier", None),
+        ],
+    )
+    .expect("append");
+    let found = hand_log::latest_for(&db, &wanted(&[[198, 51, 100, 20]]));
+    assert_eq!(
+        found.by_ip[&Ipv4Addr::new(198, 51, 100, 20)].source,
+        "later"
+    );
+}
+
+#[test]
+fn latest_for_agrees_with_reading_everything() {
+    // The fast path must give the same answer as the plain one, on a mix of
+    // months, verbs, sources and out-of-order lines.
+    let dir = tempdir();
+    let db = dir.path().join("tfps.db");
+    let mut actions = Vec::new();
+    for i in 0..300u32 {
+        let ts = SEP_28 - (i % 70) * DAY + (i * 37) % 900;
+        let verb = if i % 4 == 0 {
+            HandVerb::Unban
+        } else {
+            HandVerb::Ban
+        };
+        let mut a = ban(
+            ts,
+            [198, 51, 100, (i % 25) as u8],
+            &format!("s{}", i % 7),
+            None,
+        );
+        a.verb = verb;
+        actions.push(a);
+    }
+    hand_log::append(&db, &actions).expect("append");
+    let all: Vec<[u8; 4]> = (0..30u8).map(|o| [198, 51, 100, o]).collect();
+    let fast = hand_log::latest_for(&db, &wanted(&all));
+    let (read, _) = hand_log::read_all(&db);
+    let plain = hand_log::latest_by_ip(&read);
+    assert_eq!(fast.by_ip.len(), plain.len());
+    for (ip, a) in &fast.by_ip {
+        assert_eq!(plain[&ip.to_string()].ts, a.ts, "{ip}");
+    }
+}
+
+#[test]
+fn latest_for_counts_a_corrupt_line_it_had_to_read() {
+    let dir = tempdir();
+    let db = dir.path().join("tfps.db");
+    hand_log::append(&db, &[ban(SEP_28, [198, 51, 100, 20], "sipnab", None)]).expect("append");
+    let path = hand_log::path_for(&db, SEP_28);
+    let mut text = std::fs::read_to_string(&path).expect("read");
+    text.push_str("{not json\n");
+    std::fs::write(&path, text).expect("write");
+    let found = hand_log::latest_for(&db, &wanted(&[[198, 51, 100, 20]]));
+    assert_eq!(found.by_ip.len(), 1);
+    assert_eq!(found.unreadable, 1);
+}
+
+#[test]
+fn latest_for_asked_about_nothing_reads_nothing() {
+    let dir = tempdir();
+    let db = dir.path().join("tfps.db");
+    hand_log::append(&db, &[ban(SEP_28, [198, 51, 100, 20], "sipnab", None)]).expect("append");
+    let path = hand_log::path_for(&db, SEP_28);
+    std::fs::write(&path, "{not json\n").expect("write");
+    let found = hand_log::latest_for(&db, &std::collections::HashSet::new());
+    assert!(found.by_ip.is_empty());
+    assert_eq!(found.unreadable, 0, "an empty question opens no file");
+}

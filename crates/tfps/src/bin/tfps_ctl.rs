@@ -821,11 +821,11 @@ impl BannedDoc {
 /// is the better explanation of why the address is blocked now, so it wins,
 /// the same "most recent reason wins" rule `--why` applies to the audit log.
 fn hand_attribution(
-    ip: &str,
-    latest: &std::collections::HashMap<String, tfps::hand_log::HandAction>,
+    ip: Ipv4Addr,
+    latest: &std::collections::HashMap<Ipv4Addr, tfps::hand_log::HandAction>,
     newest_audit_ts: Option<u32>,
 ) -> Option<(String, String, String)> {
-    let a = latest.get(ip)?;
+    let a = latest.get(&ip)?;
     if a.verb != tfps::hand_log::HandVerb::Ban {
         return None;
     }
@@ -839,12 +839,25 @@ fn hand_attribution(
     Some(("hand".to_string(), detail, a.source.clone()))
 }
 
-/// The newest audit row's time per ip, from rows in any order.
-fn newest_audit_ts(rows: &[BlockRow]) -> std::collections::HashMap<String, u32> {
+/// The newest audit row's time for each address in `candidates`, from rows
+/// in any order.
+///
+/// Only addresses with a hand ban need it, so only those are looked up: with no
+/// hand bans the rows are not walked at all, and otherwise each row costs one
+/// lookup and allocates nothing unless it is a candidate.
+fn newest_audit_ts(
+    rows: &[BlockRow],
+    candidates: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, u32> {
     let mut m: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    if candidates.is_empty() {
+        return m;
+    }
     for r in rows {
-        let e = m.entry(r.ip.clone()).or_insert(r.ts);
-        *e = (*e).max(r.ts);
+        if candidates.contains(r.ip.as_str()) {
+            let e = m.entry(r.ip.clone()).or_insert(r.ts);
+            *e = (*e).max(r.ts);
+        }
     }
     m
 }
@@ -895,18 +908,57 @@ fn hand_unbans(
         .collect()
 }
 
-/// The latest hand action per address, read from beside the database.
+/// The latest hand action for each address in `wanted`, read from beside the
+/// database.
 ///
 /// Lines that cannot be read are reported on stderr and skipped, so an
 /// operator knows the record is incomplete.
 fn hand_record(
     db: &std::path::Path,
-) -> std::collections::HashMap<String, tfps::hand_log::HandAction> {
-    let (actions, unreadable) = tfps::hand_log::read_all(db);
-    if unreadable > 0 {
-        eprintln!("WARNING: {unreadable} line(s) of the hand-action record could not be read");
+    wanted: &std::collections::HashSet<Ipv4Addr>,
+) -> std::collections::HashMap<Ipv4Addr, tfps::hand_log::HandAction> {
+    let found = tfps::hand_log::latest_for(db, wanted);
+    if found.unreadable > 0 {
+        eprintln!(
+            "WARNING: {} line(s) of the hand-action record could not be read",
+            found.unreadable
+        );
     }
-    tfps::hand_log::latest_by_ip(&actions)
+    found.by_ip
+}
+
+/// Which count of `banned`'s summary line a block falls in.
+#[derive(Debug, PartialEq, Eq)]
+enum Tally {
+    /// The perimeter's own blocks and hand-placed ones: what "perimeter/manual"
+    /// has always counted.
+    PerimeterManual,
+    /// Blocks only the APIBAN feed explains.
+    Apiban,
+    /// Blocks nothing explains.
+    Unattributed,
+}
+
+/// The summary count for a block explained by a hand ban, the audit log or
+/// the feed, in that order of precedence.
+fn tally_of(hand: bool, audit: bool, apiban: bool) -> Tally {
+    if hand || audit {
+        Tally::PerimeterManual
+    } else if apiban {
+        Tally::Apiban
+    } else {
+        Tally::Unattributed
+    }
+}
+
+/// The addresses whose latest hand action is a ban, as `newest_audit_ts` takes them.
+fn hand_banned(
+    hand: &std::collections::HashMap<Ipv4Addr, tfps::hand_log::HandAction>,
+) -> std::collections::HashSet<String> {
+    hand.iter()
+        .filter(|(_, a)| a.verb == tfps::hand_log::HandVerb::Ban)
+        .map(|(ip, _)| ip.to_string())
+        .collect()
 }
 
 /// Write `actions` beside the database, and say so on stderr when that fails.
@@ -1022,9 +1074,11 @@ fn banned(args: &Args) -> Result<(), String> {
             .as_ref()
             .and_then(|s| s.blocks(1_000_000, None).ok())
             .unwrap_or_default();
-        let newest = newest_audit_ts(&rows);
+        let wanted: std::collections::HashSet<Ipv4Addr> =
+            entries.iter().map(|(ip, _)| *ip).collect();
+        let hand = hand_record(&args.db, &wanted);
+        let newest = newest_audit_ts(&rows, &hand_banned(&hand));
         let audit = attribute_by_ip(rows);
-        let hand = hand_record(&args.db);
         let apiban = store
             .as_ref()
             .and_then(|s| s.apiban_all().ok())
@@ -1035,7 +1089,7 @@ fn banned(args: &Args) -> Result<(), String> {
             let ip_s = ip.to_string();
             let (why, first_seen) = banned_attribution(&ip_s, &audit, &apiban);
             let expires = expires_epoch(*until, now_wall, now_mono);
-            let doc = match hand_attribution(&ip_s, &hand, newest.get(&ip_s).copied()) {
+            let doc = match hand_attribution(*ip, &hand, newest.get(&ip_s).copied()) {
                 Some((reason, detail, source)) => {
                     banned_doc(&ip_s, Some((&reason, &detail)), first_seen, expires)
                         .with_source(Some(&source))
@@ -1061,20 +1115,20 @@ fn banned(args: &Args) -> Result<(), String> {
     // ip -> (reason, detail), most recent block per ip (rows come newest-first).
     let mut audit: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
+    let wanted: std::collections::HashSet<Ipv4Addr> = entries.iter().map(|(ip, _)| *ip).collect();
+    let hand = hand_record(&args.db, &wanted);
     let mut newest: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     if let Some(s) = store.as_ref() {
         if let Ok(rows) = s.blocks(1_000_000, None) {
-            newest = newest_audit_ts(&rows);
+            newest = newest_audit_ts(&rows, &hand_banned(&hand));
             for r in rows {
                 audit.entry(r.ip).or_insert((r.reason, r.detail));
             }
         }
     }
-    let hand = hand_record(&args.db);
 
     let now_ns = monotonic_ns();
-    let (mut n_perimeter, mut n_apiban, mut n_hand, mut n_unknown) =
-        (0usize, 0usize, 0usize, 0usize);
+    let (mut n_perimeter, mut n_apiban, mut n_unknown) = (0usize, 0usize, 0usize);
     say!("{:<16} {:>10}  REASON", "SOURCE", "EXPIRES IN");
     for (ip, until) in &entries {
         let left = if *until == 0 {
@@ -1084,20 +1138,22 @@ fn banned(args: &Args) -> Result<(), String> {
         };
         let ip_s = ip.to_string();
         // A hand ban no daemon block has superseded wins; then block_log; then the
-        // feed; then unknown.
-        let why = if let Some((_, detail, source)) =
-            hand_attribution(&ip_s, &hand, newest.get(&ip_s).copied())
-        {
-            n_hand += 1;
+        // feed; then unknown. A hand ban counts as perimeter/manual, as before.
+        let by_hand = hand_attribution(*ip, &hand, newest.get(&ip_s).copied());
+        let by_audit = audit.get(&ip_s);
+        let by_feed = apiban.contains(&ip_s);
+        match tally_of(by_hand.is_some(), by_audit.is_some(), by_feed) {
+            Tally::PerimeterManual => n_perimeter += 1,
+            Tally::Apiban => n_apiban += 1,
+            Tally::Unattributed => n_unknown += 1,
+        }
+        let why = if let Some((_, detail, source)) = by_hand {
             format!("hand ({detail}) by {source}")
-        } else if let Some((reason, detail)) = audit.get(&ip_s) {
-            n_perimeter += 1;
+        } else if let Some((reason, detail)) = by_audit {
             format!("{reason} ({detail})")
-        } else if apiban.contains(&ip_s) {
-            n_apiban += 1;
+        } else if by_feed {
             "apiban (feed)".to_string()
         } else {
-            n_unknown += 1;
             "not in this audit log".to_string()
         };
         if args.why {
@@ -1107,7 +1163,7 @@ fn banned(args: &Args) -> Result<(), String> {
         }
     }
     say!(
-        "\n{} blocked — {n_perimeter} perimeter, {n_hand} by hand, {n_apiban} APIBAN feed{}",
+        "\n{} blocked — {n_perimeter} perimeter/manual, {n_apiban} APIBAN feed{}",
         entries.len(),
         if n_unknown > 0 {
             format!(", {n_unknown} unattributed")
@@ -3485,15 +3541,72 @@ mod tests {
         assert_eq!(recs[0].verb, tfps::hand_log::HandVerb::Unban);
     }
 
+    /// The latest action per address, as `latest_for` answers it.
+    fn latest_of(
+        actions: &[tfps::hand_log::HandAction],
+    ) -> std::collections::HashMap<Ipv4Addr, tfps::hand_log::HandAction> {
+        let mut m = std::collections::HashMap::new();
+        for a in actions {
+            let keep = m
+                .get(&a.ip)
+                .is_none_or(|held: &tfps::hand_log::HandAction| held.ts <= a.ts);
+            if keep {
+                m.insert(a.ip, a.clone());
+            }
+        }
+        m
+    }
+
+    fn row(ts: u32, ip: &str) -> BlockRow {
+        BlockRow {
+            ts,
+            ip: ip.to_string(),
+            reason: "user-agent".to_string(),
+            detail: "friendly-scanner".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_newest_daemon_block_is_looked_up_only_for_hand_banned_addresses() {
+        let rows = [
+            row(300, "203.0.113.1"),
+            row(200, "203.0.113.2"),
+            row(100, "203.0.113.1"),
+        ];
+        let candidates: std::collections::HashSet<String> = ["203.0.113.1".to_string()].into();
+        let newest = newest_audit_ts(&rows, &candidates);
+        assert_eq!(newest.len(), 1, "{newest:?}");
+        assert_eq!(newest["203.0.113.1"], 300);
+    }
+
+    #[test]
+    fn with_no_hand_bans_the_audit_rows_are_not_walked_again() {
+        let rows = [row(300, "203.0.113.1")];
+        assert!(newest_audit_ts(&rows, &std::collections::HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn banned_keeps_its_summary_wording() {
+        let body = handler_body(include_str!("tfps_ctl.rs"), "banned");
+        assert!(
+            body.contains("perimeter/manual"),
+            "the summary keeps its words"
+        );
+        assert!(
+            !body.contains("by hand, "),
+            "hand bans count as perimeter/manual"
+        );
+    }
+
     #[test]
     fn a_hand_ban_explains_a_block_nothing_else_explains() {
-        let latest = tfps::hand_log::latest_by_ip(&[hand(
+        let latest = latest_of(&[hand(
             500,
             tfps::hand_log::HandVerb::Ban,
             "sipnab",
             Some("scan"),
         )]);
-        let got = hand_attribution(&ip(20).to_string(), &latest, None);
+        let got = hand_attribution(ip(20), &latest, None);
         assert_eq!(
             got,
             Some(("hand".to_string(), "scan".to_string(), "sipnab".to_string()))
@@ -3502,41 +3615,32 @@ mod tests {
 
     #[test]
     fn a_newer_daemon_block_outranks_an_older_hand_ban() {
-        let latest = tfps::hand_log::latest_by_ip(&[hand(
+        let latest = latest_of(&[hand(
             500,
             tfps::hand_log::HandVerb::Ban,
             "sipnab",
             Some("scan"),
         )]);
-        assert_eq!(
-            hand_attribution(&ip(20).to_string(), &latest, Some(600)),
-            None
-        );
+        assert_eq!(hand_attribution(ip(20), &latest, Some(600)), None);
         assert!(
-            hand_attribution(&ip(20).to_string(), &latest, Some(400)).is_some(),
+            hand_attribution(ip(20), &latest, Some(400)).is_some(),
             "an older daemon block does not"
         );
     }
 
     #[test]
     fn a_hand_unban_explains_nothing() {
-        let latest = tfps::hand_log::latest_by_ip(&[
+        let latest = latest_of(&[
             hand(500, tfps::hand_log::HandVerb::Ban, "sipnab", Some("scan")),
             hand(600, tfps::hand_log::HandVerb::Unban, "operator", None),
         ]);
-        assert_eq!(hand_attribution(&ip(20).to_string(), &latest, None), None);
+        assert_eq!(hand_attribution(ip(20), &latest, None), None);
     }
 
     #[test]
     fn a_hand_ban_with_no_reason_says_so_rather_than_leaving_it_blank() {
-        let latest = tfps::hand_log::latest_by_ip(&[hand(
-            500,
-            tfps::hand_log::HandVerb::Ban,
-            "operator",
-            None,
-        )]);
-        let (reason, detail, source) =
-            hand_attribution(&ip(20).to_string(), &latest, None).expect("attributed");
+        let latest = latest_of(&[hand(500, tfps::hand_log::HandVerb::Ban, "operator", None)]);
+        let (reason, detail, source) = hand_attribution(ip(20), &latest, None).expect("attributed");
         assert_eq!(
             (reason.as_str(), detail.as_str(), source.as_str()),
             ("hand", "no reason given", "operator")
@@ -3616,5 +3720,18 @@ mod tests {
             2,
             "the --all path and the single-address path"
         );
+    }
+
+    #[test]
+    fn a_hand_ban_counts_as_perimeter_manual_in_the_summary() {
+        assert_eq!(tally_of(true, false, false), Tally::PerimeterManual);
+        assert_eq!(
+            tally_of(true, true, true),
+            Tally::PerimeterManual,
+            "hand wins"
+        );
+        assert_eq!(tally_of(false, true, false), Tally::PerimeterManual);
+        assert_eq!(tally_of(false, false, true), Tally::Apiban);
+        assert_eq!(tally_of(false, false, false), Tally::Unattributed);
     }
 }

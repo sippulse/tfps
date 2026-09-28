@@ -153,6 +153,87 @@ pub fn latest_by_ip(actions: &[HandAction]) -> HashMap<String, HandAction> {
     latest
 }
 
+/// The latest hand action for each address asked about, and how many lines
+/// could not be read along the way.
+#[derive(Debug, Default)]
+pub struct Latest {
+    /// The latest action per address, by time.
+    pub by_ip: HashMap<Ipv4Addr, HandAction>,
+    /// Lines read that could not be parsed.
+    pub unreadable: usize,
+}
+
+/// The latest hand action for each address in `wanted`: what `banned` asks.
+///
+/// Cheaper than [`read_all`] followed by [`latest_by_ip`], and gives the same
+/// answer (`latest_for_agrees_with_reading_everything` pins that):
+///
+/// * months are read newest first, and the scan stops after the first whole
+///   file that leaves every address in `wanted` answered. A file holds the
+///   actions of one month, so an older file cannot hold a newer action;
+/// * a line's address is read without parsing the rest of it, and only a line
+///   about an address still being asked about is parsed in full;
+/// * within a file the latest is decided by time, not by line order, because
+///   two runs may append slightly out of order.
+///
+/// Asked about nothing, it reads nothing.
+#[must_use]
+pub fn latest_for(db: &Path, wanted: &std::collections::HashSet<Ipv4Addr>) -> Latest {
+    let mut out = Latest::default();
+    if wanted.is_empty() {
+        return out;
+    }
+    let mut files = month_files(db);
+    files.sort();
+    for (_, path) in files.iter().rev() {
+        // Answered by a newer month: nothing in this one can be newer.
+        let settled: std::collections::HashSet<Ipv4Addr> = out.by_ip.keys().copied().collect();
+        let Ok(bytes) = std::fs::read(path) else {
+            out.unreadable += 1;
+            continue;
+        };
+        for line in bytes.split(|b| *b == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let Some(ip) = quick_ip(line) else {
+                out.unreadable += 1;
+                continue;
+            };
+            if !wanted.contains(&ip) || settled.contains(&ip) {
+                continue;
+            }
+            match serde_json::from_slice::<HandAction>(line) {
+                Ok(a) => match out.by_ip.get(&ip) {
+                    Some(held) if held.ts > a.ts => {}
+                    _ => {
+                        out.by_ip.insert(ip, a);
+                    }
+                },
+                Err(_) => out.unreadable += 1,
+            }
+        }
+        if out.by_ip.len() == wanted.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// The address of a record line, read without parsing the rest of it.
+///
+/// Relies on the shape [`append`] writes, `"ip":"a.b.c.d"`; a line without it
+/// is not one of ours and counts as unreadable.
+fn quick_ip(line: &[u8]) -> Option<Ipv4Addr> {
+    const KEY: &[u8] = b"\"ip\":\"";
+    let start = line.windows(KEY.len()).position(|w| w == KEY)? + KEY.len();
+    let len = line[start..].iter().position(|b| *b == b'"')?;
+    std::str::from_utf8(&line[start..start + len])
+        .ok()?
+        .parse()
+        .ok()
+}
+
 /// Check a `--source` value: a short plain name.
 ///
 /// # Errors
