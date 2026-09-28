@@ -866,6 +866,11 @@ fn main() -> ExitCode {
                 // A 90-day audit window for the block log, and the APIBAN retention prune;
                 // both apply whether or not behavioural detection is on.
                 s.prune_log(t.0.saturating_sub(90 * 24 * 3600));
+                // The hand-action record beside the database keeps the same window
+                // as the block log it complements.
+                if let Err(e) = tfps::hand_log::prune(&args.db, t.0, 90 * 24 * 3600) {
+                    eprintln!("WARNING: could not prune the hand-action record: {e}");
+                }
                 s.apiban_prune(t.0.saturating_sub(APIBAN_RETENTION_SECS));
                 // Known-good peers persist in every mode — they are perimeter protection.
                 if let Err(e) = s.save_known_peers(engine.export_known_peers()) {
