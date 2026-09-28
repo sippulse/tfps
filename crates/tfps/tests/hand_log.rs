@@ -678,3 +678,30 @@ fn observing_only_nothing_is_blocked_and_the_count_is_reported() {
     assert_eq!(report.reapplied, 0);
     assert_eq!(report.observe_only, 1);
 }
+
+#[test]
+fn a_record_line_written_with_other_json_spacing_is_still_read() {
+    // Only tfps_ctl writes the record, and it writes compact JSON, but a line
+    // any JSON writer produced, or someone reformatted, is still a record.
+    let dir = tempdir();
+    let rec = dir.path();
+    std::fs::write(
+        hand_log::path_for(rec, SEP_28),
+        format!(
+            "{{\"ts\": {SEP_28}, \"action\": \"ban\", \"ip\": \"198.51.100.20\", \
+             \"source\": \"sipnab\", \"reason\": null, \"expires\": {}}}\n",
+            SEP_28 + 3600
+        ),
+    )
+    .expect("write");
+    // A second spaced line, for an address nobody asked about.
+    let mut text = std::fs::read_to_string(hand_log::path_for(rec, SEP_28)).expect("read");
+    text.push_str(&format!(
+        "{{\"ts\": {SEP_28}, \"action\": \"ban\", \"ip\": \"198.51.100.99\", \
+         \"source\": \"other\", \"reason\": null, \"expires\": null}}\n"
+    ));
+    std::fs::write(hand_log::path_for(rec, SEP_28), text).expect("write");
+    let found = hand_log::latest_for(rec, &wanted(&[[198, 51, 100, 20]]));
+    assert_eq!(found.unreadable, 0, "a valid line is not unreadable");
+    assert_eq!(found.by_ip.len(), 1, "only the address asked about: {:?}", found.by_ip.keys());
+}

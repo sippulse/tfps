@@ -219,21 +219,25 @@ pub fn latest_for(dir: &Path, wanted: &std::collections::HashSet<Ipv4Addr>) -> L
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let Some(ip) = quick_ip(line) else {
+            // The fast path reads the address of a line in the form `append`
+            // writes. Any other line, valid JSON with other spacing included,
+            // is parsed in full, so it is judged on its content, not its layout.
+            let parsed = match quick_ip(line) {
+                Some(ip) if !wanted.contains(&ip) || settled.contains(&ip) => continue,
+                Some(_) | None => serde_json::from_slice::<HandAction>(line),
+            };
+            let Ok(a) = parsed else {
                 out.unreadable += 1;
                 continue;
             };
-            if !wanted.contains(&ip) || settled.contains(&ip) {
+            if !wanted.contains(&a.ip) || settled.contains(&a.ip) {
                 continue;
             }
-            match serde_json::from_slice::<HandAction>(line) {
-                Ok(a) => match out.by_ip.get(&ip) {
-                    Some(held) if held.ts > a.ts => {}
-                    _ => {
-                        out.by_ip.insert(ip, a);
-                    }
-                },
-                Err(_) => out.unreadable += 1,
+            match out.by_ip.get(&a.ip) {
+                Some(held) if held.ts > a.ts => {}
+                _ => {
+                    out.by_ip.insert(a.ip, a);
+                }
             }
         }
         if out.by_ip.len() == wanted.len() {
@@ -245,8 +249,8 @@ pub fn latest_for(dir: &Path, wanted: &std::collections::HashSet<Ipv4Addr>) -> L
 
 /// The address of a record line, read without parsing the rest of it.
 ///
-/// Relies on the shape [`append`] writes, `"ip":"a.b.c.d"`; a line without it
-/// is not one of ours and counts as unreadable.
+/// Matches the shape [`append`] writes, `"ip":"a.b.c.d"`. `None` means only
+/// that the shortcut does not apply; the caller then parses the whole line.
 fn quick_ip(line: &[u8]) -> Option<Ipv4Addr> {
     const KEY: &[u8] = b"\"ip\":\"";
     let start = line.windows(KEY.len()).position(|w| w == KEY)? + KEY.len();
