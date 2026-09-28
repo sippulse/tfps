@@ -57,6 +57,10 @@ struct Args {
     block_ttl: u64,
     no_enforce: bool,
     db: PathBuf,
+    /// `hand_log_dir` from the configuration file.
+    hand_log_dir: Option<PathBuf>,
+    /// `reapply_hand_bans` from the configuration file.
+    reapply_hand_bans: bool,
     checkpoint_every: u64,
     apiban_key: Option<String>,
     ignoreip: Vec<String>,
@@ -89,6 +93,8 @@ impl Default for Args {
             block_ttl: 3600,
             no_enforce: false,
             db: PathBuf::from(store::DEFAULT_PATH),
+            hand_log_dir: None,
+            reapply_hand_bans: false,
             // Five minutes. Losing that to a power cut costs five minutes of learning —
             // and checkpointing per packet would be a write bottleneck.
             checkpoint_every: 300,
@@ -222,6 +228,9 @@ fn apply_config(a: &mut Args, c: &config::Config) {
     unless_given!("--block-ttl", block_ttl, c.block_ttl);
     unless_given!("--checkpoint-every", checkpoint_every, c.checkpoint_every);
     unless_given!("--db", db, c.db.clone());
+    // No command-line flags for these two: they are installation settings.
+    a.hand_log_dir = c.hand_log_dir.clone();
+    a.reapply_hand_bans = c.reapply_hand_bans;
     unless_given!("--xdp-obj", xdp_obj, c.xdp_obj.clone());
     unless_given!("--drop-map", shared_map, c.drop_map.clone());
 
@@ -520,6 +529,56 @@ fn main() -> ExitCode {
     );
     for (label, origin, _) in ignoreip.report() {
         say!("                      {label} ({})", origin.describe());
+    }
+
+    // A restart starts from an empty block map. With `reapply_hand_bans` set, hand
+    // bans still in force are placed again from `tfps_ctl`'s record, through the
+    // same gate as every other block: ignoreip first, then registered peers.
+    if args.reapply_hand_bans {
+        let hand_dir = tfps::hand_log::resolve_dir(args.hand_log_dir.as_deref(), &args.db);
+        let (actions, unreadable) = tfps::hand_log::read_all(&hand_dir);
+        if unreadable > 0 {
+            eprintln!(
+                "WARNING: {unreadable} line(s) of the hand-action record in {} could not be read",
+                hand_dir.display()
+            );
+        }
+        let plan = tfps::hand_log::reapply_plan(&actions, start.0);
+        let exempt = |ip: Ipv4Addr| -> Option<String> {
+            ignoreip.exempt(ip).map(str::to_string).or_else(|| {
+                engine
+                    .is_known_peer(ip, start)
+                    .then(|| "registered peer".to_string())
+            })
+        };
+        let enforcing = enforcer.is_some();
+        let mut place = |ip: Ipv4Addr, ttl: u64| match enforcer.as_mut() {
+            Some(e) => e.block(ip, ttl),
+            None => Err("no enforcer".to_string()),
+        };
+        let report = tfps::hand_log::reapply(
+            &plan,
+            exempt,
+            if enforcing { Some(&mut place) } else { None },
+        );
+        say!(
+            "  hand bans         : {} re-applied from {}, {} exempt, {} failed{}",
+            report.reapplied,
+            hand_dir.display(),
+            report.exempt.len(),
+            report.failed.len(),
+            if report.observe_only > 0 {
+                format!(", {} not placed (observe only)", report.observe_only)
+            } else {
+                String::new()
+            }
+        );
+        for (ip, rule) in &report.exempt {
+            say!("                      {ip} not re-applied: exempt by {rule}");
+        }
+        for (ip, e) in &report.failed {
+            eprintln!("ALARM: could not re-apply the hand ban on {ip}: {e}");
+        }
     }
 
     let sock = match Socket::new(
@@ -868,7 +927,8 @@ fn main() -> ExitCode {
                 s.prune_log(t.0.saturating_sub(90 * 24 * 3600));
                 // The hand-action record beside the database keeps the same window
                 // as the block log it complements.
-                if let Err(e) = tfps::hand_log::prune(&args.db, t.0, 90 * 24 * 3600) {
+                let hand_dir = tfps::hand_log::resolve_dir(args.hand_log_dir.as_deref(), &args.db);
+                if let Err(e) = tfps::hand_log::prune(&hand_dir, t.0, 90 * 24 * 3600) {
                     eprintln!("WARNING: could not prune the hand-action record: {e}");
                 }
                 s.apiban_prune(t.0.saturating_sub(APIBAN_RETENTION_SECS));
@@ -1121,4 +1181,29 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
         e.source_count(),
         ports
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_hand_record_settings_come_from_the_config_file() {
+        let mut a = Args::default();
+        let c: config::Config = serde_json::from_str(
+            r#"{"hand_log_dir": "/srv/tfps/hand", "reapply_hand_bans": true}"#,
+        )
+        .expect("parses");
+        apply_config(&mut a, &c);
+        assert_eq!(
+            a.hand_log_dir.as_deref(),
+            Some(std::path::Path::new("/srv/tfps/hand"))
+        );
+        assert!(a.reapply_hand_bans);
+
+        let mut b = Args::default();
+        apply_config(&mut b, &serde_json::from_str("{}").expect("parses"));
+        assert!(b.hand_log_dir.is_none());
+        assert!(!b.reapply_hand_bans, "off unless the file says so");
+    }
 }

@@ -67,34 +67,57 @@ pub struct HandAction {
     pub expires: Option<u32>,
 }
 
-/// The file holding actions taken at `ts`, beside the database at `db`.
+/// The file in the record directory `dir` holding actions taken at `ts`.
 #[must_use]
-pub fn path_for(db: &Path, ts: u32) -> PathBuf {
+pub fn path_for(dir: &Path, ts: u32) -> PathBuf {
     let (year, month) = year_month(ts);
-    dir_of(db).join(format!("{PREFIX}{year:04}{month:02}{SUFFIX}"))
+    dir.join(format!("{PREFIX}{year:04}{month:02}{SUFFIX}"))
 }
 
-fn dir_of(db: &Path) -> PathBuf {
-    db.parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
-}
-
-/// Append `actions`, each as one line, to the month file of its own time.
+/// The record directory: the configured one, else the database's directory.
 ///
-/// A new file takes the database's permissions, so whoever may read the
-/// database may read this and no one else; with no database yet, `0640`.
+/// One rule for `tfps_ctl` and the daemon, so the record the one writes is the
+/// record the other prunes and re-applies.
+#[must_use]
+pub fn resolve_dir(configured: Option<&Path>, db: &Path) -> PathBuf {
+    configured.map_or_else(
+        || {
+            db.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+        },
+        Path::to_path_buf,
+    )
+}
+
+/// The mode a new record file takes: the database's, so whoever may read the
+/// database may read the record and no one else; `0640` with no database yet.
+#[must_use]
+pub fn mode_of(db: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(db)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0o640)
+}
+
+/// Append `actions`, each as one line, to the month file of its own time in
+/// `dir`, creating `dir` if it does not exist. A new file takes `mode` (see
+/// [`mode_of`]).
 ///
 /// # Errors
 ///
 /// A message naming the file when it cannot be opened or written.
-pub fn append(db: &Path, actions: &[HandAction]) -> Result<(), String> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mode = std::fs::metadata(db)
-        .map(|m| m.permissions().mode() & 0o777)
-        .unwrap_or(0o640);
+pub fn append(dir: &Path, actions: &[HandAction], mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if !actions.is_empty() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o750)
+            .create(dir)
+            .map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    }
     for action in actions {
-        let path = path_for(db, action.ts);
+        let path = path_for(dir, action.ts);
         let mut line = serde_json::to_string(action).map_err(|e| format!("encoding: {e}"))?;
         line.push('\n');
         let mut file = std::fs::OpenOptions::new()
@@ -117,8 +140,8 @@ pub fn append(db: &Path, actions: &[HandAction]) -> Result<(), String> {
 /// A line that does not parse is counted rather than skipped silently, so a
 /// caller can tell the operator the record is incomplete.
 #[must_use]
-pub fn read_all(db: &Path) -> (Vec<HandAction>, usize) {
-    let mut files = month_files(db);
+pub fn read_all(dir: &Path) -> (Vec<HandAction>, usize) {
+    let mut files = month_files(dir);
     files.sort();
     let mut actions = Vec::new();
     let mut unreadable = 0;
@@ -178,12 +201,12 @@ pub struct Latest {
 ///
 /// Asked about nothing, it reads nothing.
 #[must_use]
-pub fn latest_for(db: &Path, wanted: &std::collections::HashSet<Ipv4Addr>) -> Latest {
+pub fn latest_for(dir: &Path, wanted: &std::collections::HashSet<Ipv4Addr>) -> Latest {
     let mut out = Latest::default();
     if wanted.is_empty() {
         return out;
     }
-    let mut files = month_files(db);
+    let mut files = month_files(dir);
     files.sort();
     for (_, path) in files.iter().rev() {
         // Answered by a newer month: nothing in this one can be newer.
@@ -234,6 +257,95 @@ fn quick_ip(line: &[u8]) -> Option<Ipv4Addr> {
         .ok()
 }
 
+/// A hand ban to re-apply when the daemon starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reapply {
+    /// The address.
+    pub ip: Ipv4Addr,
+    /// Seconds the ban has left; `0` for a ban with no expiry.
+    pub ttl_secs: u64,
+    /// Who placed it.
+    pub source: String,
+}
+
+/// The hand bans still in force at `now`, by address: the ones a starting
+/// daemon re-applies when `reapply_hand_bans` is set.
+///
+/// For each address only the latest hand action counts. It must be a ban, and
+/// it must not have expired; a ban with no expiry is re-applied with none.
+#[must_use]
+pub fn reapply_plan(actions: &[HandAction], now: u32) -> Vec<Reapply> {
+    let mut latest: HashMap<Ipv4Addr, &HandAction> = HashMap::new();
+    for a in actions {
+        match latest.get(&a.ip) {
+            Some(held) if held.ts > a.ts => {}
+            _ => {
+                latest.insert(a.ip, a);
+            }
+        }
+    }
+    let mut plan: Vec<Reapply> = latest
+        .into_values()
+        .filter(|a| a.verb == HandVerb::Ban)
+        .filter_map(|a| {
+            let ttl_secs = match a.expires {
+                None => 0,
+                Some(e) if e > now => u64::from(e - now),
+                Some(_) => return None,
+            };
+            Some(Reapply {
+                ip: a.ip,
+                ttl_secs,
+                source: a.source.clone(),
+            })
+        })
+        .collect();
+    plan.sort_by_key(|r| r.ip);
+    plan
+}
+
+/// What re-applying a plan did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReapplyReport {
+    /// Bans placed again.
+    pub reapplied: usize,
+    /// Bans the guard exempted, with the rule that exempted them.
+    pub exempt: Vec<(Ipv4Addr, String)>,
+    /// Bans the kernel refused, with its reason.
+    pub failed: Vec<(Ipv4Addr, String)>,
+    /// Bans not placed because the daemon only observes.
+    pub observe_only: usize,
+}
+
+/// Run `plan` through the guard and place what passes.
+///
+/// `exempt` answers the guard's question, returning the rule that exempts an
+/// address (mutable because the daemon's ignoreip list counts its matches); the daemon passes its ignoreip list and its registered peers, so a
+/// re-applied ban meets the same gate as any other block. `block` places a ban
+/// for the given seconds (`0` for none); `None` means the daemon only observes,
+/// and nothing is placed.
+pub fn reapply(
+    plan: &[Reapply],
+    mut exempt: impl FnMut(Ipv4Addr) -> Option<String>,
+    mut block: Option<&mut dyn FnMut(Ipv4Addr, u64) -> Result<(), String>>,
+) -> ReapplyReport {
+    let mut report = ReapplyReport::default();
+    for r in plan {
+        if let Some(rule) = exempt(r.ip) {
+            report.exempt.push((r.ip, rule));
+            continue;
+        }
+        match block.as_mut() {
+            None => report.observe_only += 1,
+            Some(b) => match b(r.ip, r.ttl_secs) {
+                Ok(()) => report.reapplied += 1,
+                Err(e) => report.failed.push((r.ip, e)),
+            },
+        }
+    }
+    report
+}
+
 /// Check a `--source` value: a short plain name.
 ///
 /// # Errors
@@ -280,10 +392,10 @@ pub fn check_reason(s: &str) -> Result<(), String> {
 /// # Errors
 ///
 /// A message naming the first file that could not be deleted.
-pub fn prune(db: &Path, now: u32, window: u32) -> Result<usize, String> {
+pub fn prune(dir: &Path, now: u32, window: u32) -> Result<usize, String> {
     let cutoff = now.saturating_sub(window);
     let mut removed = 0;
-    for ((year, month), path) in month_files(db) {
+    for ((year, month), path) in month_files(dir) {
         if month_end(year, month) < cutoff {
             std::fs::remove_file(&path).map_err(|e| format!("removing {}: {e}", path.display()))?;
             removed += 1;
@@ -292,9 +404,9 @@ pub fn prune(db: &Path, now: u32, window: u32) -> Result<usize, String> {
     Ok(removed)
 }
 
-/// The month files beside `db`, with their year and month.
-fn month_files(db: &Path) -> Vec<((i64, u32), PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(dir_of(db)) else {
+/// The month files in `dir`, with their year and month.
+fn month_files(dir: &Path) -> Vec<((i64, u32), PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     entries

@@ -914,10 +914,10 @@ fn hand_unbans(
 /// Lines that cannot be read are reported on stderr and skipped, so an
 /// operator knows the record is incomplete.
 fn hand_record(
-    db: &std::path::Path,
+    args: &Args,
     wanted: &std::collections::HashSet<Ipv4Addr>,
 ) -> std::collections::HashMap<Ipv4Addr, tfps::hand_log::HandAction> {
-    let found = tfps::hand_log::latest_for(db, wanted);
+    let found = tfps::hand_log::latest_for(&hand_dir(args), wanted);
     if found.unreadable > 0 {
         eprintln!(
             "WARNING: {} line(s) of the hand-action record could not be read",
@@ -961,7 +961,17 @@ fn hand_banned(
         .collect()
 }
 
-/// Write `actions` beside the database, and say so on stderr when that fails.
+/// The record directory: `hand_log_dir` from the configuration file, else the
+/// database's directory; the same rule the daemon uses.
+fn hand_dir(args: &Args) -> std::path::PathBuf {
+    let configured = match tfps::config::load(&args.config) {
+        tfps::config::Loaded::File(c, _) => c.hand_log_dir,
+        _ => None,
+    };
+    tfps::hand_log::resolve_dir(configured.as_deref(), &args.db)
+}
+
+/// Write `actions` to the record, and say so on stderr when that fails.
 ///
 /// The ban or unban has already happened by the time this runs, so a failed
 /// write cannot undo it. Saying so on stderr is the most useful thing left to
@@ -970,7 +980,8 @@ fn record_hand(args: &Args, actions: &[tfps::hand_log::HandAction]) {
     if actions.is_empty() {
         return;
     }
-    if let Err(e) = tfps::hand_log::append(&args.db, actions) {
+    let mode = tfps::hand_log::mode_of(&args.db);
+    if let Err(e) = tfps::hand_log::append(&hand_dir(args), actions, mode) {
         eprintln!(
             "WARNING: {} hand action(s) took effect but were not recorded: {e}",
             actions.len()
@@ -1076,7 +1087,7 @@ fn banned(args: &Args) -> Result<(), String> {
             .unwrap_or_default();
         let wanted: std::collections::HashSet<Ipv4Addr> =
             entries.iter().map(|(ip, _)| *ip).collect();
-        let hand = hand_record(&args.db, &wanted);
+        let hand = hand_record(args, &wanted);
         let newest = newest_audit_ts(&rows, &hand_banned(&hand));
         let audit = attribute_by_ip(rows);
         let apiban = store
@@ -1116,7 +1127,7 @@ fn banned(args: &Args) -> Result<(), String> {
     let mut audit: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     let wanted: std::collections::HashSet<Ipv4Addr> = entries.iter().map(|(ip, _)| *ip).collect();
-    let hand = hand_record(&args.db, &wanted);
+    let hand = hand_record(args, &wanted);
     let mut newest: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     if let Some(s) = store.as_ref() {
         if let Ok(rows) = s.blocks(1_000_000, None) {
@@ -3733,5 +3744,63 @@ mod tests {
         assert_eq!(tally_of(false, true, false), Tally::PerimeterManual);
         assert_eq!(tally_of(false, false, true), Tally::Apiban);
         assert_eq!(tally_of(false, false, false), Tally::Unattributed);
+    }
+
+    #[test]
+    fn the_record_directory_comes_from_the_config_file_when_set() {
+        let dir = std::env::temp_dir().join(format!("tfps-ctl-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let cfg = dir.join("config.json");
+        std::fs::write(&cfg, r#"{"hand_log_dir": "/srv/tfps/hand"}"#).expect("write");
+        let a = args(&[
+            "banned",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--db",
+            "/var/lib/tfps/tfps.db",
+        ])
+        .expect("parses");
+        assert_eq!(hand_dir(&a), std::path::Path::new("/srv/tfps/hand"));
+        std::fs::write(&cfg, "{}").expect("write");
+        assert_eq!(
+            hand_dir(&a),
+            std::path::Path::new("/var/lib/tfps"),
+            "default: beside the database"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn every_hand_record_access_goes_through_the_configured_directory() {
+        let src = include_str!("tfps_ctl.rs");
+        let start = src.find("\nmod tests {").expect("tests module");
+        let code = &src[..start];
+        assert!(
+            !code.contains("hand_log::append(&args.db")
+                && !code.contains("hand_log::latest_for(db"),
+            "the record is found through hand_dir, never straight from the database path"
+        );
+        assert!(
+            code.matches("hand_dir(args)").count() >= 2,
+            "record_hand and banned"
+        );
+    }
+
+    #[test]
+    fn the_daemon_re_applies_hand_bans_only_when_configured_and_through_its_guard() {
+        let daemon = include_str!("../main.rs");
+        let at = daemon
+            .find("if args.reapply_hand_bans")
+            .expect("gated on the setting");
+        let block = &daemon[at..at + daemon[at..].find("\n    }\n").expect("block ends")];
+        assert!(block.contains("tfps::hand_log::reapply("), "{block}");
+        assert!(
+            block.contains("ignoreip.exempt("),
+            "exemptions apply: {block}"
+        );
+        assert!(
+            block.contains("is_known_peer("),
+            "registered peers apply: {block}"
+        );
     }
 }
