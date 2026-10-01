@@ -44,6 +44,10 @@ USAGE: tfps_ctl <command> [options]
   log [--limit N] [--ip IP]    the block audit log, newest first
   forget <peer> [--a NUMBER]   erase learned state (requires tfps stopped)
 
+MANUAL ACTIONS (ban, unban):
+  --source NAME                who asked (default: operator); letters, digits, . _ -
+  --reason TEXT                why, up to 256 bytes; kept in manual_actions-YYYYMM.jsonl
+
 SOURCE FILTERS:
   --peer IP                    exactly this peer
   --country ISO                sources that have called this country, e.g. --country GB
@@ -78,6 +82,10 @@ struct Args {
     why: bool,
     json: bool,
     config: PathBuf,
+    /// Who asked for a manual ban or unban (`--source`); `operator` when absent.
+    source: Option<String>,
+    /// Why, in the asker's words (`--reason`).
+    reason: Option<String>,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -96,6 +104,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         why: false,
         json: false,
         config: PathBuf::from(tfps::config::DEFAULT_PATH),
+        source: None,
+        reason: None,
     };
     let mut it = argv.iter();
     let value = |name: &str, it: &mut std::slice::Iter<'_, String>| -> Result<String, String> {
@@ -125,6 +135,16 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--all" => a.all = true,
             "--why" => a.why = true,
             "--json" => a.json = true,
+            "--source" => {
+                let v = value("--source", &mut it)?;
+                tfps::manual_log::check_source(&v)?;
+                a.source = Some(v);
+            }
+            "--reason" => {
+                let v = value("--reason", &mut it)?;
+                tfps::manual_log::check_reason(&v)?;
+                a.reason = Some(v);
+            }
             "-h" | "--help" => return Err(String::new()),
             other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
             other if a.command.is_empty() => a.command = other.to_string(),
@@ -133,6 +153,12 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     }
     if a.command.is_empty() {
         return Err(String::new());
+    }
+    // Who asked and why describe a manual action; on any other command they
+    // would be accepted and then ignored, which reads as recorded when it is not.
+    if (a.source.is_some() || a.reason.is_some()) && !matches!(a.command.as_str(), "ban" | "unban")
+    {
+        return Err("--source and --reason apply to ban and unban only".into());
     }
     Ok(a)
 }
@@ -743,6 +769,11 @@ struct BannedDoc {
     ip: String,
     reason: Option<String>,
     detail: Option<String>,
+    /// Who placed a manual ban (`--source`, or `operator`). Present only on a
+    /// manually placed row, so every other row keeps its exact bytes and a
+    /// consumer that pins them sees no change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
     first_seen: Option<u32>,
     expires: Option<u32>,
     enforced: bool,
@@ -768,9 +799,194 @@ fn banned_doc(
         ip: ip.to_string(),
         reason,
         detail,
+        source: None,
         first_seen,
         expires,
         enforced: true,
+    }
+}
+
+impl BannedDoc {
+    /// The same row, naming who placed it when it was placed manually.
+    fn with_source(mut self, source: Option<&str>) -> Self {
+        self.source = source.map(str::to_string);
+        self
+    }
+}
+
+/// Who placed a block manually and why, when the latest manual action for `ip`
+/// is a ban and no daemon block of it is newer.
+///
+/// Returns `("manual", detail, source)`. A daemon block newer than the manual ban
+/// is the better explanation of why the address is blocked now, so it wins,
+/// the same "most recent reason wins" rule `--why` applies to the audit log.
+fn manual_attribution(
+    ip: Ipv4Addr,
+    latest: &std::collections::HashMap<Ipv4Addr, tfps::manual_log::ManualAction>,
+    newest_audit_ts: Option<u32>,
+) -> Option<(String, String, String)> {
+    let a = latest.get(&ip)?;
+    if a.verb != tfps::manual_log::ManualVerb::Ban {
+        return None;
+    }
+    if newest_audit_ts.is_some_and(|ts| ts > a.ts) {
+        return None;
+    }
+    let detail = a
+        .reason
+        .clone()
+        .unwrap_or_else(|| "no reason given".to_string());
+    Some(("manual".to_string(), detail, a.source.clone()))
+}
+
+/// The newest audit row's time for each address in `candidates`, from rows
+/// in any order.
+///
+/// Only addresses with a manual ban need it, so only those are looked up: with no
+/// manual bans the rows are not walked at all, and otherwise each row costs one
+/// lookup and allocates nothing unless it is a candidate.
+fn newest_audit_ts(
+    rows: &[BlockRow],
+    candidates: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, u32> {
+    let mut m: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    if candidates.is_empty() {
+        return m;
+    }
+    for r in rows {
+        if candidates.contains(r.ip.as_str()) {
+            let e = m.entry(r.ip.clone()).or_insert(r.ts);
+            *e = (*e).max(r.ts);
+        }
+    }
+    m
+}
+
+/// The manual-ban records for what `place` actually blocked.
+///
+/// Exempt and failed addresses are not recorded: nothing was blocked, so the
+/// record lists only blocks that took effect and can explain what `banned`
+/// shows.
+fn manual_bans(
+    out: &Placed,
+    source: Option<&str>,
+    reason: Option<&str>,
+    now_wall: u32,
+    ttl: u64,
+) -> Vec<tfps::manual_log::ManualAction> {
+    out.blocked
+        .iter()
+        .map(|ip| tfps::manual_log::ManualAction {
+            ts: now_wall,
+            verb: tfps::manual_log::ManualVerb::Ban,
+            ip: *ip,
+            source: source.unwrap_or("operator").to_string(),
+            reason: reason.map(str::to_string),
+            expires: ban_expires(now_wall, ttl),
+        })
+        .collect()
+}
+
+/// The manual-unban records for addresses `unban` actually removed.
+fn manual_unbans(
+    removed: &[(Ipv4Addr, bool)],
+    source: Option<&str>,
+    reason: Option<&str>,
+    now_wall: u32,
+) -> Vec<tfps::manual_log::ManualAction> {
+    removed
+        .iter()
+        .filter(|(_, was)| *was)
+        .map(|(ip, _)| tfps::manual_log::ManualAction {
+            ts: now_wall,
+            verb: tfps::manual_log::ManualVerb::Unban,
+            ip: *ip,
+            source: source.unwrap_or("operator").to_string(),
+            reason: reason.map(str::to_string),
+            expires: None,
+        })
+        .collect()
+}
+
+/// The latest manual action for each address in `wanted`, read from beside the
+/// database.
+///
+/// Lines that cannot be read are reported on stderr and skipped, so an
+/// operator knows the record is incomplete.
+fn manual_record(
+    args: &Args,
+    wanted: &std::collections::HashSet<Ipv4Addr>,
+) -> std::collections::HashMap<Ipv4Addr, tfps::manual_log::ManualAction> {
+    let found = tfps::manual_log::latest_for(&manual_dir(args), wanted);
+    if found.unreadable > 0 {
+        eprintln!(
+            "WARNING: {} line(s) of the manual-action record could not be read",
+            found.unreadable
+        );
+    }
+    found.by_ip
+}
+
+/// Which count of `banned`'s summary line a block falls in.
+#[derive(Debug, PartialEq, Eq)]
+enum Tally {
+    /// The perimeter's own blocks and manually placed ones: what "perimeter/manual"
+    /// has always counted.
+    PerimeterManual,
+    /// Blocks only the APIBAN feed explains.
+    Apiban,
+    /// Blocks nothing explains.
+    Unattributed,
+}
+
+/// The summary count for a block explained by a manual ban, the audit log or
+/// the feed, in that order of precedence.
+fn tally_of(manual: bool, audit: bool, apiban: bool) -> Tally {
+    if manual || audit {
+        Tally::PerimeterManual
+    } else if apiban {
+        Tally::Apiban
+    } else {
+        Tally::Unattributed
+    }
+}
+
+/// The addresses whose latest manual action is a ban, as `newest_audit_ts` takes them.
+fn manual_banned(
+    manual: &std::collections::HashMap<Ipv4Addr, tfps::manual_log::ManualAction>,
+) -> std::collections::HashSet<String> {
+    manual
+        .iter()
+        .filter(|(_, a)| a.verb == tfps::manual_log::ManualVerb::Ban)
+        .map(|(ip, _)| ip.to_string())
+        .collect()
+}
+
+/// The record directory: `manual_log_dir` from the configuration file, else the
+/// database's directory; the same rule the daemon uses.
+fn manual_dir(args: &Args) -> std::path::PathBuf {
+    let configured = match tfps::config::load(&args.config) {
+        tfps::config::Loaded::File(c, _) => c.manual_log_dir,
+        _ => None,
+    };
+    tfps::manual_log::resolve_dir(configured.as_deref(), &args.db)
+}
+
+/// Write `actions` to the record, and say so on stderr when that fails.
+///
+/// The ban or unban has already happened by the time this runs, so a failed
+/// write cannot undo it. Saying so on stderr is the most useful thing left to
+/// do: the operator hears about it.
+fn record_manual(args: &Args, actions: &[tfps::manual_log::ManualAction]) {
+    if actions.is_empty() {
+        return;
+    }
+    let mode = tfps::manual_log::mode_of(&args.db);
+    if let Err(e) = tfps::manual_log::append(&manual_dir(args), actions, mode) {
+        eprintln!(
+            "WARNING: {} manual action(s) took effect but were not recorded: {e}",
+            actions.len()
+        );
     }
 }
 
@@ -866,10 +1082,15 @@ fn banned(args: &Args) -> Result<(), String> {
         // address on the feed alone is attributable, and reading only the audit
         // log reports it as unattributed.
         let store = Store::open_readonly(&args.db).ok();
-        let audit = match store.as_ref().and_then(|s| s.blocks(1_000_000, None).ok()) {
-            Some(rows) => attribute_by_ip(rows),
-            None => std::collections::HashMap::new(),
-        };
+        let rows = store
+            .as_ref()
+            .and_then(|s| s.blocks(1_000_000, None).ok())
+            .unwrap_or_default();
+        let wanted: std::collections::HashSet<Ipv4Addr> =
+            entries.iter().map(|(ip, _)| *ip).collect();
+        let manual = manual_record(args, &wanted);
+        let newest = newest_audit_ts(&rows, &manual_banned(&manual));
+        let audit = attribute_by_ip(rows);
         let apiban = store
             .as_ref()
             .and_then(|s| s.apiban_all().ok())
@@ -880,10 +1101,14 @@ fn banned(args: &Args) -> Result<(), String> {
             let ip_s = ip.to_string();
             let (why, first_seen) = banned_attribution(&ip_s, &audit, &apiban);
             let expires = expires_epoch(*until, now_wall, now_mono);
-            say!(
-                "{}",
-                tfps::json_line(&banned_doc(&ip_s, why, first_seen, expires))?
-            );
+            let doc = match manual_attribution(*ip, &manual, newest.get(&ip_s).copied()) {
+                Some((reason, detail, source)) => {
+                    banned_doc(&ip_s, Some((&reason, &detail)), first_seen, expires)
+                        .with_source(Some(&source))
+                }
+                None => banned_doc(&ip_s, why, first_seen, expires),
+            };
+            say!("{}", tfps::json_line(&doc)?);
         }
         return Ok(());
     }
@@ -902,8 +1127,12 @@ fn banned(args: &Args) -> Result<(), String> {
     // ip -> (reason, detail), most recent block per ip (rows come newest-first).
     let mut audit: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
+    let wanted: std::collections::HashSet<Ipv4Addr> = entries.iter().map(|(ip, _)| *ip).collect();
+    let manual = manual_record(args, &wanted);
+    let mut newest: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     if let Some(s) = store.as_ref() {
         if let Ok(rows) = s.blocks(1_000_000, None) {
+            newest = newest_audit_ts(&rows, &manual_banned(&manual));
             for r in rows {
                 audit.entry(r.ip).or_insert((r.reason, r.detail));
             }
@@ -920,15 +1149,23 @@ fn banned(args: &Args) -> Result<(), String> {
             ago(((*until).saturating_sub(now_ns) / 1_000_000_000) as u32)
         };
         let ip_s = ip.to_string();
-        // block_log reason wins; then the feed; then unknown.
-        let why = if let Some((reason, detail)) = audit.get(&ip_s) {
-            n_perimeter += 1;
+        // A manual ban no daemon block has superseded wins; then block_log; then the
+        // feed; then unknown. A manual ban counts as perimeter/manual, as before.
+        let by_manual = manual_attribution(*ip, &manual, newest.get(&ip_s).copied());
+        let by_audit = audit.get(&ip_s);
+        let by_feed = apiban.contains(&ip_s);
+        match tally_of(by_manual.is_some(), by_audit.is_some(), by_feed) {
+            Tally::PerimeterManual => n_perimeter += 1,
+            Tally::Apiban => n_apiban += 1,
+            Tally::Unattributed => n_unknown += 1,
+        }
+        let why = if let Some((_, detail, source)) = by_manual {
+            format!("manual ({detail}) by {source}")
+        } else if let Some((reason, detail)) = by_audit {
             format!("{reason} ({detail})")
-        } else if apiban.contains(&ip_s) {
-            n_apiban += 1;
+        } else if by_feed {
             "apiban (feed)".to_string()
         } else {
-            n_unknown += 1;
             "not in this audit log".to_string()
         };
         if args.why {
@@ -962,6 +1199,15 @@ fn unban(args: &Args) -> Result<(), String> {
         for (ip, _) in &all {
             removed.push((*ip, b.remove(*ip)?));
         }
+        record_manual(
+            args,
+            &manual_unbans(
+                &removed,
+                args.source.as_deref(),
+                args.reason.as_deref(),
+                now(),
+            ),
+        );
         if args.json {
             for (ip, was_removed) in &removed {
                 let refused = if *was_removed {
@@ -971,7 +1217,10 @@ fn unban(args: &Args) -> Result<(), String> {
                 };
                 say!(
                     "{}",
-                    tfps::json_line(&action_doc(Some(&ip.to_string()), "unban", refused, None))?
+                    tfps::json_line(
+                        &action_doc(Some(&ip.to_string()), "unban", refused, None)
+                            .with_source(args.source.as_deref())
+                    )?
                 );
             }
             return Ok(());
@@ -982,16 +1231,21 @@ fn unban(args: &Args) -> Result<(), String> {
     if args.positional.is_empty() {
         return Err("give at least one address, or --all".into());
     }
+    let mut done: Vec<(Ipv4Addr, bool)> = Vec::with_capacity(args.positional.len());
     for raw in &args.positional {
         let ip: Ipv4Addr = raw.parse().map_err(|e| format!("{raw}: {e}"))?;
         // Saying "unbanned" for an address that was never there would be a small lie the
         // operator acts on: they would stop looking for the real block.
         let removed = b.remove(ip)?;
+        done.push((ip, removed));
         if args.json {
             let refused = if removed { None } else { Some("not-blocked") };
             say!(
                 "{}",
-                tfps::json_line(&action_doc(Some(&ip.to_string()), "unban", refused, None))?
+                tfps::json_line(
+                    &action_doc(Some(&ip.to_string()), "unban", refused, None)
+                        .with_source(args.source.as_deref())
+                )?
             );
         } else if removed {
             say!("unbanned {ip}");
@@ -999,6 +1253,10 @@ fn unban(args: &Args) -> Result<(), String> {
             say!("{ip} was not blocked");
         }
     }
+    record_manual(
+        args,
+        &manual_unbans(&done, args.source.as_deref(), args.reason.as_deref(), now()),
+    );
     Ok(())
 }
 
@@ -1076,7 +1334,7 @@ struct ActionDoc {
     applied: bool,
     refused: Option<String>,
     expires: Option<u32>,
-    source: &'static str,
+    source: String,
 }
 
 /// Built from arguments so it is drivable from a test without touching the
@@ -1095,7 +1353,18 @@ fn action_doc(
         applied: refused.is_none(),
         refused: refused.map(str::to_string),
         expires,
-        source: "operator",
+        source: "operator".to_string(),
+    }
+}
+
+impl ActionDoc {
+    /// The same reply, naming who asked when `--source` was given. Without it
+    /// the reply keeps `"operator"`, byte for byte what it was.
+    fn with_source(mut self, source: Option<&str>) -> Self {
+        if let Some(s) = source {
+            self.source = s.to_string();
+        }
+        self
     }
 }
 
@@ -1134,7 +1403,7 @@ fn ban_expires(now_wall: u32, ttl_secs: u64) -> Option<u32> {
 /// compile cleanly and pass every `action_doc` test — see
 /// `ban_action_docs_maps_each_placed_outcome_to_its_own_refusal`, which
 /// drives this function through a real `Placed` instead.
-fn ban_action_docs(out: &Placed, expires: Option<u32>) -> Vec<ActionDoc> {
+fn ban_action_docs(out: &Placed, expires: Option<u32>, source: Option<&str>) -> Vec<ActionDoc> {
     let mut docs = Vec::with_capacity(out.blocked.len() + out.exempt.len() + out.failed.len());
     for ip in &out.blocked {
         docs.push(action_doc(Some(&ip.to_string()), "ban", None, expires));
@@ -1154,7 +1423,7 @@ fn ban_action_docs(out: &Placed, expires: Option<u32>) -> Vec<ActionDoc> {
             None,
         ));
     }
-    docs
+    docs.into_iter().map(|d| d.with_source(source)).collect()
 }
 
 /// The per-address diagnostics for whatever `place` refused or failed to
@@ -1219,6 +1488,16 @@ fn ban(args: &Args) -> Result<(), String> {
         };
         bl.insert(ip, args.ttl)
     });
+    record_manual(
+        args,
+        &manual_bans(
+            &out,
+            args.source.as_deref(),
+            args.reason.as_deref(),
+            now(),
+            args.ttl,
+        ),
+    );
 
     if args.json {
         // Render `out` exactly as computed above — the same guard decision
@@ -1230,7 +1509,7 @@ fn ban(args: &Args) -> Result<(), String> {
         // `"refused":"kernel"` on stdout, so stderr is the only place the
         // specific reason is still available to a `--json` caller.
         let expires = ban_expires(now(), args.ttl);
-        for doc in ban_action_docs(&out, expires) {
+        for doc in ban_action_docs(&out, expires, args.source.as_deref()) {
             say!("{}", tfps::json_line(&doc)?);
         }
         report_ban_diagnostics(&out);
@@ -2614,7 +2893,7 @@ mod tests {
         );
         assert_eq!(out.failed, vec![(failed_ip, "map is full".to_string())]);
 
-        let docs = ban_action_docs(&out, Some(1756921210));
+        let docs = ban_action_docs(&out, Some(1756921210), None);
         assert_eq!(
             docs.len(),
             4,
@@ -3163,6 +3442,381 @@ mod tests {
         assert!(
             handler_body(src, "status").contains("env!(\"CARGO_PKG_VERSION\")"),
             "status must pass the crate version to status_doc, never a literal"
+        );
+    }
+
+    // ── manual bans and unbans leave a record ──────────────────────────────
+
+    fn manual(
+        ts: u32,
+        verb: tfps::manual_log::ManualVerb,
+        source: &str,
+        reason: Option<&str>,
+    ) -> tfps::manual_log::ManualAction {
+        tfps::manual_log::ManualAction {
+            ts,
+            verb,
+            ip: ip(20),
+            source: source.to_string(),
+            reason: reason.map(str::to_string),
+            expires: None,
+        }
+    }
+
+    #[test]
+    fn ban_takes_a_source_and_a_reason() {
+        let a = args(&[
+            "ban",
+            "203.0.113.20",
+            "--source",
+            "sipnab",
+            "--reason",
+            "scanner seen by sipnab",
+        ])
+        .expect("parses");
+        assert_eq!(a.source.as_deref(), Some("sipnab"));
+        assert_eq!(a.reason.as_deref(), Some("scanner seen by sipnab"));
+        let a = args(&["unban", "203.0.113.20", "--source", "sipnab"]).expect("parses");
+        assert_eq!(a.source.as_deref(), Some("sipnab"));
+    }
+
+    #[test]
+    fn a_bad_source_or_reason_is_refused_before_anything_runs() {
+        for bad in [
+            vec!["ban", "203.0.113.20", "--source", "has space"],
+            vec!["ban", "203.0.113.20", "--reason", "two\nlines"],
+            vec!["ban", "203.0.113.20", "--source"],
+        ] {
+            let Err(e) = args(&bad) else {
+                panic!("{bad:?} must be refused");
+            };
+            assert!(
+                e.contains("--source") || e.contains("--reason"),
+                "{bad:?}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_and_reason_belong_to_ban_and_unban_only() {
+        let Err(e) = args(&["banned", "--source", "sipnab"]) else {
+            panic!("--source on banned must be refused");
+        };
+        assert!(e.contains("--source") && e.contains("ban"), "{e}");
+        let Err(e) = args(&["status", "--reason", "why"]) else {
+            panic!("--reason on status must be refused");
+        };
+        assert!(e.contains("--reason"), "{e}");
+    }
+
+    #[test]
+    fn only_addresses_actually_blocked_are_recorded() {
+        let out = Placed {
+            blocked: vec![ip(1), ip(2)],
+            exempt: vec![(
+                ip(3),
+                Exemption {
+                    origin: Origin::Local,
+                    rule: "203.0.113.3".to_string(),
+                },
+            )],
+            failed: vec![(ip(4), "map full".to_string())],
+        };
+        let recs = manual_bans(&out, Some("sipnab"), Some("scan"), 1_000, 3600);
+        let ips: Vec<Ipv4Addr> = recs.iter().map(|r| r.ip).collect();
+        assert_eq!(ips, vec![ip(1), ip(2)]);
+        assert!(recs
+            .iter()
+            .all(|r| r.source == "sipnab" && r.reason.as_deref() == Some("scan")));
+        assert!(recs.iter().all(|r| r.expires == ban_expires(1_000, 3600)));
+    }
+
+    #[test]
+    fn a_ban_with_no_source_is_the_operators() {
+        let out = Placed {
+            blocked: vec![ip(1)],
+            exempt: vec![],
+            failed: vec![],
+        };
+        let recs = manual_bans(&out, None, None, 1_000, 0);
+        assert_eq!(recs[0].source, "operator");
+        assert_eq!(recs[0].reason, None);
+        assert_eq!(recs[0].expires, None, "a ban with no expiry records none");
+    }
+
+    #[test]
+    fn only_addresses_actually_removed_are_recorded_as_unbanned() {
+        let removed = vec![(ip(1), true), (ip(2), false)];
+        let recs = manual_unbans(&removed, Some("sipnab"), None, 2_000);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].ip, ip(1));
+        assert_eq!(recs[0].verb, tfps::manual_log::ManualVerb::Unban);
+    }
+
+    /// The latest action per address, as `latest_for` answers it.
+    fn latest_of(
+        actions: &[tfps::manual_log::ManualAction],
+    ) -> std::collections::HashMap<Ipv4Addr, tfps::manual_log::ManualAction> {
+        let mut m = std::collections::HashMap::new();
+        for a in actions {
+            let keep = m
+                .get(&a.ip)
+                .is_none_or(|held: &tfps::manual_log::ManualAction| held.ts <= a.ts);
+            if keep {
+                m.insert(a.ip, a.clone());
+            }
+        }
+        m
+    }
+
+    fn row(ts: u32, ip: &str) -> BlockRow {
+        BlockRow {
+            ts,
+            ip: ip.to_string(),
+            reason: "user-agent".to_string(),
+            detail: "friendly-scanner".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_newest_daemon_block_is_looked_up_only_for_manual_banned_addresses() {
+        let rows = [
+            row(300, "203.0.113.1"),
+            row(200, "203.0.113.2"),
+            row(100, "203.0.113.1"),
+        ];
+        let candidates: std::collections::HashSet<String> = ["203.0.113.1".to_string()].into();
+        let newest = newest_audit_ts(&rows, &candidates);
+        assert_eq!(newest.len(), 1, "{newest:?}");
+        assert_eq!(newest["203.0.113.1"], 300);
+    }
+
+    #[test]
+    fn with_no_manual_bans_the_audit_rows_are_not_walked_again() {
+        let rows = [row(300, "203.0.113.1")];
+        assert!(newest_audit_ts(&rows, &std::collections::HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn banned_keeps_its_summary_wording() {
+        let body = handler_body(include_str!("tfps_ctl.rs"), "banned");
+        assert!(
+            body.contains("perimeter/manual"),
+            "the summary keeps its words"
+        );
+        assert!(
+            !body.contains("manually, "),
+            "manual bans count as perimeter/manual"
+        );
+    }
+
+    #[test]
+    fn a_manual_ban_explains_a_block_nothing_else_explains() {
+        let latest = latest_of(&[manual(
+            500,
+            tfps::manual_log::ManualVerb::Ban,
+            "sipnab",
+            Some("scan"),
+        )]);
+        let got = manual_attribution(ip(20), &latest, None);
+        assert_eq!(
+            got,
+            Some((
+                "manual".to_string(),
+                "scan".to_string(),
+                "sipnab".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_newer_daemon_block_outranks_an_older_manual_ban() {
+        let latest = latest_of(&[manual(
+            500,
+            tfps::manual_log::ManualVerb::Ban,
+            "sipnab",
+            Some("scan"),
+        )]);
+        assert_eq!(manual_attribution(ip(20), &latest, Some(600)), None);
+        assert!(
+            manual_attribution(ip(20), &latest, Some(400)).is_some(),
+            "an older daemon block does not"
+        );
+    }
+
+    #[test]
+    fn a_manual_unban_explains_nothing() {
+        let latest = latest_of(&[
+            manual(
+                500,
+                tfps::manual_log::ManualVerb::Ban,
+                "sipnab",
+                Some("scan"),
+            ),
+            manual(600, tfps::manual_log::ManualVerb::Unban, "operator", None),
+        ]);
+        assert_eq!(manual_attribution(ip(20), &latest, None), None);
+    }
+
+    #[test]
+    fn a_manual_ban_with_no_reason_says_so_rather_than_leaving_it_blank() {
+        let latest = latest_of(&[manual(
+            500,
+            tfps::manual_log::ManualVerb::Ban,
+            "operator",
+            None,
+        )]);
+        let (reason, detail, source) =
+            manual_attribution(ip(20), &latest, None).expect("attributed");
+        assert_eq!(
+            (reason.as_str(), detail.as_str(), source.as_str()),
+            ("manual", "no reason given", "operator")
+        );
+    }
+
+    #[test]
+    fn banned_json_names_who_placed_a_manual_ban() {
+        let doc = banned_doc(&ip(20).to_string(), Some(("manual", "scan")), None, None)
+            .with_source(Some("sipnab"));
+        let v = serde_json::to_value(&doc).expect("serializes");
+        assert_eq!(v["source"], "sipnab");
+        assert_eq!(v["reason"], "manual");
+        let plain = serde_json::to_value(banned_doc(&ip(21).to_string(), None, None, None))
+            .expect("serializes");
+        assert!(plain["source"].is_null(), "not a manual ban: {plain}");
+    }
+
+    #[test]
+    fn ban_and_unban_write_the_record() {
+        let src = include_str!("tfps_ctl.rs");
+        for name in ["ban", "unban"] {
+            assert!(
+                handler_body(src, name).contains("record_manual("),
+                "{name} must record what it did"
+            );
+        }
+    }
+
+    #[test]
+    fn banned_explains_a_manual_ban_in_both_renderings() {
+        let body = handler_body(include_str!("tfps_ctl.rs"), "banned");
+        assert_eq!(
+            body.matches("manual_attribution(").count(),
+            2,
+            "the JSON path and the human path must both consult the manual record"
+        );
+    }
+
+    #[test]
+    fn the_daemon_prunes_the_manual_record_on_the_audit_window() {
+        let daemon = include_str!("../main.rs");
+        assert!(
+            daemon.contains("tfps::manual_log::prune("),
+            "the daemon owns retention; without it the manual record grows forever"
+        );
+    }
+
+    #[test]
+    fn a_ban_reply_names_the_given_source_and_keeps_operator_otherwise() {
+        let out = Placed {
+            blocked: vec![ip(1)],
+            exempt: vec![],
+            failed: vec![],
+        };
+        let named = ban_action_docs(&out, None, Some("sipnab"));
+        assert!(
+            tfps::json_line(&named[0])
+                .unwrap()
+                .ends_with(r#""source":"sipnab"}"#),
+            "the reply must not contradict the record"
+        );
+        let plain = ban_action_docs(&out, None, None);
+        assert!(
+            tfps::json_line(&plain[0])
+                .unwrap()
+                .ends_with(r#""source":"operator"}"#),
+            "no --source: the reply is byte-for-byte what it was"
+        );
+    }
+
+    #[test]
+    fn both_unban_replies_name_the_given_source() {
+        let body = handler_body(include_str!("tfps_ctl.rs"), "unban");
+        assert_eq!(
+            body.matches(".with_source(args.source.as_deref())").count(),
+            2,
+            "the --all path and the single-address path"
+        );
+    }
+
+    #[test]
+    fn a_manual_ban_counts_as_perimeter_manual_in_the_summary() {
+        assert_eq!(tally_of(true, false, false), Tally::PerimeterManual);
+        assert_eq!(
+            tally_of(true, true, true),
+            Tally::PerimeterManual,
+            "manual wins"
+        );
+        assert_eq!(tally_of(false, true, false), Tally::PerimeterManual);
+        assert_eq!(tally_of(false, false, true), Tally::Apiban);
+        assert_eq!(tally_of(false, false, false), Tally::Unattributed);
+    }
+
+    #[test]
+    fn the_record_directory_comes_from_the_config_file_when_set() {
+        let dir = std::env::temp_dir().join(format!("tfps-ctl-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let cfg = dir.join("config.json");
+        std::fs::write(&cfg, r#"{"manual_log_dir": "/srv/tfps/manual"}"#).expect("write");
+        let a = args(&[
+            "banned",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--db",
+            "/var/lib/tfps/tfps.db",
+        ])
+        .expect("parses");
+        assert_eq!(manual_dir(&a), std::path::Path::new("/srv/tfps/manual"));
+        std::fs::write(&cfg, "{}").expect("write");
+        assert_eq!(
+            manual_dir(&a),
+            std::path::Path::new("/var/lib/tfps"),
+            "default: beside the database"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn every_manual_record_access_goes_through_the_configured_directory() {
+        let src = include_str!("tfps_ctl.rs");
+        let start = src.find("\nmod tests {").expect("tests module");
+        let code = &src[..start];
+        assert!(
+            !code.contains("manual_log::append(&args.db")
+                && !code.contains("manual_log::latest_for(db"),
+            "the record is found through manual_dir, never straight from the database path"
+        );
+        assert!(
+            code.matches("manual_dir(args)").count() >= 2,
+            "record_manual and banned"
+        );
+    }
+
+    #[test]
+    fn the_daemon_re_applies_manual_bans_only_when_configured_and_through_its_guard() {
+        let daemon = include_str!("../main.rs");
+        let at = daemon
+            .find("if args.reapply_manual_bans")
+            .expect("gated on the setting");
+        let block = &daemon[at..at + daemon[at..].find("\n    }\n").expect("block ends")];
+        assert!(block.contains("tfps::manual_log::reapply("), "{block}");
+        assert!(
+            block.contains("ignoreip.exempt("),
+            "exemptions apply: {block}"
+        );
+        assert!(
+            block.contains("is_known_peer("),
+            "registered peers apply: {block}"
         );
     }
 }

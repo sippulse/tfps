@@ -99,6 +99,15 @@ pub struct Config {
     pub checkpoint_every: Option<u64>,
     pub iface: Option<String>,
     pub db: Option<PathBuf>,
+    /// Where `tfps_ctl` keeps its record of manual bans and unbans. Absent: the
+    /// database's directory.
+    pub manual_log_dir: Option<PathBuf>,
+    /// Re-apply unexpired manual bans from that record when the daemon starts,
+    /// through the same guard a manual ban passes. Off unless set: a restart has
+    /// always started from an empty block map, and an operator who relies on
+    /// that must not find old bans back without asking for them.
+    #[serde(default)]
+    pub reapply_manual_bans: bool,
     pub xdp_obj: Option<PathBuf>,
     pub drop_map: Option<PathBuf>,
 }
@@ -209,5 +218,25 @@ mod tests {
     fn an_absent_file_is_not_an_error() {
         let p = std::path::Path::new("/path/that/does/not/exist/config.json");
         assert!(matches!(load(p), Loaded::Absent));
+    }
+
+    #[test]
+    fn the_manual_action_record_can_be_moved_and_is_beside_the_database_by_default() {
+        let c = parse(r#"{"manual_log_dir": "/srv/tfps/manual"}"#).expect("parses");
+        assert_eq!(
+            c.manual_log_dir.as_deref(),
+            Some(std::path::Path::new("/srv/tfps/manual"))
+        );
+        assert!(parse("{}").expect("empty").manual_log_dir.is_none());
+    }
+
+    #[test]
+    fn re_applying_manual_bans_at_startup_is_off_unless_asked_for() {
+        assert!(!parse("{}").expect("empty").reapply_manual_bans);
+        assert!(
+            parse(r#"{"reapply_manual_bans": true}"#)
+                .expect("parses")
+                .reapply_manual_bans
+        );
     }
 }
