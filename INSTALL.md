@@ -19,9 +19,9 @@ same line again to upgrade. It never touches an existing `/etc/tfps/config.json`
 | systemd | TFPS ships as a unit |
 | root | it installs into `/usr/local`, `/etc/tfps` and `/etc/systemd/system` |
 | `curl` | to fetch the release |
-| `clang` and `bpftool` | to compile the XDP program; **installed for you** on Debian, Ubuntu and Fedora when missing |
+| `clang`, `bpftool` and the libbpf headers (`libbpf-dev` / `libbpf-devel`) | to compile the XDP program; **installed for you** on Debian, Ubuntu and Fedora when missing |
 
-Tested on Debian 12 and Ubuntu 24.04. Anything else with the kernel and systemd above
+Tested on Debian 12, Debian 13 and Ubuntu 24.04. Anything else with the kernel and systemd above
 should work; the installer says exactly what is missing when it is not.
 
 The daemon does not bind a UDP port, so your softswitch keeps its socket on 5060 and never
@@ -31,7 +31,7 @@ notices. Nothing in the installer changes your SIP service, your firewall or you
 
 1. **Checks the host**: Linux, x86_64, root, systemd, kernel and BTF. It stops with a plain
    message when one is missing, before changing anything.
-2. **Installs `clang` and `bpftool`** when they are not there, through `apt-get` or `dnf`.
+2. **Installs `clang`, `bpftool` and the libbpf headers** when they are not there, through `apt-get` or `dnf`.
 3. **Gets the binaries**, from the first of these that applies:
    - `TFPS_TARBALL` — a release tarball you already have (see below);
    - the repository, when you run it from a checkout;
