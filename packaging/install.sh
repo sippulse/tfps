@@ -84,6 +84,17 @@ if ! have clang || ! have bpftool; then
     have clang || die "clang is still missing after the install"
     have bpftool || die "bpftool is still missing after the install"
 fi
+# tfps_xdp.c includes <bpf/bpf_helpers.h> and <bpf/bpf_endian.h>, the libbpf headers. clang
+# and bpftool do not bring them: Debian 13 compiled nothing without libbpf-dev.
+if [ ! -f /usr/include/bpf/bpf_helpers.h ]; then
+    say "installing the libbpf headers"
+    if have apt-get; then
+        pkg_install libbpf-dev
+    else
+        pkg_install libbpf-devel
+    fi
+    [ -f /usr/include/bpf/bpf_helpers.h ] || die "the libbpf headers (bpf/bpf_helpers.h) are still missing after the install"
+fi
 
 # ----------------------------------------------------------- 2. get the binaries
 # On exit from this section: $SRC has ebpf/tfps_xdp.c and packaging/, $BIN has tfps and
