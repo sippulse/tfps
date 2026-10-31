@@ -61,7 +61,7 @@ packet on a captured port
                           │
                           ├─ < N ──► pass
                           └─ ≥ N ──► XDP_DROP the INVITE
-                                     + userspace forges a 603 Decline
+                                     + (planned, not implemented) userspace 603 Decline
 ```
 
 **Two properties of this flow:**
@@ -113,7 +113,7 @@ Blocking on a canonicalisation failure would repeat **R07** of the Java TFPS, wh
 
 **Hierarchical key `(peer, A-number)`.**
 
-The trustworthy key and the useful key are opposites. The **A-number is forgeable** — a text field in `From`. The **peer's IP is not**: over UDP it could be spoofed, but the SIP response would not come back and the call would not complete. Except that the peer is the **broad-profile** entity, which saturates every behavioural signal.
+The trustworthy key and the useful key are opposites. The **A-number is forgeable** — a text field in `From`. The **peer's IP is observable without trusting SIP headers**, but it is not non-forgeable: over UDP it can be spoofed, and a one-way block can still fire even if the response would not come back. Enforcement therefore depends on ingress filtering (BCP38/BCP84/uRPF). Except that the peer is the **broad-profile** entity, which saturates every behavioural signal.
 
 By anchoring on the peer and grouping by A-number, **forgeability becomes signal**:
 
@@ -137,7 +137,7 @@ replaced it and why:
   volume spike against the source's own norm) with **hierarchical Gamma-Poisson surprise**.
 - Both yield evidence in log-likelihood units and are fused; enforcement fires when the total
   crosses a bound set by the error rates (α, β), not a hand-picked threshold.
-- The unit is the **source IP**, not `(peer, A-number)` — non-forgeable, and it removes the
+- The unit is the **source IP**, not `(peer, A-number)` — observable without trusting SIP headers (though spoofable on UDP), and it removes the
   A-number-rotation bypass.
 - Behavioural detection is **opt-in** (`--behavioural`); the perimeter (noise reduction) is
   the default product.
@@ -163,17 +163,21 @@ Sources: a list of user-agents and IP ranges in the JSON; rate; optionally APIBA
 | case | eBPF | userspace |
 |---|---|---|
 | scanner / perimeter | drops | **nothing — total silence** |
-| fraud, legitimate customer | drops | forges `603 Decline` |
+| fraud, legitimate customer (opt-in `--enforce-behavioural`) | drops the source | **nothing — forged `603` is not implemented** |
 | clean | passes | nothing |
 
-### The perimeter stays quiet, fraud gets an answer
+### The perimeter stays quiet; the forged answer is not implemented
+
+Current v0.3.0 drops the source and sends no response. The argument below is the design
+rationale for the forged `603` once it exists.
 
 Any response to a scanner — `403`, `404`, even `401` — confirms a live SIP endpoint and invites escalation; differentiated responses still leak extension enumeration. But silently dropping a **legitimate customer** costs 32 seconds of retransmission under RFC 3261's A/B timers, and the product's central case is a paying customer, where silence looks like an outage.
 
 **Exception**: **decoys answer deliberately.** Silence protects the production surface; an answer feeds the trap. Different surfaces, different roles.
 
-### Drop-then-forge
+### Drop-then-forge (planned)
 
+**Not implemented in v0.3.0.** The source is dropped; no response is forged yet. When it is,
 XDP **drops** the INVITE and userspace **forges** the response through a raw socket (`CAP_NET_RAW`). This **eliminates the race** against the softswitch instead of trying to win it. RFC 3261 §17.1.3 makes the forgery mechanical: the response reuses the INVITE's own `Via`/`branch`, `From` tag, `Call-ID` and `CSeq` — only the `To-tag` and `Contact` have to be generated.
 
 **eBPF cannot create a packet from scratch** — no helper builds a new frame, only rewrites or redirects. Hence the forgery lives in userspace.
@@ -305,4 +309,4 @@ What killed it was **friction** and **lack of focus** — and the second is meas
 
 **A half-built machine everywhere.**
 
-This spec cuts the corpus, the cloud, the statistical model, the challenge, range novelty and the telemetry collector — not out of modesty, but because **a system with no model has no half-built model**.
+This spec cuts the corpus, the cloud, the statistical model, the challenge and the telemetry collector — not out of modesty, but because **a system with no model has no half-built model**. (Range and dialling-prefix novelty were later reintroduced as the behavioural arms; see [`docs/anomaly-detection.md`](docs/anomaly-detection.md).)

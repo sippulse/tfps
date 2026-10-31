@@ -299,6 +299,27 @@ const _: () = assert!(COUNTRY_COUNT <= 256);
 /// destroy per-country novelty exactly where IRSF is common.
 pub fn resolve(digits: &InternationalDigits) -> Option<Country> {
     let d = digits.0.as_str();
+    // Calling codes are one to four digits (`1`, `44`, `1242`). Longest-match: try the
+    // longest possible prefix first and stop at the first hit. Binary search rather than a
+    // scan of all 233 entries — this runs on every international call.
+    for len in (1..=4).rev() {
+        let Some(key) = d.get(..len) else { continue };
+        if let Ok(i) = CODES.binary_search_by(|(code, _, _)| (*code).cmp(key)) {
+            return Some(Country {
+                index: CountryIndex(CODES[i].2),
+                iso: CODES[i].1,
+                calling_code: CODES[i].0,
+            });
+        }
+    }
+    None
+}
+
+/// The pre-binary-search implementation, kept as the reference the fast path is checked
+/// against. Not compiled into the binary.
+#[cfg(test)]
+fn resolve_linear(digits: &InternationalDigits) -> Option<Country> {
+    let d = digits.0.as_str();
     let mut best: Option<usize> = None;
     for (i, (code, _, _)) in CODES.iter().enumerate() {
         if d.starts_with(code) && best.is_none_or(|b| code.len() > CODES[b].0.len()) {
@@ -360,6 +381,37 @@ mod tests {
 
     fn dig(s: &str) -> InternationalDigits {
         InternationalDigits(s.to_string())
+    }
+
+    #[test]
+    fn the_code_table_is_sorted_for_binary_search() {
+        assert!(
+            CODES.windows(2).all(|w| w[0].0 < w[1].0),
+            "resolve() binary-searches CODES; the table must stay sorted by code"
+        );
+    }
+
+    #[test]
+    fn binary_search_resolution_matches_the_linear_reference() {
+        // The fast path is only correct if it returns exactly what the exhaustive
+        // longest-match did. Cover every code, plus longer numbers that share a prefix.
+        for (code, _, _) in CODES {
+            for suffix in ["", "0000", "123456"] {
+                let d = dig(&format!("{code}{suffix}"));
+                assert_eq!(resolve(&d), resolve_linear(&d), "{code}{suffix}");
+            }
+        }
+        for digits in [
+            "12125551234",
+            "442039967796",
+            "5511999998888",
+            "25261234567",
+            "9791234567",
+            "999123456",
+        ] {
+            let d = dig(digits);
+            assert_eq!(resolve(&d), resolve_linear(&d), "{digits}");
+        }
     }
 
     #[test]

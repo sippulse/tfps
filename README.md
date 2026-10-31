@@ -28,6 +28,14 @@ Two layers, and the first is the product:
   valid credentials and every perimeter signal is clean. It catches IRSF by anomaly. It is a
   research-grade layer, not a guarantee.
 
+> **Not a guarantee. Use at your own risk.** TFPS sees SIP on the wire only. It cannot detect
+> every fraud type (SIP over TLS/TCP content, IPv6, billing or insider fraud, social
+> engineering, low-and-slow mimicry, fraud that never touches the network). Behavioural
+> detection is experimental and report-only by default. Source-level XDP blocking is opt-in
+> with `--enforce-behavioural`, and the forged SIP `603` is still missing. Validate it on your
+> own traffic; it is not a substitute for a security audit or financial controls. See the
+> full Disclaimer below.
+
 - **Static musl binaries** — `tfps` ≈ 4.3 MB, `tfps_ctl` ≈ 2.3 MB. No glibc dependency;
   they run on Ubuntu 24.04, Debian 12 and forward.
 - **No UDP bind** — capture is `AF_PACKET`, so your softswitch keeps its own socket on 5060
@@ -70,7 +78,7 @@ noisiest scanners disappear from the capture entirely.
 | compared to | a faster `fail2ban`, no log parsing | goes where fail2ban structurally cannot |
 | maturity | production | **highly experimental** |
 | needs learning? | no — effective from minute one | yes — 30-day learning window before it acts |
-| the signal | user-agent, URI shape, failed auth, APIBAN | three-arm sequential detector (see below) |
+| the signal | user-agent, URI shape, failed auth, APIBAN | four-arm sequential detector (see below) |
 | default | **on** | **off** |
 
 ```sh
@@ -91,24 +99,30 @@ configured on the softswitch at all.
 
 ---
 
-## Status — v0.2.1
+## Status — v0.3.0
 
 | working | not yet |
 |---|---|
-| `AF_PACKET` capture, no port bind | enforcing the behavioural verdict (forged `603`) |
+| `AF_PACKET` capture, no port bind | — |
 | XDP enforcement of perimeter blocks (native/generic) | SIP over TCP (detection) |
 | perimeter: user-agent, URI injection, failed auth | IPv6, SIP over TLS |
 | APIBAN, background-synced and persisted | call-duration signal via `BYE` |
 | `ignoreip`, with the host's own addresses always exempt | day-31 activation confirmation |
-| three-arm behavioural detector, self-calibrating | |
+| four-arm behavioural detector, self-calibrating | |
+| source-level behavioural enforcement (`--enforce-behavioural`) | forged SIP `603` |
 | SQLite persistence and control tool | |
 
-**The perimeter enforces today; the behavioural layer detects and reports.** During the
-30-day learning window it prints `WOULD BLOCK` lines and blocks nothing. After that it
-prints `BLOCK` lines with the evidence — but pushing that verdict to the kernel (the forged
-`603 Decline` of `SPEC.md` §8, or a source-level drop) is the remaining piece. Read the
-`WOULD BLOCK`/`BLOCK` lines and the `tfps_ctl stats` calibration to judge the (α, β) tuning
-before wiring enforcement on.
+**The perimeter enforces today; the behavioural layer detects and reports by default.**
+During the 30-day learning window it prints `WOULD BLOCK` lines and blocks nothing. After
+that it prints `BLOCK (report-only, not enforced)` lines with the evidence. With
+`--enforce-behavioural` (or `"enforce_behavioural": true`) the same verdict is written into
+XDP for `block_ttl` and logged as `BLOCKED ... reason=behavioural`; the forged SIP `603
+Decline` of `SPEC.md` §8 is still missing.
+A registered peer is exempt from the third-party APIBAN feed, but no longer from the
+perimeter's or behavioural layer's own active evidence (injection, auth failure, registration scanning, auth
+volume); only a successful REGISTER grants known-good status, for 24 hours. Read the
+`WOULD BLOCK`/`BLOCK` lines and the `tfps_ctl stats` calibration to judge how the detector
+fits your traffic before wiring enforcement on.
 
 ---
 
@@ -167,13 +181,15 @@ Five rejections in ten minutes condemn the source — `fail2ban`'s `maxretry`/`f
 the Asterisk jail, deliberately, but read off the wire instead of a log the softswitch may
 not be writing. Requests are matched to responses by the `Via` branch (RFC 3261 §17.1.3),
 falling back to `Call-ID` + `CSeq`. A retransmitted `401` counts once; an accepted credential
-clears the run, so someone who fixes a typo is not blocked by their next slip. Because it
-counts *failures*, a busy NAT is not a problem — a hundred phones behind one address all
-succeed.
+clears only that AOR's failures, so someone who fixes a typo is not blocked by their next
+slip, while a valid account cannot reset a run against a different extension. The source of
+the response must also match the request's destination. A NAT whose phones succeed is below
+the registration-scan floor; a NAT with no captured responses can still look like an
+enumerator, so put it in `ignoreip`.
 
 **The backstop**: where the softswitch rejects probes *without* answering (measured on the
 reference server: one outbound packet in 45 s against hundreds inbound), the failure counter
-cannot rise, so a volume rule remains — 20 authenticated attempts in 60 s with no challenge
+cannot rise, so a volume rule remains — 50 authenticated attempts in 60 s with no challenge
 seen. When that condition is detected, TFPS **says so** on the report, because a rule that
 structurally cannot fire is the `fail2ban` blindness this project exists to avoid.
 
@@ -193,6 +209,37 @@ what a source does with those valid credentials.
 
 Turn it on with `--behavioural`. It learns each **source IP**'s normal behaviour and flags
 IRSF by anomaly.
+
+### Enable it
+
+```json
+{
+  "behavioural": true,
+  "enforce_behavioural": false,
+  "intl_prefixes": ["+", "00", "011", "9011"],
+  "home_countries": ["BR"],
+  "learn_days": 30,
+  "ignoreip": ["10.0.0.0/8"]
+}
+```
+
+```sh
+tfps --behavioural                              # 30-day learning window, report-only
+tfps --behavioural --enforce-behavioural        # block after learning
+tfps --behavioural --active --enforce-behavioural # block now; do not do this on day one
+```
+
+The first **30 days are learning**: it prints `WOULD BLOCK` and blocks nothing. Each new
+source also has its own **24 h / 20 international call** warm-up (`WARMING`). After that the
+verdict is printed as `BLOCK (report-only, not enforced)` unless `--enforce-behavioural` (or
+`"enforce_behavioural": true`) is set, in which case the source is written into XDP for
+`block_ttl` and the log says `BLOCKED ... reason=behavioural`. The perimeter still enforces;
+the forged SIP `603` is the remaining piece. Watch `WOULD BLOCK` lines and `tfps_ctl stats` during the
+window. To disable, remove `--behavioural` or set `"behavioural": false`; learned state stays
+on disk until `tfps_ctl forget`.
+
+Use `--no-enforce-one-way` (or `"no_enforce_one_way": true`) if the one-way perimeter evidence
+is exposed to spoofing: those verdicts stay report-only; behavioural detection is unchanged.
 
 > **Prerequisite — configure your international prefixes.** The behavioural layer reasons
 > only about **international** destinations, and `intl_prefixes` (global and per-peer) is how
@@ -219,31 +266,36 @@ IRSF destinations (Latvia, Somalia, the Philippines) validate as ordinary mobile
 while some genuine ranges are rejected. Neither validity nor number-type separates fraud
 from legitimate traffic. Detection has to be **behavioural**.
 
-**IRSF has a behavioural signature, in two phases**, and each maps onto a solved problem:
+**IRSF has a behavioural signature, in phases**, and each maps onto a solved problem:
 
-- **Scanning** — "they try dozens of countries to find one that routes through a partner
-  ITSP." That *is* a port scan, and it is detected with a **Threshold Random Walk** (Jung et
+- **Scanning** — finding a target, working out how to dial out, then finding which premium
+  numbers route. The SIP search for a target belongs to the perimeter; the other two are
+  first-contact discovery and are detected with a **Threshold Random Walk** (Jung et
   al., IEEE S&P 2004) — a sequential test that accumulates evidence per call and fires the
-  moment it is sufficient. Two arms run: a new **prefix** (probing `00`, `011`, `+5540`…),
-  and a **failed completion** (a call answered `4xx`/`5xx`/`6xx`, or never — the AT&T
-  signature, "the call never came here"). A never-seen **country** is *not* one of them:
-  country novelty was too fragile, because without correct international-prefix
-  configuration an internal extension or an inbound E.164 DID is mis-read as a new
-  international destination. The seen-country set is still tracked for the report, but it no
-  longer blocks.
+  moment it is sufficient. Three arms run: a new **dialling prefix** (`00`, `011`, `9011`,
+  `+`…), a new **destination range** (the B-number with its last four digits dropped — the
+  premium-rate hunt), and a **failed completion** (a call answered `4xx`/`5xx`/`6xx`, or
+  never — the AT&T signature, "the call never came here"). A never-seen **country** is *not*
+  a separate arm: every new country is already a new range, and country novelty was too
+  fragile on its own. The seen-country set is still tracked for the report.
 - **Exploitation** — hammering the route it found shows as a volume spike against the
   source's own norm, scored with **hierarchical Gamma-Poisson surprise**.
 
-The three arms produce evidence in the same log-likelihood units, so they **add**;
+The four arms produce evidence in the same log-likelihood units, so they **add**;
 enforcement fires when the total crosses a bound set by the **error rates you choose**
 (α, β) — not a hand-picked threshold. Every block is one explainable sentence:
-*"14 bits: 9 country-scan, 5 volume."*
+*"14 nats: 9 range-scan, 3.5 volume."* Each arm also has a hard floor (4 dialling
+prefixes, 10 destination ranges, 10 failed novel ranges), and a new source is observed for
+24 hours / 20 international calls before it can be blocked. Those floors are the
+false-positive control; the SPRT decides once a burst is real.
 
-**It self-calibrates.** The benign hypotheses — how often a normal source dials a new
-country, how often calls fail, the population's rate distribution — are learned from the
+**It self-calibrates.** The benign hypotheses — how often a normal source uses a new
+dialling prefix or a new destination range, how often calls fail, the population's rate
+distribution — are learned from the
 deployment's *own* aggregate traffic during the learning window and refit at each
-checkpoint. The operator sets **only α and β**, properties of their risk appetite, never a
-traffic constant. `tfps_ctl stats` shows the learned values.
+checkpoint. The only policy numbers are **α and β** — the tolerated false-alarm and miss
+rates — never a traffic constant. They are compiled-in defaults today (`1e-4`, `1e-2`), not
+yet exposed in the config file. `tfps_ctl stats` shows the learned values.
 
 **Its one honest weakness**: a low-and-slow attacker who mimics a legitimate profile at low
 volume. Which is exactly why this layer is opt-in, blocks are temporary, and the unban rate
@@ -274,6 +326,8 @@ integrations. Never **policy** configuration, which would say what fraud is.
   "home_countries": ["BR"],
 
   "behavioural": false,
+  "enforce_behavioural": false,
+  "no_enforce_one_way": false,
   "apiban_key": "optional-key",
 
   "learn_days": 30,
@@ -347,14 +401,16 @@ The collaborative [APIBAN](https://apiban.org) list, fed by honeypots, on a **se
 thread**: HTTP never touches the packet path. That is exactly where the 2023 TFPS died — a
 synchronous `rest_get()` per INVITE, ~26 INVITEs/s, any outage froze every call. Here the
 feed is resumed from its persisted cursor, re-applied for 7 days after a restart (so the
-integration never comes back protecting nothing), and honours `ignoreip`.
+integration never comes back protecting nothing), and honours `ignoreip`. The key is read
+only from the config file (installed `0600`); it is deliberately not a command-line flag,
+because argv is visible to local users and shell history.
 
 ---
 
 ## Building
 
 ```sh
-cargo test                                                   # ~180 tests
+cargo test                                                   # ~317 tests
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
@@ -408,7 +464,10 @@ why).
 | `--learn-days N` | days observing before the behavioural layer acts (default `30`) |
 | `--active` | skip the learning period |
 | `--no-enforce` | observe only, do not touch XDP |
-| `--apiban-key KEY` | enable APIBAN, in the background |
+| `--no-enforce-one-way` | report user-agent, scanner, injection, duplicate-header, registration-scan and auth-volume evidence, but do not block it (spoofable source); response-based auth failures and APIBAN still enforce |
+| `--enforce-one-way` | override a config file that set `no_enforce_one_way: true` |
+| `--enforce-behavioural` | enforce a behavioural `Block` by writing the source into XDP for `block_ttl` (requires `--behavioural`) |
+| `--no-enforce-behavioural` | report behavioural verdicts only (default) |
 | `--config PATH` | configuration (default `/etc/tfps/config.json`) |
 | `--db PATH` / `--no-db` | SQLite database, or run without persistence |
 | `-v` / `--debug-unparsed` | verbose; show payloads that failed to parse |
@@ -499,7 +558,9 @@ memory; only the boot load and the periodic checkpoint touch disk. State splits 
 durability: **perimeter** state dies with the process and rebuilds from traffic in minutes
 (consistent with fail-open by not pinning the eBPF program); **behavioural** state and the
 APIBAN list survive on disk, the latter because it is consumed through a forward-only cursor
-and cannot rebuild itself.
+and cannot rebuild itself. The database is created `0600` and the state directory `0700`
+when the daemon creates them: it holds customer IPs, countries called and block history, not
+just counters.
 
 ---
 
@@ -510,19 +571,38 @@ Documented, not engineered away — a limitation stated plainly beats one that f
 | not handled | why |
 |---|---|
 | **SIP over TLS** | encrypted payload; only metadata and IP reputation remain |
-| **SIP over TCP — detection** | L7 reassembly is not implemented; content is not parsed. But **enforcement covers TCP**: a source condemned (perimeter or APIBAN) is dropped in XDP on the TCP SIP ports too, TLS/5061 included — so bad IPs are banned on TCP even though new attacks over TCP/TLS are not *detected* on the wire |
+| **SIP over TCP — detection** | L7 reassembly is not implemented; content is not parsed. **Enforcement covers TCP** on the ports you list: a condemned source is dropped in XDP on those ports too, so add 5061 if you want TLS/TCP covered — new attacks over TCP/TLS are still not *detected* on the wire |
 | **IPv6** | the capture takes `ETH_P_IP` only; counted and warned about |
+| **IPv4 fragments** | not reassembled; any fragment (MF or offset) is counted and never judged. The softswitch may still reassemble the real message |
+| **802.1Q/QinQ tagged SIP** | XDP checks for EtherType 0x0800; run the tap on an untagged interface, or add tag handling before relying on enforcement there |
+| **spoofed source IP** | UDP source addresses are forgeable. Deploy BCP38/BCP84 or uRPF; otherwise one spoofed packet can trip a one-way block against another address. The block map is also a 65,536-entry LRU that a spoofed-source flood can churn. `--no-enforce-one-way` (or `no_enforce_one_way: true`) keeps those verdicts report-only |
 | **a broad international profile** | anomaly saturates by construction — a peer already calling 200 countries has no burst left |
 | **the first 30 days** | the behavioural layer's learning window, by design and announced |
 | **a low-and-slow mimic** | the residual gap no on-wire method closes — hence opt-in, TTL'd, unbannable |
-| **enforcing the behavioural verdict** | detected and reported today; the forged `603` is the remaining piece |
+| **forged SIP `603`** | source-level XDP blocking is available with `--enforce-behavioural`; the SIP-level reject is still missing |
+
+---
+
+## Disclaimer
+
+**TFPS cannot catch every possible type of fraud.** It is one layer that sees SIP on the
+wire. It does not see billing, CRM, provisioning, identity, social engineering, insider
+fraud, or traffic it cannot parse (SIP over TLS, SIP over TCP content, IPv6). A determined
+low-and-slow attacker can mimic a legitimate profile. Behavioural detection is experimental
+and report-only by default (source-level XDP blocking is opt-in); every verdict can be
+wrong.
+
+Use it at your own risk. Validate it on your own traffic, keep the perimeter and the learning
+window, and do not treat it as a substitute for a security audit, fraud controls, or your
+carrier/billing reconciliation. The software is provided **AS IS**, under the Apache-2.0
+licence, without warranty of any kind.
 
 ---
 
 ## Documentation
 
 - [`docs/anomaly-detection.md`](docs/anomaly-detection.md) — the behavioural detector: the
-  research, why the constraints rule out most methods, and the three-arm design
+  research, why the constraints rule out most methods, and the four-arm design
 - [`DETECTION.md`](DETECTION.md) — how a packet is examined, test by test, in code order
 - [`SPEC.md`](SPEC.md) — the architecture and the decisions (§6 superseded by the doc above)
 - [`CONTEXT.md`](CONTEXT.md) — the vocabulary, normative for code and documentation

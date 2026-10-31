@@ -39,7 +39,8 @@ every worked example at the end is real traffic captured on the test server on
   7. method gate ........... engine::observe          → non-INVITE stops here
   8. dial plan ............. dialplan::to_international → domestic stops here
   9. country ............... country::resolve         → unknown country stops here
- 10. novelty .............. novelty::PairState::observe → PASS / WOULD BLOCK / BLOCK
+ 10. behavioural arms ..... engine::decide            → PASS / WOULD BLOCK / BLOCK
+                            (dialling prefix, destination range, completion, volume)
 ```
 
 Two ordering facts carry the whole design:
@@ -47,9 +48,10 @@ Two ordering facts carry the whole design:
 - **The perimeter runs before any state is touched.** Noise must never enter a learning
   baseline, or the model learns that scanning is normal for that peer and poisons itself.
 - **The dial-plan test is the cheapest gate on the hot path** and it comes before
-  canonicalisation, country lookup and novelty. On a mostly-domestic carrier the majority
-  of INVITEs leave at step 8 having allocated nothing. Cost scales with *international*
-  volume, not with total volume.
+  canonicalisation, country lookup and the behavioural arms. On a mostly-domestic carrier
+  the majority of INVITEs leave at step 8 without allocating (separator stripping borrows
+  when there is nothing to strip). Cost scales with *international* volume, not with total
+  volume.
 
 ---
 
@@ -100,7 +102,7 @@ Checks, in order — any failure returns `None`:
 | 2 | version | `pkt[0] >> 4` | `!= 4` |
 | 3 | IHL | `pkt[0] & 0x0f`, ×4 | `< 20`, or longer than the buffer |
 | 4 | protocol | `pkt[9]` | `!= 17` (UDP) |
-| 5 | fragment offset | `pkt[6] & 0x1f`, `pkt[7]` | `!= 0` — a non-first fragment carries no L4 header, so there are no ports to read |
+| 5 | fragment flag/offset | `pkt[6] & 0x20`, `pkt[6] & 0x1f`, `pkt[7]` | any fragment is a counted blind spot; a first fragment carries ports but not the whole SIP message, and this system does not reassemble |
 | 6 | UDP header present | — | fewer than 8 bytes after the IPv4 header |
 
 Two length fields are then clamped rather than trusted:
@@ -111,7 +113,9 @@ Two length fields are then clamped rather than trusted:
 - the UDP length field (`udp[4..6]`) is clamped to `[8, datagram_len]` for the same reason.
 
 What comes out is `UdpDatagram { src, dst, src_port, dst_port, payload }`, where `src` —
-the **peer** — is the only non-forgeable identity available from this observation point.
+the **peer** — is the only identity available without trusting SIP headers. It is not
+non-forgeable over UDP: spoofing is a real deployment risk and enforcement depends on
+ingress filtering.
 Over UDP a source address can be spoofed, but the SIP response would not come back and the
 call would not complete, which is why the peer, and not the `From` header, anchors
 everything downstream.
@@ -125,7 +129,7 @@ was, and the binary counts it (`main.rs:477`):
 |---|---|---|
 | IPv6 | `pkt[0] >> 4 == 6` | `ipv6` |
 | TCP | IPv4, `pkt[9] == 6` | `tcp` — **only if a port is one of the watched SIP ports** |
-| later fragment | IPv4, fragment offset `!= 0` | `fragments` |
+| any fragment | IPv4, MF flag or fragment offset set | `fragments` |
 | anything else | — | not counted |
 
 The TCP restriction exists because counting all TCP would include the administrator's own
@@ -248,8 +252,7 @@ fail2ban ever told anyone that.
 ### 5.2 URI injection (`injection_in_uri`, perimeter.rs:181)
 
 11 built-in patterns — `'`, `%27`, `--`, `\`, `%24`, `%60`, `==`, `?=?`, `union`,
-`select`, `;` — matched case-insensitively against **three fields only**: the Request-URI,
-`From` and `To`.
+`select`, `;` — matched case-insensitively against **the Request-URI only**.
 
 The narrow scope is deliberate. Applied to the whole message these patterns would match
 constantly: `Via` carries `;branch=`, `User-Agent` strings contain hyphens, SDP contains
@@ -261,8 +264,9 @@ real traffic.
 Request-URI of `sip:a;drop@pbx.com` fires; `sip:200@pbx.com;transport=tcp` does not.
 
 This is a *higher*-confidence signal than the user-agent list: a scanner can trivially
-forge a normal UA, but no real telephone puts a single quote or `--` in a `From` header.
-There is no innocent explanation.
+forge a normal UA, but a real dialled destination does not carry a single quote or `--`.
+Scanning `From`/`To` as well was a false-positive source: SIP user parts can be legitimate
+names (`o'brien@`, `select@`), and a call from a named account is not SQL injection.
 
 ### 5.3 Failed authentication (`observe_response`, engine.rs)
 
@@ -293,11 +297,13 @@ has to be **matched back to its request**.
 `Call-ID` and increments `CSeq`, so keying on `Call-ID` alone would collapse an entire
 guessing run into a single countable failure.
 
-Only requests **carrying a credential** are remembered — a request without one is of no
-interest, because the `401` it receives is the normal challenge. Each peer holds at most 64
-pending transactions, pruned after 32 seconds (RFC 3261 Timer B/F, 64×T1, after which no
-response can still be matched). The entry is **claimed on the first matching response**, so
-a retransmitted `401` counts once.
+Only requests **carrying a credential** are remembered for the auth rule — a request
+without one is of no interest, because the `401` it receives is the normal challenge.
+International INVITEs are remembered separately for the completion arm. Each peer holds at
+most 32 pending transactions, pruned after 32 seconds (RFC 3261 Timer B/F, 64×T1, after
+which no response can still be matched). The entry is **claimed on the first matching
+response from the request's destination**, so a retransmitted `401` counts once and a
+forged response from another address is ignored.
 
 #### The subject of the decision
 
@@ -310,12 +316,14 @@ block lands on the party being challenged — never on the softswitch for having
 | `AUTH_FAILURES_TO_BLOCK` | 5 | the `maxretry` default of the `fail2ban` Asterisk jail |
 | `AUTH_FAILURE_WINDOW_SECS` | 600 | its `findtime` default — a decade of field use behind both |
 
-An accepted credential **clears the count**: someone who fixes a mistyped password is not
-condemned by their next slip. Only an uninterrupted run is an attack.
+An accepted credential **clears that AOR's count**: someone who fixes a mistyped password is
+not condemned by their next slip, while a valid account cannot reset a run against a
+different extension. The failure ring is per AOR for exactly that reason.
 
-Because it counts failures rather than volume, **a large NAT is not a problem** — a hundred
-phones behind one address all succeed, and successes do not accumulate. That was a real
-limitation of the rate-based rule this replaced.
+The rule counts failures rather than volume. A NAT whose phones succeed is not flagged; a
+NAT with no captured responses can still look like an enumerator, so put it in `ignoreip`.
+The registration-scan floor is 10 distinct AORs in 10 minutes; the auth-volume backstop is
+50 authenticated attempts in 60 seconds.
 
 #### The backstop, and why it must exist
 
@@ -325,9 +333,9 @@ does not serve **without challenging them** — 1 outbound packet in 45 seconds 
 hundreds inbound. A probe with a correctly addressed `REGISTER` was challenged immediately,
 so the silence is a policy, not a fault.
 
-There, the failure counter structurally cannot rise. So a volume backstop remains: **20
+There, the failure counter structurally cannot rise. So a volume backstop remains: **50
 authenticated attempts in 60 s**, from the measured baseline of 2 challenges in 45 s of
-legitimate traffic (~2.7/min, roughly 7× headroom). It is looser because it cannot tell
+legitimate traffic (~2.7/min, roughly 18× headroom). It is looser because it cannot tell
 success from failure, only volume.
 
 And when that condition is detected — credentials presented, not one digest challenge seen
@@ -413,10 +421,12 @@ international calls escaping the system entirely.
 
 > **This stage has been replaced.** The rotating-bitmap novelty engine described below has
 > been retired in favour of the four-arm sequential detector in
-> [`docs/anomaly-detection.md`](docs/anomaly-detection.md): country-scan, prefix-scan and
-> completion (Threshold Random Walk) plus a Gamma-Poisson volume arm, keyed on the source IP,
-> fused in bits and tuned by (α, β). The description below is kept for the record of what the
-> earlier decision path did; stages 1–9 above (capture, parse, perimeter, dial plan, country)
+> [`docs/anomaly-detection.md`](docs/anomaly-detection.md): dialling-prefix, destination-range
+> and completion (Threshold Random Walk) plus a Gamma-Poisson volume arm, keyed on the
+> source IP, fused in bits and tuned by (α, β). Country novelty is tracked for reporting,
+> not fused: a new country is already a new range. The description below is kept for the
+> record of what the earlier decision path did; stages 1–9 above (capture, parse,
+> perimeter, dial plan, country)
 > are current.
 
 ### (historical) novelty: has this caller ever called this country?
@@ -426,8 +436,9 @@ Isolation Forest, no negative binomial. The signal is set membership.
 
 ### The learning unit
 
-The key is the pair **`(peer, A-number)`**: the peer anchors trust (non-forgeable), the
-A-number groups behaviour (forgeable, taken from `From`; `<no-from>` when absent).
+The key is the pair **`(peer, A-number)`**: the peer anchors trust (not SIP-header trust,
+but still spoofable on UDP), the A-number groups behaviour (forgeable, taken from `From`;
+`<no-from>` when absent).
 
 Forgeability is turned into signal rather than fought. An attacker who **rotates**
 A-numbers explodes the pair cardinality on that peer, which is visible one level up. An
@@ -523,17 +534,21 @@ Three decisions condemn the source (`main.rs:500`):
 | decision | reason label | detail |
 |---|---|---|
 | `Noise` | `user-agent` | the signature that matched |
+| `Scanner` | `scanner` | the scanner id that matched |
 | `Injection` | `injection` | the pattern that matched |
+| `Malformed` | `ambiguous-header` | the duplicate singleton header |
 | `AuthFailure` | `auth-failed` | `rejected` |
+| `RegScan` | `reg-scan` | `no-success` |
 | `AuthAbuse` | `auth-volume` | `no-answer` |
 
 Condemning writes the source IP into an eBPF map with an expiry, prints a `BLOCKED` line
 and appends a row to the SQLite audit log so the decision can be reconstructed later
 without the journal.
 
-`Block` (the behavioural verdict) is reported and counted; per `SPEC.md` §8 its enforcement
-pairs an `XDP_DROP` with a forged `603 Decline` from userspace, since eBPF cannot construct
-a packet — no helper builds a new frame, only rewrites or redirects one.
+`Block` (the behavioural verdict) is report-only by default. With `--enforce-behavioural`
+it goes through the same `disposition` gate and writes the source into XDP for `block_ttl`.
+The forged `603 Decline` of `SPEC.md` §8 is **not implemented**: eBPF cannot construct a
+packet, and userspace does not yet forge one, so the source is simply dropped.
 
 ### The map, and two endianness conventions
 
@@ -689,11 +704,11 @@ that fails quietly.
 | **SIP over TLS** | the payload is encrypted; nothing above L4 is readable. Only metadata and IP reputation remain |
 | **SIP over TCP** | L7 reassembly inside XDP is unworkable; the packets are counted as a blind spot, never parsed |
 | **IPv6** | the capture socket takes `ETH_P_IP` only; counted and warned about, never inspected |
-| **later fragments** | carry no L4 header, so there are no ports to match; counted |
+| **IPv4 fragments** | this system does not reassemble; a first fragment carries the UDP header but not the whole SIP message, so it is counted and never judged. The softswitch may still reassemble the real message |
 | **traffic on undeclared ports** | not examined and not counted — declaring the ports is the operator's job |
 | **a customer with a broad international profile** | novelty saturates by construction: a peer that already calls 200 countries has no debuts left to accumulate. A minority of customers, the majority of the loss |
 | **the first 30 days of fraud** | learning mode, by design and announced continuously |
-| **a PBX already compromised at install time** | partially: the day-31 confirmation and 45-day bitmap ageing are the two defences, and neither is complete |
+| **a PBX already compromised at install time** | partially: learning mode delays the first block, but the compromised behaviour becomes the baseline. There is no retroactive audit of what was learned |
 | **Chain B** (credentials stolen through provisioning) | the precursor is an HTTP fetch, outside the SIP plane entirely |
 
 ---
@@ -709,6 +724,6 @@ that fails quietly.
 | orchestration and verdict | `crates/tfps-core/src/engine.rs` | `observe_packet`, `observe_response`, `decide` |
 | dial plan | `crates/tfps-core/src/dialplan.rs` | `to_international:70` |
 | country | `crates/tfps-core/src/country.rs` | `resolve:298` |
-| novelty | `crates/tfps-core/src/novelty.rs` | `PairState::observe:192`, `RotatingBitmap::rotate_to:80` |
+| behavioural arms | `crates/tfps-core/src/anomaly.rs` | `SourceAnomaly::observe`, `SeqTest`, `RateModel`, `RangeBloom` |
 | enforcement (userspace) | `crates/tfps/src/xdp.rs` | `attach:75`, `load:120`, `block:186` |
 | enforcement (kernel) | `ebpf/tfps_xdp.c` | `tfps_filter` |

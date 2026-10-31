@@ -187,13 +187,18 @@ impl Enforcer {
     /// A `ttl_secs` of 0 means no expiry. Expiry exists because a wrong block must undo
     /// itself — nobody will be awake at 3 a.m. to unblock a customer.
     pub fn block(&mut self, ip: Ipv4Addr, ttl_secs: u64) -> Result<(), String> {
+        let now = monotonic_ns();
+        if ttl_secs != 0 && now == 0 {
+            // A zero clock would turn every TTL into a tiny absolute value and expire the
+            // block immediately. Fail loudly rather than silently drop protection.
+            return Err("monotonic clock unavailable; refusing a block with a broken TTL".into());
+        }
         let until = if ttl_secs == 0 {
             0u64
         } else {
-            monotonic_ns().saturating_add(ttl_secs.saturating_mul(1_000_000_000))
+            now.saturating_add(ttl_secs.saturating_mul(1_000_000_000))
         };
-        self.blocked_by_us += 1;
-        match &mut self.backend {
+        let result = match &mut self.backend {
             Backend::Shared { map } => {
                 // The pinned map's convention: IP as a **big-endian** number. Determined
                 // empirically against the production map, by matching an IP that fail2ban
@@ -209,7 +214,11 @@ impl Enforcer {
                 map.insert(u32::from_ne_bytes(ip.octets()), until, 0)
                     .map_err(|e| format!("blocking {ip}: {e}"))
             }
+        };
+        if result.is_ok() {
+            self.blocked_by_us = self.blocked_by_us.saturating_add(1);
         }
+        result
     }
 
     /// Shared mode uses another product's program, whose counters have their own
@@ -386,10 +395,14 @@ impl Blocklist {
 
     /// Condemns a source by hand, with the same TTL semantics the daemon uses.
     pub fn insert(&mut self, ip: Ipv4Addr, ttl_secs: u64) -> Result<(), String> {
+        let now = monotonic_ns();
+        if ttl_secs != 0 && now == 0 {
+            return Err("monotonic clock unavailable; refusing a block with a broken TTL".into());
+        }
         let until = if ttl_secs == 0 {
             0
         } else {
-            monotonic_ns().saturating_add(ttl_secs.saturating_mul(1_000_000_000))
+            now.saturating_add(ttl_secs.saturating_mul(1_000_000_000))
         };
         self.map
             .insert(self.key(ip), until, 0)

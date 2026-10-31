@@ -37,6 +37,11 @@ pub const DEFAULT_PATH: &str = "/var/lib/tfps/tfps.db";
 /// See `migrate()` for what that means when their own columns change.
 const SCHEMA: i64 = 1;
 
+/// How long a source's learned state is kept after it was last seen. The baseline is a
+/// 45–90 day construct; a source silent for longer starts fresh rather than resurrecting
+/// a stale country set and rate.
+pub const PEER_RETENTION_SECS: u32 = 90 * 24 * 3600;
+
 /// A source's learned state, as stored — for the control tool.
 pub struct SourceRow {
     pub peer: String,
@@ -102,11 +107,24 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self, String> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            // 0700: the database holds customer IPs, countries called and block history.
+            // Only a directory we create is tightened; chmod-ing an existing shared parent
+            // (/tmp, /var/lib) could break other users and is the unit's job.
+            if !dir.exists() {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder
+                    .create(dir)
+                    .map_err(|e| format!("creating {}: {e}", dir.display()))?;
+            }
         }
         let conn =
             Connection::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
+        // Even an existing database is tightened: the default umask creates it 0644.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("securing {}: {e}", path.display()))?;
 
         // WAL: concurrent reads while the checkpoint writes, and fewer fsyncs.
         // `synchronous=NORMAL` is WAL's usual companion — losing the last few seconds to a
@@ -115,6 +133,9 @@ impl Store {
             .map_err(|e| format!("WAL: {e}"))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| format!("synchronous: {e}"))?;
+        // Deleted peer/block rows must not remain recoverable from free pages.
+        conn.pragma_update(None, "secure_delete", "ON")
+            .map_err(|e| format!("secure_delete: {e}"))?;
 
         let me = Self { conn };
         me.migrate()?;
@@ -299,6 +320,16 @@ impl Store {
         self.conn
             .execute(
                 "DELETE FROM known_peer WHERE last_auth < ?1",
+                params![older_than],
+            )
+            .unwrap_or(0)
+    }
+
+    /// Drops learned sources that have not been heard from within the retention window.
+    pub fn peer_anomaly_prune(&self, older_than: u32) -> usize {
+        self.conn
+            .execute(
+                "DELETE FROM peer_anomaly WHERE last_seen < ?1",
                 params![older_than],
             )
             .unwrap_or(0)
@@ -586,12 +617,15 @@ impl Store {
     /// learning, which is bad but recoverable; refusing to start would be worse.
     pub fn load_into(&self, engine: &mut Engine) -> Result<(usize, usize), String> {
         let mut sources = 0usize;
+        // A source silent beyond the retention window is not a baseline any more. Filtering
+        // here also stops a long offline database from filling the peer ceiling at boot.
+        let cutoff = self.now_stamp().saturating_sub(PEER_RETENTION_SECS);
         let mut st = self
             .conn
-            .prepare("SELECT peer, seen, n_countries, rate_a, rate_b FROM peer_anomaly")
+            .prepare("SELECT peer, seen, n_countries, rate_a, rate_b FROM peer_anomaly WHERE last_seen >= ?1")
             .map_err(|e| format!("reading peer_anomaly: {e}"))?;
         let rows = st
-            .query_map([], |r| {
+            .query_map(params![cutoff], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Vec<u8>>(1)?,
@@ -696,6 +730,18 @@ mod tests {
     }
 
     #[test]
+    fn the_database_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp().with_extension("perms.db");
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the learned state is not world-readable");
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn meta_survives_a_reopen() {
         // The APIBAN resume point lives here. Losing it means refetching the whole feed on
         // every restart, which is what this replaced.
@@ -729,6 +775,13 @@ mod tests {
         let (sources, _) = s.checkpoint(&e1).unwrap();
         assert_eq!(sources, 1, "one source persisted");
 
+        // A second checkpoint with no new traffic writes nothing: the checkpoint is
+        // incremental, so a quiet interval is not a database write burst.
+        e1.clear_anomaly_dirty();
+        assert_eq!(s.checkpoint(&e1).unwrap().0, 0, "nothing dirty");
+        e1.observe(peer, &invite("200", "00551199998888"), t);
+        assert_eq!(s.checkpoint(&e1).unwrap().0, 1, "one source changed");
+
         // A fresh process, memory wiped.
         let mut e2 = Engine::new(DialPlan::new(["00"]), Mode::Active).with_behavioural();
         let s2 = Store::open(&path).unwrap();
@@ -744,6 +797,29 @@ mod tests {
             },
             "Brazil was already known before the restart"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_source_silent_past_retention_is_pruned_and_not_loaded() {
+        let path = tmp().with_extension("retention.db");
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO peer_anomaly (peer, seen, n_countries, rate_a, rate_b, last_seen)
+                 VALUES ('10.0.0.9', ?1, 3, 0.5, 0.25, 100)",
+                params![vec![0u8; 32]],
+            )
+            .unwrap();
+        assert_eq!(count(&s, "peer_anomaly"), 1);
+
+        let mut e = Engine::new(DialPlan::new(["00"]), Mode::Active).with_behavioural();
+        let (loaded, _) = s.load_into(&mut e).unwrap();
+        assert_eq!(loaded, 0, "a stale baseline is not resurrected at boot");
+
+        assert_eq!(s.peer_anomaly_prune(1_000), 1);
+        assert_eq!(count(&s, "peer_anomaly"), 0);
         let _ = std::fs::remove_file(&path);
     }
 

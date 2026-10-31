@@ -55,6 +55,19 @@ pub enum Gate<E> {
     Enforce,
 }
 
+/// Is this reason derived from a **request alone**?
+///
+/// A UDP source can be spoofed, so these verdicts are the ones a spoofer can trigger
+/// against somebody else's address. The operator can keep them report-only with
+/// `--no-enforce-one-way`. `auth-failed` is deliberately absent: it needs a response from
+/// the expected responder, so it is bidirectional evidence.
+pub fn is_one_way(kind: &str) -> bool {
+    matches!(
+        kind,
+        "user-agent" | "scanner" | "injection" | "ambiguous-header" | "reg-scan" | "auth-volume"
+    )
+}
+
 /// Apply the gate. The ignore list outranks a learned registration.
 pub fn gate<E>(exempt: Option<E>, known_peer: bool) -> Gate<E> {
     if let Some(why) = exempt {
@@ -98,6 +111,26 @@ mod tests {
     // The one order every enforcement path shares. A registered peer never
     // outranks the operator's list, and nothing shields an address the caller
     // has not vouched for.
+    #[test]
+    fn request_only_reasons_are_one_way_and_response_evidence_is_not() {
+        for kind in [
+            "user-agent",
+            "scanner",
+            "injection",
+            "ambiguous-header",
+            "reg-scan",
+            "auth-volume",
+        ] {
+            assert!(is_one_way(kind), "{kind}");
+        }
+        assert!(
+            !is_one_way("auth-failed"),
+            "a 401 needs the expected responder"
+        );
+        assert!(!is_one_way("apiban"), "the feed is not request evidence");
+        assert!(!is_one_way("unknown"));
+    }
+
     #[test]
     fn the_gate_puts_the_ignore_list_before_a_registered_peer() {
         assert_eq!(gate(Some("10.0.0.0/8"), true), Gate::Exempt("10.0.0.0/8"));

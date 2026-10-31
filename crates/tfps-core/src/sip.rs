@@ -4,8 +4,11 @@
 //! needs to decide and to forge a response, and ignores everything else. The boundary is in
 //! `SPEC.md` §1: *it does not speak SIP beyond forging responses*.
 //!
-//! Parsing borrows from the input buffer (zero-copy). The decision path runs per
-//! international INVITE, so nothing here allocates.
+//! Parsing borrows from the input buffer (zero-copy) unless a header is folded; then only
+//! that header is joined into an owned string. The decision path runs per international
+//! INVITE, so the common case does not allocate.
+
+use std::borrow::Cow;
 
 /// SIP method. Only the ones the system observes; everything else is `Other`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,43 +50,46 @@ pub struct Request<'a> {
     pub request_uri: &'a str,
     /// User part of the Request-URI — the dialled number, still **not canonical**.
     pub request_user: Option<&'a str>,
-    pub via: Option<&'a str>,
-    pub from: Option<&'a str>,
-    pub to: Option<&'a str>,
-    pub call_id: Option<&'a str>,
-    pub cseq: Option<&'a str>,
-    pub user_agent: Option<&'a str>,
-    pub p_asserted_identity: Option<&'a str>,
+    pub via: Option<Cow<'a, str>>,
+    pub from: Option<Cow<'a, str>>,
+    pub to: Option<Cow<'a, str>>,
+    pub call_id: Option<Cow<'a, str>>,
+    pub cseq: Option<Cow<'a, str>>,
+    pub user_agent: Option<Cow<'a, str>>,
+    pub p_asserted_identity: Option<Cow<'a, str>>,
     /// The credential presented. Its **presence** is the brute-force signal: a `REGISTER`
     /// carrying `Authorization` is a password attempt, whereas the `401` preceding it is
     /// just the normal challenge.
-    pub authorization: Option<&'a str>,
-    /// A line continuation occurred (folded header). Rare and legal; flagged because this
-    /// parser does not join them, so a folded value comes out truncated.
+    pub authorization: Option<Cow<'a, str>>,
+    /// A line continuation occurred and was joined into the header value (RFC 3261 §7.3.1).
     pub folded: bool,
+    /// The first duplicated singleton header (From/To/Call-ID/CSeq/User-Agent/...); a
+    /// second copy makes the message ambiguous, so the engine condemns it rather than
+    /// guessing which copy the softswitch will use.
+    pub duplicate: Option<&'static str>,
 }
 
 impl<'a> Request<'a> {
     /// User part of `From` — the A-number, an **unverified assertion** by the sender (see
     /// `CONTEXT.md`, entry "A-number").
-    pub fn from_user(&self) -> Option<&'a str> {
-        self.from.and_then(uri_user)
+    pub fn from_user(&self) -> Option<&str> {
+        self.from.as_deref().and_then(uri_user)
     }
 
     /// User part of `To` — for a REGISTER, the extension (AOR) being registered. The
     /// registration-scan rule counts how many *distinct* ones a single source probes.
-    pub fn to_user(&self) -> Option<&'a str> {
-        self.to.and_then(uri_user)
+    pub fn to_user(&self) -> Option<&str> {
+        self.to.as_deref().and_then(uri_user)
     }
 
     /// The `From` tag, needed to match a forged response.
-    pub fn from_tag(&self) -> Option<&'a str> {
-        self.from.and_then(|v| param(v, "tag"))
+    pub fn from_tag(&self) -> Option<&str> {
+        self.from.as_deref().and_then(|v| param(v, "tag"))
     }
 
     /// The topmost `Via` `branch` — the transaction matcher of RFC 3261 §17.1.3.
-    pub fn via_branch(&self) -> Option<&'a str> {
-        self.via.and_then(|v| param(v, "branch"))
+    pub fn via_branch(&self) -> Option<&str> {
+        self.via.as_deref().and_then(|v| param(v, "branch"))
     }
 
     /// Did this request carry a credential?
@@ -98,18 +104,24 @@ impl<'a> Request<'a> {
 
 /// Extracts the user part from a SIP URI embedded in a header value.
 ///
-/// Accepts the forms that show up in practice: `sip:user@host`, `<sip:user@host>`,
-/// `"Name" <sip:user@host>;tag=x`, and `tel:+55...`.
+/// The display name is free text and may itself contain `sip:`; it is skipped first, the
+/// bracketed addr-spec is preferred, and the scheme is matched case-insensitively. Returns
+/// a slice into `value`.
 fn uri_user(value: &str) -> Option<&str> {
-    let start = value
-        .find("sip:")
-        .or_else(|| value.find("sips:"))
-        .or_else(|| value.find("tel:"))?;
-    let after_scheme = &value[start..];
-    let colon = after_scheme.find(':')? + 1;
-    let rest = &after_scheme[colon..];
-
-    // The user part ends at `@`; with no `@` (the `tel:` case) it ends at a delimiter.
+    let v = value.trim_start();
+    let after_name = match v.strip_prefix('"') {
+        Some(rest) => match rest.find('"') {
+            Some(q) => &rest[q + 1..],
+            None => rest,
+        },
+        None => v,
+    };
+    let inner = match (after_name.find('<'), after_name.find('>')) {
+        (Some(a), Some(b)) if b > a => &after_name[a + 1..b],
+        _ => after_name,
+    };
+    let start = find_scheme(inner)?;
+    let rest = &inner[start..];
     let end = rest.find('@').unwrap_or_else(|| {
         rest.find(|c: char| c == '>' || c == ';' || c == '?' || c.is_whitespace())
             .unwrap_or(rest.len())
@@ -122,11 +134,32 @@ fn uri_user(value: &str) -> Option<&str> {
     }
 }
 
+/// Byte offset just after a case-insensitive `sip:` / `sips:` / `tel:` scheme.
+pub(crate) fn find_scheme(value: &str) -> Option<usize> {
+    for scheme in ["sip:", "sips:", "tel:"] {
+        if let Some(i) = find_ascii_ci(value, scheme) {
+            return Some(i + scheme.len());
+        }
+    }
+    None
+}
+
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 /// Extracts a `;name=value` parameter from a header value.
 fn param<'a>(value: &'a str, name: &str) -> Option<&'a str> {
     for part in value.split(';').skip(1) {
         let part = part.trim();
-        let (k, v) = part.split_once('=')?;
+        // A valueless parameter such as `;rport` is legal and must not hide a later
+        // `;branch=...`; skip it instead of abandoning the whole header.
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
         if k.trim().eq_ignore_ascii_case(name) {
             let v = v.trim();
             let end = v
@@ -255,16 +288,27 @@ fn parse_response(text: &str) -> Option<Response<'_>> {
         if line.is_empty() {
             break;
         }
+        // Responses are not used to judge a caller, but they gate auth/completion state.
+        // A folded or duplicated transaction header is ambiguous; ignore the whole response
+        // rather than let a forged copy move state. Multiple Via is legal; keep the topmost.
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return None;
+        }
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
         let (name, value) = (name.trim(), value.trim());
-        // Only the topmost Via: it is the one the responder copied from the request.
         if via.is_none() && header_is(name, "Via", Some("v")) {
             via = Some(value);
         } else if header_is(name, "Call-ID", Some("i")) {
+            if call_id.is_some() {
+                return None;
+            }
             call_id = Some(value);
         } else if header_is(name, "CSeq", None) {
+            if cseq.is_some() {
+                return None;
+            }
             cseq = Some(value);
         }
     }
@@ -310,7 +354,23 @@ pub fn parse_request(buf: &[u8]) -> Option<Request<'_>> {
         p_asserted_identity: None,
         authorization: None,
         folded: false,
+        duplicate: None,
     };
+
+    #[derive(Clone, Copy)]
+    enum Last {
+        Via,
+        From,
+        To,
+        CallId,
+        CSeq,
+        UserAgent,
+        PAsserted,
+        Authorization,
+    }
+
+    let mut last: Option<Last> = None;
+    let mut auth_name: Option<&'static str> = None;
 
     for line in lines {
         if line.is_empty() {
@@ -318,37 +378,118 @@ pub fn parse_request(buf: &[u8]) -> Option<Request<'_>> {
         }
         if line.starts_with(' ') || line.starts_with('\t') {
             req.folded = true;
+            let part = line.trim();
+            match last {
+                Some(Last::Via) => append(&mut req.via, part),
+                Some(Last::From) => append(&mut req.from, part),
+                Some(Last::To) => append(&mut req.to, part),
+                Some(Last::CallId) => append(&mut req.call_id, part),
+                Some(Last::CSeq) => append(&mut req.cseq, part),
+                Some(Last::UserAgent) => append(&mut req.user_agent, part),
+                Some(Last::PAsserted) => append(&mut req.p_asserted_identity, part),
+                Some(Last::Authorization) => append(&mut req.authorization, part),
+                None => {}
+            }
             continue;
         }
         let Some((name, value)) = line.split_once(':') else {
+            last = None;
             continue;
         };
         let name = name.trim();
         let value = value.trim();
 
-        // Only the topmost Via matters: it is what the response reuses.
-        if req.via.is_none() && header_is(name, "Via", Some("v")) {
-            req.via = Some(value);
-        } else if header_is(name, "From", Some("f")) {
-            req.from = Some(value);
-        } else if header_is(name, "To", Some("t")) {
-            req.to = Some(value);
-        } else if header_is(name, "Call-ID", Some("i")) {
-            req.call_id = Some(value);
-        } else if header_is(name, "CSeq", None) {
-            req.cseq = Some(value);
-        } else if header_is(name, "User-Agent", None) {
-            req.user_agent = Some(value);
-        } else if header_is(name, "P-Asserted-Identity", None) {
-            req.p_asserted_identity = Some(value);
-        } else if header_is(name, "Authorization", None)
-            || header_is(name, "Proxy-Authorization", None)
-        {
-            req.authorization = Some(value);
+        // Only the topmost Via matters: it is what the response reuses. A second Via is
+        // legal (proxies append them), so it is ignored rather than called ambiguous.
+        if header_is(name, "Via", Some("v")) {
+            if req.via.is_none() {
+                req.via = Some(Cow::Borrowed(value));
+                last = Some(Last::Via);
+            } else {
+                last = None; // a continuation of the ignored Via is not the topmost one
+            }
+            continue;
         }
+
+        let field = if header_is(name, "From", Some("f")) {
+            Some((Last::From, "From"))
+        } else if header_is(name, "To", Some("t")) {
+            Some((Last::To, "To"))
+        } else if header_is(name, "Call-ID", Some("i")) {
+            Some((Last::CallId, "Call-ID"))
+        } else if header_is(name, "CSeq", None) {
+            Some((Last::CSeq, "CSeq"))
+        } else if header_is(name, "User-Agent", None) {
+            Some((Last::UserAgent, "User-Agent"))
+        } else if header_is(name, "P-Asserted-Identity", None) {
+            Some((Last::PAsserted, "P-Asserted-Identity"))
+        } else {
+            None
+        };
+
+        if let Some((kind, label)) = field {
+            let slot = match kind {
+                Last::From => &mut req.from,
+                Last::To => &mut req.to,
+                Last::CallId => &mut req.call_id,
+                Last::CSeq => &mut req.cseq,
+                Last::UserAgent => &mut req.user_agent,
+                Last::PAsserted => &mut req.p_asserted_identity,
+                Last::Via | Last::Authorization => unreachable!(),
+            };
+            if slot.is_some() {
+                req.duplicate.get_or_insert(label);
+                last = None;
+            } else {
+                *slot = Some(Cow::Borrowed(value));
+                last = Some(kind);
+            }
+            continue;
+        }
+
+        if header_is(name, "Authorization", None) || header_is(name, "Proxy-Authorization", None) {
+            let label = if header_is(name, "Authorization", None) {
+                "Authorization"
+            } else {
+                "Proxy-Authorization"
+            };
+            match auth_name {
+                Some(prev) if prev == label => {
+                    req.duplicate.get_or_insert(label);
+                    last = None;
+                }
+                Some(_) => {
+                    // Authorization and Proxy-Authorization are different credentials and
+                    // may legitimately coexist; the first is enough for presence.
+                    last = None;
+                }
+                None if req.authorization.is_none() => {
+                    req.authorization = Some(Cow::Borrowed(value));
+                    auth_name = Some(label);
+                    last = Some(Last::Authorization);
+                }
+                None => {
+                    last = None;
+                }
+            }
+            continue;
+        }
+
+        last = None;
     }
 
     Some(req)
+}
+
+/// Joins one folded continuation (RFC 3261 §7.3.1) into the previous header value.
+fn append<'a>(field: &mut Option<Cow<'a, str>>, part: &str) {
+    if let Some(v) = field {
+        let mut joined = String::with_capacity(v.len() + 1 + part.len());
+        joined.push_str(v);
+        joined.push(' ');
+        joined.push_str(part);
+        *field = Some(Cow::Owned(joined));
+    }
 }
 
 #[cfg(test)]
@@ -378,9 +519,15 @@ mod tests {
         assert_eq!(r.from_user(), Some("200"));
         assert_eq!(r.from_tag(), Some("1928301774"));
         assert_eq!(r.via_branch(), Some("z9hG4bK776asdhds"));
-        assert_eq!(r.call_id, Some("a84b4c76e66710@pc33.example.com"));
-        assert_eq!(r.cseq, Some("314159 INVITE"));
-        assert_eq!(r.user_agent, Some("Grandstream GXP2140 1.0.9.14"));
+        assert_eq!(
+            r.call_id.as_deref(),
+            Some("a84b4c76e66710@pc33.example.com")
+        );
+        assert_eq!(r.cseq.as_deref(), Some("314159 INVITE"));
+        assert_eq!(
+            r.user_agent.as_deref(),
+            Some("Grandstream GXP2140 1.0.9.14")
+        );
         assert!(!r.folded);
     }
 
@@ -413,7 +560,7 @@ mod tests {
         let r = parse_request(msg.as_bytes()).expect("must parse");
         assert_eq!(r.from_user(), Some("1000"));
         assert_eq!(r.via_branch(), Some("z9hG4bKabc"));
-        assert_eq!(r.call_id, Some("call-123"));
+        assert_eq!(r.call_id.as_deref(), Some("call-123"));
     }
 
     #[test]
@@ -424,6 +571,67 @@ mod tests {
                    \r\n";
         let r = parse_request(msg.as_bytes()).unwrap();
         assert_eq!(r.via_branch(), Some("FIRST"));
+    }
+
+    #[test]
+    fn a_display_name_cannot_hide_the_real_aor() {
+        // A valid quoted display name containing its own sip: URI is free text. The real
+        // addr-spec is the bracketed one; taking the first "sip:" let an enumerator keep
+        // to_user constant while varying the true To.
+        let msg = "REGISTER sip:pbx SIP/2.0\r\n\
+                   To: \"sip:constant@x\" <sip:1001@pbx>\r\n\r\n";
+        let r = parse_request(msg.as_bytes()).unwrap();
+        assert_eq!(r.to_user(), Some("1001"));
+    }
+
+    #[test]
+    fn a_valueless_via_parameter_does_not_hide_the_branch() {
+        // `;rport` (no '=') is legal; the parser used to abandon the whole header there,
+        // falling back to Call-ID|CSeq and losing the response pairing.
+        let msg = "REGISTER sip:pbx SIP/2.0\r\n\
+                   Via: SIP/2.0/UDP 10.0.0.5;rport;branch=z9hG4bK1\r\n\r\n";
+        let r = parse_request(msg.as_bytes()).unwrap();
+        assert_eq!(r.via_branch(), Some("z9hG4bK1"));
+    }
+
+    #[test]
+    fn the_uri_scheme_is_case_insensitive() {
+        let msg = "REGISTER sip:pbx SIP/2.0\r\n\
+                   To: <SIP:1001@pbx>\r\n\r\n";
+        let r = parse_request(msg.as_bytes()).unwrap();
+        assert_eq!(r.to_user(), Some("1001"));
+    }
+
+    #[test]
+    fn duplicate_singleton_headers_are_flagged() {
+        let msg = "REGISTER sip:pbx SIP/2.0\r\n\
+                   From: <sip:first@pbx>;tag=a\r\n\
+                   From: <sip:second@pbx>;tag=b\r\n\
+                   Call-ID: first\r\n\
+                   Call-ID: second\r\n\r\n";
+        let r = parse_request(msg.as_bytes()).unwrap();
+        assert_eq!(r.from_user(), Some("first"), "the first copy is kept");
+        assert_eq!(r.duplicate, Some("From"), "the ambiguity is recorded");
+    }
+
+    #[test]
+    fn a_folded_user_agent_is_joined() {
+        let msg = "REGISTER sip:pbx SIP/2.0\r\n\
+                   User-Agent:\r\n\
+                   \tsipvicious\r\n\r\n";
+        let r = parse_request(msg.as_bytes()).unwrap();
+        assert!(r.folded);
+        assert_eq!(r.user_agent.as_deref().map(str::trim), Some("sipvicious"));
+    }
+
+    #[test]
+    fn a_folded_or_duplicate_response_is_ignored() {
+        // Folding or duplicating a transaction header in a response is ambiguous; ignore
+        // the response rather than let a forged copy move auth/completion state.
+        let folded = "SIP/2.0 200 OK\r\nVia:\r\n z9hG4bK1\r\nCall-ID: c\r\nCSeq: 1 INVITE\r\n\r\n";
+        let duplicate = "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP x;branch=z\r\nCall-ID: a\r\nCall-ID: b\r\nCSeq: 1 INVITE\r\n\r\n";
+        assert!(parse(folded.as_bytes()).is_none());
+        assert!(parse(duplicate.as_bytes()).is_none());
     }
 
     #[test]

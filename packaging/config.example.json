@@ -1,6 +1,10 @@
 {
   "ports": [5060],
   "intl_prefixes": ["+", "00", "011", "9011"],
+  "ignoreip": ["10.0.0.0/8"],
+  "behavioural": false,
+  "enforce_behavioural": false,
+  "no_enforce_one_way": false,
   "learn_days": 30,
   "block_ttl": 3600,
   "stats_every": 60

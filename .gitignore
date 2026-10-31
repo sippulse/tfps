@@ -6,3 +6,9 @@
 *.pcap
 *.pcapng
 /.scratch/
+
+# Synthetic scenario captures (behaviour_scenarios example)
+!sim/pcaps/*.pcap
+
+# Local security audit reports
+/.gstack/

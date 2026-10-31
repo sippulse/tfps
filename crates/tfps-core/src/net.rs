@@ -31,7 +31,8 @@ pub struct UdpDatagram<'a> {
 pub enum NotUdp {
     Ipv6,
     Tcp,
-    /// A fragment with no L4 header — only the first fragment carries ports.
+    /// Any IPv4 fragment. A first fragment carries ports but not the whole SIP message;
+    /// this system does not reassemble, so it is a counted blind spot, never judged.
     LaterFragment,
     Other,
 }
@@ -64,7 +65,8 @@ pub fn classify_other(pkt: &[u8]) -> NotUdp {
         6 => NotUdp::Ipv6,
         4 if pkt.len() >= IPV4_MIN_HEADER => {
             let frag = u16::from_be_bytes([pkt[6] & 0x1f, pkt[7]]);
-            if frag != 0 {
+            let more = pkt[6] & 0x20 != 0;
+            if frag != 0 || more {
                 NotUdp::LaterFragment
             } else if pkt[9] == 6 {
                 NotUdp::Tcp
@@ -98,9 +100,13 @@ pub fn parse_ipv4_udp(pkt: &[u8]) -> Option<UdpDatagram<'_>> {
         return None;
     }
 
-    // Fragmentation: only the zero-offset fragment carries the UDP header.
+    // Fragmentation: never judge a fragment as a complete datagram. A zero-offset first
+    // fragment carries the UDP header but not the rest of the SIP message; letting the
+    // parser see it made a partial request look authoritative while the softswitch
+    // reassembled something else. Count the blind spot instead.
+    let more_fragments = pkt[6] & 0x20 != 0;
     let frag_offset = u16::from_be_bytes([pkt[6] & 0x1f, pkt[7]]);
-    if frag_offset != 0 {
+    if more_fragments || frag_offset != 0 {
         return None;
     }
 
@@ -174,6 +180,16 @@ mod tests {
     fn ignores_non_initial_fragments() {
         // No L4 header; reading ports here would mean reading mid-payload.
         assert!(parse_ipv4_udp(&packet(b"xxxxxxxx", IPPROTO_UDP, 185)).is_none());
+    }
+
+    #[test]
+    fn ignores_a_first_fragment_too() {
+        // MF=1, offset 0: the UDP header is present, but the SIP message is not. Judging
+        // this partial datagram was a detection/false-positive hazard.
+        let mut p = packet(b"INVITE sip:x@pbx SIP/2.0\r\n", IPPROTO_UDP, 0);
+        p[6] |= 0x20; // MF
+        assert!(parse_ipv4_udp(&p).is_none());
+        assert_eq!(classify_other(&p), NotUdp::LaterFragment);
     }
 
     #[test]

@@ -78,6 +78,8 @@ impl DialPlan {
         &self,
         dialed: &str,
     ) -> Option<(InternationalDigits, String)> {
+        // Borrowed when there is nothing to strip: the common domestic case leaves the
+        // behavioural layer without an allocation at all.
         let cleaned = strip_visual_separators(dialed);
 
         // Longest-match. This resolves the classic ambiguity on its own: a PBX using `0`
@@ -91,14 +93,19 @@ impl DialPlan {
 
         let (rest, matched) = match best {
             Some(p) => (&cleaned[p.len()..], p.clone()),
-            None if self.bare_e164 => (cleaned.as_str(), String::new()),
+            None if self.bare_e164 => (cleaned.as_ref(), String::new()),
             None => return None,
         };
 
-        let digits: String = rest.chars().filter(char::is_ascii_digit).collect();
-        if rest.chars().any(|c| !c.is_ascii_digit()) {
-            // Something non-numeric survived the prefix: not a dialable number.
-            return None;
+        // One pass: reject a non-digit and keep the digits, rather than collecting and
+        // then scanning the result again.
+        let mut digits = String::with_capacity(rest.len());
+        for c in rest.chars() {
+            if !c.is_ascii_digit() {
+                // Something non-numeric survived the prefix: not a dialable number.
+                return None;
+            }
+            digits.push(c);
         }
         if !(E164_MIN_DIGITS..=E164_MAX_DIGITS).contains(&digits.len()) {
             return None;
@@ -120,10 +127,20 @@ impl DialPlan {
 
 /// Strips visual separators seen in real Request-URIs: `-`, `.`, space, parentheses.
 /// `+` is preserved, because it is a prefix and not a separator.
-fn strip_visual_separators(s: &str) -> String {
-    s.chars()
-        .filter(|c| !matches!(c, '-' | '.' | ' ' | '(' | ')'))
-        .collect()
+///
+/// Borrows when there is nothing to strip, which is the usual case and the hot path.
+fn strip_visual_separators(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s
+        .bytes()
+        .any(|b| matches!(b, b'-' | b'.' | b' ' | b'(' | b')'))
+    {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        s.chars()
+            .filter(|c| !matches!(c, '-' | '.' | ' ' | '(' | ')'))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
