@@ -38,11 +38,13 @@ the vocabulary must always treat it as the sender's assertion, never as verified
 canonical**: it may come as `+E164`, `00…`, `011…`, `9011…`, `0…` or bare.
 
 **Peer** — the interconnection entity sending the traffic, identified by source IP address.
-It is the only **non-forgeable** identity from the system's observation point, which is why
-it serves as the trust anchor. A peer may be a wholesale carrier, a customer PBX, or a
-trunk.
+It is the only identity observable **without trusting SIP headers**, which is why it is the
+trust anchor — but over UDP a source address **can be spoofed**. Enforcement therefore
+depends on ingress filtering (BCP38/BCP84/uRPF); the code must not claim the address is
+non-forgeable. A peer may be a wholesale carrier, a customer PBX, or a trunk.
 
-**Learning unit** — the `(peer, A-number)` pair. Behaviour is learned about this.
+**Learning unit** — the **peer** (source IP). Behaviour is learned per source, because the
+A-number is forgeable and keying on it was the rotation bypass.
 
 **Tenant** — avoid. The word implies a provisioned customer, which this system does not
 have. Use **peer** or **learning unit**, depending on the level.
@@ -56,11 +58,17 @@ statement about the destination, including behavioural ones: 20.3% of destinatio
 historical corpus do not resolve to a country without prefix stripping.
 
 **Destination country** — the country of the canonicalised B-number. An alphabet of ~200
-values. This is the granularity at which novelty works.
+values. Tracked for reporting; not a separate behavioural signal, because every new country
+is already a new range.
 
 **Range** — a B-number prefix with the last N digits ignored. The **durable** unit of
 destination intelligence: measured persistence of 41–68% over 24 months, against 0% for the
-exact number.
+exact number. **Not a dialling prefix**: the range identifies the destination, the dialling
+prefix identifies the outbound format.
+
+**Dialling prefix** — the outbound format a PBX uses to mark a call international: `+`,
+`00`, `011`, `9011`. It is a property of the sender's dial plan, not of the destination, and
+is never called a *range*.
 
 **IPRN** — *International Premium Rate Number*. The number fraud calls, and the source of
 the shared revenue. Under ITU-T E.169.2 the only legitimate international premium range is
@@ -77,18 +85,23 @@ and it is not the foundation of this system.
 
 ## Signals
 
-**Novelty** — the first occurrence of a categorical value for a learning unit: first
-country, first range, first hour. **This is the system's primary behavioural signal.** It
-self-calibrates: the novelty rate falls as the unit matures.
+**Novelty** — the first occurrence of a categorical value for a **peer**: a dialling prefix
+it has never used, or a destination range not seen in the current window. **This is the
+system's primary behavioural signal.** It self-calibrates: the novelty rate falls as the
+peer matures.
 
-**Warm-up** — the initial period during which a unit lacks enough history for its novelty to
-mean anything. Measured at 7 days for country novelty.
+**Warm-up** — the initial period during which a peer lacks enough history for its novelty to
+mean anything. Two layers: **learning mode** (30 days after installation, during which
+behaviour observes and does not block) and a **per-source warm-up** (24 hours and 20
+international calls) before that source can be blocked.
 
 **Burst** and **fan-out** — **rejected terms**. Recorded here so they do not creep back by
 accident. *Burst* (call rate) was measured as marginal: it varies 30× across real cases.
 *Fan-out* (distinct destinations per call) was **refuted**: a legitimate median of 0.60,
 with three of four real fraud cases falling below it. The fraudster **repeats** a few
-destinations with long calls, because the revenue is per minute.
+destinations with long calls, because the revenue is per minute. Range novelty is not
+fan-out: fan-out counts destinations per call; range novelty counts first-seen ranges per
+source in a short window, which is the route-probing phase.
 
 **Digest challenge** — a `401` or `407` demanding credentials (RFC 3261 §22). **Not a
 synonym for Challenge**, which is a verdict this system issues; a digest challenge is
@@ -129,11 +142,12 @@ discovered, never configured) and **declared** entries (the operator's). A decla
 that has never matched is **cold**, and reported as such.
 
 **Disposition** — what the perimeter does with a source it has judged, given the verdict
-and the exemptions: **ignore** (nothing tripped), **exempt** (ignoreip or a registered
-peer; reported, never enforced), **would-block** (condemned while observing only) or
-**block**. The same **gate** — ignoreip first, then registered peer — stands in front of
-every block, whether the perimeter, the APIBAN feed or a hand-placed `tfps_ctl ban` asks
-for it. In code: `tfps_core::disposition`.
+and the exemptions: **ignore** (nothing tripped), **exempt** (ignoreip; reported, never
+enforced), **would-block** (condemned while observing only) or **block**. `ignoreip` stands
+in front of every block. A registered peer is still exempt from the third-party **APIBAN**
+feed, but no longer from the perimeter's or behaviour layer's own active evidence
+(injection, auth failure, registration scanning, auth volume, behavioural verdict); only a
+successful REGISTER grants known-good status, and it is bound to 24 hours. In code: `tfps_core::disposition`.
 
 **Volume backstop** — the authentication rule that fires on *authenticated attempts* when
 no digest challenge is ever seen, as opposed to the primary rule that fires on *failed
@@ -145,15 +159,16 @@ known tool user-agents. **It does not exist to catch fraud**; it exists to keep 
 of the behavioural baseline. Active from installation.
 
 **Behaviour** — the layer that decides about fraud, from what it has learned about each
-unit. Active after the learning period.
+unit. Active after the learning period; **report-only by default**, with
+`--enforce-behavioural` adding a source-level XDP block.
 
 **Learning mode** — the first 30 days, during which the behaviour layer observes and **does
 not block**, announcing that explicitly. The perimeter blocks normally during this period.
 
 **Silence** — not answering an attempt. Applied to **production addresses** against
-attackers, because any response confirms a live endpoint and invites escalation. It does
-**not** apply to legitimate customers, who get a response, nor to **decoys**, which answer
-deliberately.
+attackers, because any response confirms a live endpoint and invites escalation. The design
+answers legitimate customers and **decoys**, but v0.3.0 does **not** forge the `603`
+response yet: all blocked sources are silent.
 
 **Decoy** — an idle extension or DID used as a trap. Traffic aimed at a decoy is suspicious
 by definition.

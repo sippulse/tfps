@@ -89,13 +89,14 @@
             <p class="card-number">02 / EXPERIMENTAL</p>
             <h3>Behavioural detection</h3>
             <p>
-              Learns each source’s international calling pattern and reports anomalous
-              scans and volume—even when the attacker has valid credentials.
+              Learns each source’s international calling pattern—the dialling formats it
+              tries and the destination ranges it probes—and reports anomalous scans and
+              volume, even when the attacker has valid credentials.
             </p>
             <ul>
               <li>Opt-in with <code>--behavioural</code></li>
               <li>30-day learning window by default</li>
-              <li>Detection and reporting today</li>
+              <li>Detection and reporting by default; source-level blocking is opt-in</li>
             </ul>
           </article>
         </div>
@@ -150,9 +151,9 @@ tfps_ctl status</code></pre>
         <h2>Know what it does not inspect.</h2>
         <div class="limit-list">
           <span>SIP over TLS payloads</span><span>SIP/TCP detection</span><span>IPv6 traffic</span>
-          <span>Behavioural enforcement</span>
+          <span>SIP-level behavioural reject</span>
         </div>
-        <p>Known-bad sources can still be enforced across configured TCP SIP ports. Full limitations are documented in the project README.</p>
+        <p>Known-bad sources can still be enforced across configured TCP SIP ports. Behavioural verdicts can add a source-level XDP block with <code>--enforce-behavioural</code>; the forged SIP <code>603</code> remains. No on-wire detector catches every fraud type; TFPS is one layer, use it at your own risk. Full limitations are documented in the project README.</p>
       </section>
     </main>
 

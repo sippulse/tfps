@@ -11,7 +11,7 @@
 #   1. TFPS_TARBALL=<file or URL>   a release tarball you already have (air-gapped hosts,
 #                                   or a build from another machine)
 #   2. a checkout                   when run from inside the repository
-#   3. the GitHub release           TFPS_VERSION=latest (default) or a tag such as v0.2.0
+#   3. the GitHub release           TFPS_VERSION=latest (default) or a tag such as v0.3.0
 #   4. the source                   built here, only when the host can afford it
 #
 # Everything is idempotent: run it again to upgrade. /etc/tfps/config.json is written
@@ -141,7 +141,7 @@ build_from_source() {
         "$(dirname "$cargo_bin")/rustup" target add "$MUSL_TARGET" >/dev/null 2>&1 || true
     fi
     say "building the static binaries (this takes a while on a small machine)"
-    ( cd "$1" && "$cargo_bin" build --quiet --release --target "$MUSL_TARGET" )
+    ( cd "$1" && "$cargo_bin" build --locked --quiet --release --target "$MUSL_TARGET" )
     SRC="$1"
     BIN="$1/target/$MUSL_TARGET/release"
 }

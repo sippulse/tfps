@@ -17,7 +17,7 @@ use std::net::Ipv4Addr;
 
 use crate::anomaly::{AnomalySnapshot, Params, SourceAnomaly};
 use crate::country::{self, Country};
-use crate::dialplan::DialPlan;
+use crate::dialplan::{DialPlan, InternationalDigits};
 use crate::novelty::Timestamp;
 use crate::perimeter::{
     AuthAttempts, AuthFailures, NoiseFilter, RegProbes, AUTH_FAILURE_WINDOW_SECS, AUTH_WINDOW_SECS,
@@ -54,14 +54,23 @@ pub enum Decision {
     /// Would have blocked, but the behavioural layer is still learning.
     WouldBlock {
         country: &'static str,
-        bits: u32,
+        /// Fused evidence in nats.
+        evidence_nats: u32,
         countries: u32,
     },
-    /// Block: the source's fused evidence crossed the fire bound. `bits` is the evidence,
-    /// `countries` the distinct destinations it has attempted — both go in the audit line.
+    /// The evidence crossed the bound, but the source has not been observed long enough
+    /// for its own baseline. Reported, never blocked.
+    Warming {
+        country: &'static str,
+        evidence_nats: u32,
+        countries: u32,
+    },
+    /// Block: the source's fused evidence crossed the fire bound. `evidence_nats` is that
+    /// evidence, `countries` the distinct destinations it has attempted — both go in the
+    /// audit line.
     Block {
         country: &'static str,
-        bits: u32,
+        evidence_nats: u32,
         countries: u32,
     },
     /// Perimeter noise: a scanning tool identified by its user-agent.
@@ -75,6 +84,11 @@ pub enum Decision {
     /// scanning tool can forge a legitimate UA, but no real phone puts a single quote or
     /// `--` in the `From` header.
     Injection { pattern: &'static str },
+    /// A singleton header appeared more than once (From, To, Call-ID, CSeq, User-Agent,
+    /// P-Asserted-Identity, Authorization). The parser keeps the first and flags the
+    /// duplicate; the message is condemned rather than guessed at, because the softswitch
+    /// may use the other copy. This closes the duplicate-header smuggling evasion.
+    Malformed { header: &'static str },
     /// Registration scanning: many REGISTER attempts, none succeeding — enumerating
     /// extensions without ever logging in. Carries the number of distinct extensions probed.
     /// Caught even with no credential presented, which the auth-failure rule cannot see.
@@ -138,8 +152,10 @@ pub struct Stats {
     pub intl_completed: u64,
     /// International calls observed to fail (a final `4xx`/`5xx`/`6xx`) — the scan signal.
     pub intl_failed: u64,
-    /// First-time-prefix events, for the learned prefix benign rate.
+    /// First-time-dialling-prefix events, for the learned prefix benign rate.
     pub prefix_novel: u64,
+    /// First-time-destination-range events, for the learned range benign rate.
+    pub range_novel: u64,
     /// Calls to the operator's own country — national, excluded from the behavioural layer.
     pub domestic: u64,
     pub invites: u64,
@@ -149,6 +165,10 @@ pub struct Stats {
     pub novel: u64,
     pub blocks: u64,
     pub would_block: u64,
+    /// Firing verdicts suppressed because the source is still in its own warm-up.
+    pub warming: u64,
+    /// Successful registrations refused because the known-peer map was full.
+    pub known_peers_dropped: u64,
     /// Pairs refused by the memory ceiling. **Non-zero is a symptom of an A-number
     /// rotation attack** — and it must show up in the report, not vanish silently.
     pub pairs_dropped: u64,
@@ -168,10 +188,10 @@ const MAX_PEERS: usize = 10_000;
 /// does. Set well above any plausible legitimate device so no real endpoint is ever banned;
 /// a real enumeration ("a few tries per extension, across the dial plan") sails past it.
 /// Catches the no-credential probe the auth-failure rule (which needs a credential) misses.
-pub const REG_SCAN_EXTENSIONS: usize = 5;
+pub const REG_SCAN_EXTENSIONS: usize = 10;
 
 /// Per-source capacity for the distinct-extension tracker; ≥ `REG_SCAN_EXTENSIONS`.
-const REG_PROBE_CAPACITY: usize = 8;
+const REG_PROBE_CAPACITY: usize = 16;
 
 /// Window for the registration-scan counter.
 pub const REG_SCAN_WINDOW_SECS: u32 = 600;
@@ -190,10 +210,11 @@ fn ext_id(aor: &str) -> u64 {
 /// Ceiling on remembered known-good peers, to bound memory.
 const MAX_KNOWN_PEERS: usize = 50_000;
 
-/// How long a successful authentication keeps a peer exempt. Longer than any registration
-/// interval, so a peer that is briefly offline is not forgotten — but a customer who leaves
-/// eventually ages out.
-pub const KNOWN_PEER_TTL_SECS: u32 = 7 * 24 * 3600;
+/// How long a successful registration keeps a peer exempt from the third-party feed.
+/// Longer than any registration interval, so a peer that is briefly offline is not
+/// forgotten, but short enough that a reassigned dynamic IP does not inherit the trust for a
+/// week. The perimeter's own evidence is never exempted.
+pub const KNOWN_PEER_TTL_SECS: u32 = 24 * 3600;
 
 /// A peer's durable detector state, as the store sees it.
 #[derive(Debug, Clone)]
@@ -222,9 +243,9 @@ struct PeerState {
     pending_intl: PendingAuth,
     /// Distinct extensions this source has probed with REGISTER — the enumeration counter.
     reg_probes: RegProbes<REG_PROBE_CAPACITY>,
-    /// When this source last completed a registration (a `2xx` to a REGISTER); `None` until
-    /// it does. A source that has logged in even once is not an enumerator.
-    last_reg_success: Option<u32>,
+    /// The durable state changed since the last checkpoint. Checkpoints write only dirty
+    /// sources, so a quiet installation does not rewrite every peer on every interval.
+    dirty: bool,
 }
 
 /// How many authenticated transactions per peer can be awaiting a response.
@@ -242,36 +263,74 @@ const PENDING_TTL_SECS: u32 = 32;
 /// **Only authenticated requests are remembered.** A request with no credential is of no
 /// interest: the `401` it receives is the normal challenge, and storing it would be the
 /// mistake that blocks every customer.
+#[derive(Debug)]
+struct PendingEntry {
+    key: String,
+    at: u32,
+    /// None = unconfirmed legacy caller (`observe`, tests); Some = the request's destination.
+    responder: Option<Ipv4Addr>,
+    aor: Option<u64>,
+    novel: bool,
+}
+
 #[derive(Debug, Default)]
 struct PendingAuth {
-    entries: Vec<(String, u32)>,
+    entries: Vec<PendingEntry>,
 }
 
 impl PendingAuth {
-    fn remember(&mut self, key: String, now: u32) {
+    fn remember(
+        &mut self,
+        key: String,
+        now: u32,
+        responder: Option<Ipv4Addr>,
+        aor: Option<u64>,
+        novel: bool,
+    ) {
         self.entries
-            .retain(|(_, t)| now.saturating_sub(*t) < PENDING_TTL_SECS);
+            .retain(|e| now.saturating_sub(e.at) < PENDING_TTL_SECS);
         // A retransmission of the same request is the same attempt, not a second one.
-        if let Some(e) = self.entries.iter_mut().find(|(k, _)| *k == key) {
-            e.1 = now;
+        if let Some(e) = self.entries.iter_mut().find(|e| e.key == key) {
+            e.at = now;
+            e.responder = responder;
+            e.aor = aor;
+            e.novel = novel;
             return;
         }
         if self.entries.len() < MAX_PENDING_PER_PEER {
-            self.entries.push((key, now));
+            self.entries.push(PendingEntry {
+                key,
+                at: now,
+                responder,
+                aor,
+                novel,
+            });
         }
     }
 
-    /// Claims a transaction, if it was an authenticated one. Removing it on the first
-    /// matching response is what keeps a retransmitted `401` from counting twice.
-    fn claim(&mut self, key: &str) -> bool {
-        match self.entries.iter().position(|(k, _)| k == key) {
-            Some(i) => {
-                self.entries.remove(i);
-                true
-            }
-            None => false,
-        }
+    /// Claims a transaction, if it was an authenticated one **and the response came from the
+    /// address the request was sent to**. Returning the recorded AOR lets a success clear
+    /// only that AOR's failures. Removing the entry on the first matching response keeps a
+    /// retransmitted `401` from counting twice.
+    fn claim(&mut self, key: &str, src: Ipv4Addr) -> Option<(Option<u64>, bool)> {
+        let i = self
+            .entries
+            .iter()
+            .position(|e| e.key == key && e.responder.is_none_or(|expected| expected == src))?;
+        let entry = self.entries.remove(i);
+        Some((entry.aor, entry.novel))
     }
+}
+
+/// One international INVITE, as the decision function sees it: the dialling format, the
+/// canonical destination, the request (for its transaction key) and the instant.
+struct Observation<'a> {
+    prefix: &'a str,
+    digits: &'a InternationalDigits,
+    request: &'a sip::Request<'a>,
+    country: Country,
+    now: Timestamp,
+    responder: Option<Ipv4Addr>,
 }
 
 pub struct Engine {
@@ -295,7 +354,7 @@ pub struct Engine {
     /// Whether behavioural fraud detection runs at all.
     ///
     /// **Off by default.** The product is noise reduction — the perimeter and its clean
-    /// sngrep — and that stands on its own. Behavioural detection (country novelty and the
+    /// sngrep — and that stands on its own. Behavioural detection (prefix and range novelty and the
     /// rest) is an opt-in extra: worth having, but most installs will never turn it on, and
     /// forcing its state, its learning window and its per-peer memory on everyone would be
     /// exactly the over-engineering this product is meant to avoid. When off, INVITEs are
@@ -348,6 +407,11 @@ impl Engine {
     /// The calibrated parameters currently in force, for the report.
     pub fn params(&self) -> &Params {
         &self.params
+    }
+
+    /// Mutable parameters, used by tests to disable the per-source warm-up.
+    pub fn params_mut(&mut self) -> &mut Params {
+        &mut self.params
     }
 
     /// Declares the operator's own country/countries by ISO label (`+1` is `NANP`).
@@ -410,6 +474,8 @@ impl Engine {
         if self.stats.international >= 500 {
             let rp = self.stats.prefix_novel as f64 / self.stats.international as f64;
             p.theta0_prefix = rp.clamp(0.005, 0.3);
+            let rr = self.stats.range_novel as f64 / self.stats.international as f64;
+            p.theta0_range = rr.clamp(0.02, 0.4);
         }
         // theta0c: the population failure rate among observed final responses.
         let finals = self.stats.intl_completed + self.stats.intl_failed;
@@ -448,18 +514,32 @@ impl Engine {
         self.peers.len()
     }
 
-    /// Each source's durable detector state, in the shape the store writes.
+    /// Each **dirty** source's durable detector state, in the shape the store writes.
+    ///
+    /// Checkpoints are periodic and inline with capture, so rewriting every quiet peer
+    /// every five minutes is wasted work and a needless stall. A peer becomes dirty when
+    /// its walks or its rate posterior change.
     pub fn export_anomaly(&self) -> impl Iterator<Item = PeerAnomalyRecord> + '_ {
-        self.peers.iter().map(|(ip, st)| {
-            let snap = st.anomaly.snapshot();
-            PeerAnomalyRecord {
-                peer: *ip,
-                seen_countries: snap.seen_countries,
-                n_countries: snap.n_countries,
-                rate_a: snap.rate_a,
-                rate_b: snap.rate_b,
-            }
-        })
+        self.peers
+            .iter()
+            .filter(|(_, st)| st.dirty)
+            .map(|(ip, st)| {
+                let snap = st.anomaly.snapshot();
+                PeerAnomalyRecord {
+                    peer: *ip,
+                    seen_countries: snap.seen_countries,
+                    n_countries: snap.n_countries,
+                    rate_a: snap.rate_a,
+                    rate_b: snap.rate_b,
+                }
+            })
+    }
+
+    /// Marks every source clean after a successful checkpoint.
+    pub fn clear_anomaly_dirty(&mut self) {
+        for st in self.peers.values_mut() {
+            st.dirty = false;
+        }
     }
 
     /// Restores a source's detector state. Honours the peer ceiling.
@@ -483,13 +563,15 @@ impl Engine {
                 rate_b: r.rate_b,
             },
         );
+        st.dirty = false;
     }
 
     /// Approximate memory held by detector state, for the report.
     pub fn approx_state_bytes(&self) -> usize {
-        // A SourceAnomaly is a fixed handful of words: two walks, a rate posterior, a
-        // 256-bit country set. Call it ~200 bytes per peer with map overhead.
-        const PER_PEER: usize = 200;
+        // A SourceAnomaly is a fixed handful of words: three walks, a rate posterior, a
+        // 256-bit country set, and two 128-byte range filters. Call it ~600 bytes per peer
+        // with map overhead.
+        const PER_PEER: usize = 600;
         self.peers.len() * PER_PEER
     }
 
@@ -516,7 +598,7 @@ impl Engine {
             Some(Message::Response(r)) => {
                 self.stats.responses += 1;
                 // The subject is the party being answered, not the one answering.
-                return (dst, self.observe_response(dst, &r, now));
+                return (dst, self.observe_response(dst, src, &r, now));
             }
             Some(Message::Keepalive) => {
                 self.stats.keepalives += 1;
@@ -527,13 +609,16 @@ impl Engine {
                 return (src, Decision::OutOfScope("not SIP"));
             }
         };
-        (src, self.observe_request(src, &req, now))
+        let responder = (!dst.is_unspecified()).then_some(dst);
+        (src, self.observe_request(src, responder, &req, now))
     }
 
     /// Convenience for callers that only have one address — every request, and every test
     /// that predates two-sided observation.
     pub fn observe(&mut self, peer: Ipv4Addr, payload: &[u8], now: Timestamp) -> Decision {
-        self.observe_packet(peer, peer, payload, now).1
+        // One-address convenience: no expected responder, so a response is not pinned to it.
+        self.observe_packet(peer, Ipv4Addr::UNSPECIFIED, payload, now)
+            .1
     }
 
     /// A response: the only place a **failed** authentication can be recognised.
@@ -544,6 +629,7 @@ impl Engine {
     fn observe_response(
         &mut self,
         peer: Ipv4Addr,
+        src: Ipv4Addr,
         r: &sip::Response<'_>,
         now: Timestamp,
     ) -> Decision {
@@ -562,44 +648,74 @@ impl Engine {
             return Decision::OutOfScope("SIP response");
         };
 
-        // A successful registration (any 2xx to a REGISTER) clears the enumerator
-        // suspicion: a source that logs in even once is not scanning.
-        if r.is_success()
-            && r.cseq
-                .is_some_and(|c| c.to_ascii_uppercase().contains("REGISTER"))
-        {
-            st.last_reg_success = Some(now.0);
-            st.reg_probes.clear();
+        // A response can answer two questions at once: it may be the outcome of an
+        // authenticated request, and — when that request was an international INVITE — the
+        // outcome of a call. Claim both, and never let the auth path consume the completion
+        // path: an authenticated INVITE answered `200` or `404` used to be swallowed here,
+        // leaving the completion arm blind to exactly the traffic it exists to watch.
+        // Provisional responses are neither outcome; claiming one would lose the final.
+        let auth = if provisional {
+            None
+        } else {
+            st.pending.claim(&key, src)
+        };
+        let intl = if provisional {
+            None
+        } else {
+            st.pending_intl.claim(&key, src)
+        };
+        let was_auth = auth.is_some();
+        let was_intl = intl.is_some();
+        if !was_auth && !was_intl {
+            return Decision::OutOfScope("SIP response");
         }
 
-        // Authentication path: a response to a REGISTER we recorded as an authenticated
-        // attempt. This is where a rejected credential is counted.
-        if st.pending.claim(&key) {
+        let aor = auth.and_then(|(aor, _)| aor);
+        let novel = intl.is_some_and(|(_, novel)| novel);
+        if was_auth {
+            let is_register = r
+                .cseq
+                .is_some_and(|c| c.to_ascii_uppercase().contains("REGISTER"));
             if r.is_success() {
                 self.stats.auth_ok += 1;
-                st.auth_failures.clear();
-                // A successful authentication marks this source a known-good registered
-                // peer, exempt from banning — the dynamic equivalent of `ignoreip`.
-                if self.known_peers.len() < MAX_KNOWN_PEERS || self.known_peers.contains_key(&peer)
-                {
-                    self.known_peers.insert(peer, now.0);
+                // A success clears only the AOR that succeeded. Clearing every failure let
+                // an attacker with one valid account reset the counter while guessing
+                // another account.
+                st.auth_failures.clear_aor(aor.unwrap_or(0));
+                if is_register {
+                    // Only a successful REGISTER proves a registered peer. A 2xx to an
+                    // authenticated INVITE is a call, not a registration, and used to grant
+                    // seven days of perimeter immunity.
+                    if let Some(aor) = aor {
+                        st.reg_probes.remove(aor);
+                    }
+                    if self.known_peers.len() < MAX_KNOWN_PEERS
+                        || self.known_peers.contains_key(&peer)
+                    {
+                        self.known_peers.insert(peer, now.0);
+                    } else {
+                        // A silent cap would make new customers lose the APIBAN exemption
+                        // without anyone seeing why. Count it for the report.
+                        self.stats.known_peers_dropped =
+                            self.stats.known_peers_dropped.saturating_add(1);
+                    }
                 }
-                return Decision::OutOfScope("SIP response");
-            }
-            if r.is_digest_challenge() {
+            } else if r.is_digest_challenge() {
                 self.stats.auth_failures += 1;
-                let (n, exceeded) = st.auth_failures.record(now.0, AUTH_FAILURE_WINDOW_SECS);
+                let (n, exceeded) =
+                    st.auth_failures
+                        .record(aor.unwrap_or(0), now.0, AUTH_FAILURE_WINDOW_SECS);
                 if exceeded {
                     return Decision::AuthFailure { failures: n };
                 }
             }
-            return Decision::OutOfScope("SIP response");
         }
 
         // Completion path: the final response to an international INVITE we remembered.
         // Only a final response is an outcome, and silence is never fed — the same honesty
-        // the auth rule keeps.
-        if !provisional && st.pending_intl.claim(&key) {
+        // the auth rule keeps. A digest challenge is the normal handshake, not a routing
+        // outcome, whether or not the INVITE carried a credential.
+        if was_intl && !r.is_digest_challenge() {
             let completed = r.is_success();
             if completed {
                 self.stats.intl_completed += 1;
@@ -609,26 +725,34 @@ impl Engine {
                 // A 3xx redirect is neither a completion nor a failure; ignore it.
                 return Decision::OutOfScope("SIP response");
             }
-            if !behavioural {
-                return Decision::OutOfScope("SIP response");
-            }
-            let v = st.anomaly.observe_completion(completed, now.0);
-            let bits = v.evidence.round().max(0.0) as u32;
-            if v.fired {
-                if mode.is_learning(now) {
-                    self.stats.would_block += 1;
-                    return Decision::WouldBlock {
+            if behavioural {
+                let v = st.anomaly.observe_completion(completed, novel, now.0);
+                st.dirty = true;
+                let evidence_nats = v.evidence.round().max(0.0) as u32;
+                if v.fired {
+                    if mode.is_learning(now) {
+                        self.stats.would_block += 1;
+                        return Decision::WouldBlock {
+                            country: "?",
+                            evidence_nats,
+                            countries: v.countries,
+                        };
+                    }
+                    if v.warming {
+                        self.stats.warming += 1;
+                        return Decision::Warming {
+                            country: "?",
+                            evidence_nats,
+                            countries: v.countries,
+                        };
+                    }
+                    self.stats.blocks += 1;
+                    return Decision::Block {
                         country: "?",
-                        bits,
+                        evidence_nats,
                         countries: v.countries,
                     };
                 }
-                self.stats.blocks += 1;
-                return Decision::Block {
-                    country: "?",
-                    bits,
-                    countries: v.countries,
-                };
             }
         }
         Decision::OutOfScope("SIP response")
@@ -637,23 +761,24 @@ impl Engine {
     fn observe_request(
         &mut self,
         peer: Ipv4Addr,
+        responder: Option<Ipv4Addr>,
         req: &sip::Request<'_>,
         now: Timestamp,
     ) -> Decision {
         // The perimeter comes before everything, and applies to **any** method: scanners
         // send OPTIONS and REGISTER as much as INVITE. It leaves here without touching any
         // state, which is exactly the point — noise must not enter the baseline.
-        if let Some(sig) = self.noise_filter.is_noise(req.user_agent) {
+        if let Some(sig) = self.noise_filter.is_noise(req.user_agent.as_deref()) {
             self.stats.noise += 1;
             return Decision::Noise { signature: sig };
         }
 
         // URI injection belongs with the perimeter and applies to any method: the attack
-        // shows up in INVITE as much as in REGISTER and OPTIONS.
-        if let Some(pat) =
-            self.noise_filter
-                .injection_in_uri(&[Some(req.request_uri), req.from, req.to])
-        {
+        // shows up in INVITE as much as in REGISTER and OPTIONS. Only the Request-URI is
+        // scanned: From/To user parts can be legitimate SIP names (`o'brien@`, `select@`),
+        // and condemning a whole source for a name is a false positive. The Request-URI is
+        // what the softswitch routes and what the classic injection targets.
+        if let Some(pat) = self.noise_filter.injection_in_uri(&[Some(req.request_uri)]) {
             self.stats.injections += 1;
             return Decision::Injection { pattern: pat };
         }
@@ -664,12 +789,18 @@ impl Engine {
         // before the INVITE gate so those are caught.
         if let Some(id) = self.noise_filter.scanner_id(&[
             Some(req.request_uri),
-            req.from,
-            req.to,
-            req.p_asserted_identity,
+            req.from.as_deref(),
+            req.to.as_deref(),
+            req.p_asserted_identity.as_deref(),
         ]) {
             self.stats.scanners += 1;
             return Decision::Scanner { id };
+        }
+
+        // Duplicate singleton headers are ambiguous: the softswitch may read a different
+        // copy than this parser. Condemn the source instead of guessing which one is real.
+        if let Some(header) = req.duplicate {
+            return Decision::Malformed { header };
         }
 
         // A credential is stolen at `REGISTER` and spent at `INVITE`, and both are challenged
@@ -681,10 +812,11 @@ impl Engine {
         if (is_register || credentialed)
             && (self.peers.len() < MAX_PEERS || self.peers.contains_key(&peer))
         {
-            let plan = self.default_plan.clone();
+            // The dial plan is cloned only when the peer is new. Cloning it for every
+            // credentialed request would allocate once per packet under a brute-force run.
             let params = self.params.clone();
             let st = self.peers.entry(peer).or_insert_with(|| PeerState {
-                dial_plan: plan,
+                dial_plan: self.default_plan.clone(),
                 anomaly: SourceAnomaly::new(&params),
                 ..Default::default()
             });
@@ -694,15 +826,13 @@ impl Engine {
             // attempts — is what keeps a legitimate endpoint safe: a phone registers its own
             // one (a device its few) AOR(s) however many times it retransmits, so it never
             // climbs, and a source that has logged in even once is exempt outright.
+            let aor_text = req.to_user().or(req.request_user).unwrap_or("");
+            let aor_hash = ext_id(aor_text);
             if is_register {
-                let aor = req.to_user().or(req.request_user).unwrap_or("");
-                let distinct = st
-                    .reg_probes
-                    .record(ext_id(aor), now.0, REG_SCAN_WINDOW_SECS);
-                let succeeded = st
-                    .last_reg_success
-                    .is_some_and(|t| now.0.saturating_sub(t) < REG_SCAN_WINDOW_SECS);
-                if distinct as usize >= REG_SCAN_EXTENSIONS && !succeeded {
+                let distinct = st.reg_probes.record(aor_hash, now.0, REG_SCAN_WINDOW_SECS);
+                // A success for one AOR removes only that AOR (on the response path). It no
+                // longer exempts the source from enumerating every other extension.
+                if distinct as usize >= REG_SCAN_EXTENSIONS {
                     self.stats.reg_scans += 1;
                     return Decision::RegScan {
                         extensions: distinct,
@@ -712,8 +842,18 @@ impl Engine {
 
             if credentialed {
                 self.stats.auth_attempts += 1;
-                if let Some(key) = sip::transaction_key(req.via_branch(), req.call_id, req.cseq) {
-                    st.pending.remember(key, now.0);
+                if let Some(key) = sip::transaction_key(
+                    req.via_branch(),
+                    req.call_id.as_deref(),
+                    req.cseq.as_deref(),
+                ) {
+                    st.pending.remember(
+                        key,
+                        now.0,
+                        responder,
+                        is_register.then_some(aor_hash),
+                        false,
+                    );
                 }
                 // The volume backstop, for deployments where no response is ever seen.
                 let (n, exceeded) = st.auth_attempts.record(now.0, AUTH_WINDOW_SECS);
@@ -772,30 +912,55 @@ impl Engine {
             return Decision::OutOfScope("home country");
         }
 
-        Self::decide(&prefix, state, req, c, now, self.mode, &mut self.stats)
+        Self::decide(
+            Observation {
+                prefix: &prefix,
+                digits: &digits,
+                request: req,
+                country: c,
+                now,
+                responder,
+            },
+            state,
+            self.mode,
+            &mut self.stats,
+        )
     }
 
     fn decide(
-        prefix: &str,
+        obs: Observation<'_>,
         state: &mut PeerState,
-        req: &sip::Request<'_>,
-        c: Country,
-        now: Timestamp,
         mode: Mode,
         stats: &mut Stats,
     ) -> Decision {
-        // One observation feeds the source's sequential detector: the destination country
-        // and the dialling prefix, at this instant. All the state — novelty, prefix
-        // variety, volume — lives inside it.
-        let v = state.anomaly.observe(c.index, prefix, now.0);
+        let Observation {
+            prefix,
+            digits,
+            request,
+            country: c,
+            now,
+            responder,
+        } = obs;
+        // One observation feeds the source's sequential detector: the destination country,
+        // the dialling prefix it discovered, and the destination range it probed, at this
+        // instant. All the state — prefix variety, range novelty, volume — lives inside it.
+        let v = state.anomaly.observe(c.index, prefix, &digits.0, now.0);
+        state.dirty = true;
         // Remember the call so its final response can feed the completion arm.
-        if let Some(key) = sip::transaction_key(req.via_branch(), req.call_id, req.cseq) {
-            state.pending_intl.remember(key, now.0);
+        if let Some(key) = sip::transaction_key(
+            request.via_branch(),
+            request.call_id.as_deref(),
+            request.cseq.as_deref(),
+        ) {
+            state
+                .pending_intl
+                .remember(key, now.0, responder, None, v.first_range);
         }
         // A first-time country registers as novelty for the report's thermometer.
         stats.novel += u64::from(v.first_time);
         stats.prefix_novel += u64::from(v.first_prefix);
-        let bits = v.evidence.round().max(0.0) as u32;
+        stats.range_novel += u64::from(v.first_range);
+        let evidence_nats = v.evidence.round().max(0.0) as u32;
 
         if !v.fired {
             return Decision::Pass {
@@ -807,14 +972,22 @@ impl Engine {
             stats.would_block += 1;
             return Decision::WouldBlock {
                 country: c.iso,
-                bits,
+                evidence_nats,
+                countries: v.countries,
+            };
+        }
+        if v.warming {
+            stats.warming += 1;
+            return Decision::Warming {
+                country: c.iso,
+                evidence_nats,
                 countries: v.countries,
             };
         }
         stats.blocks += 1;
         Decision::Block {
             country: c.iso,
-            bits,
+            evidence_nats,
             countries: v.countries,
         }
     }
@@ -859,6 +1032,24 @@ mod tests {
         .into_bytes()
     }
 
+    /// A REGISTER for a specific AOR, used by the NAT/enumeration tests.
+    fn register_ext(n: u32, ext: &str, credential: bool) -> Vec<u8> {
+        let auth = if credential {
+            "Authorization: Digest username=\"1001\", realm=\"pbx\", response=\"deadbeef\"\r\n"
+        } else {
+            ""
+        };
+        format!(
+            "REGISTER sip:pbx SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.0.0.5;branch=z9hG4bK{n}\r\n\
+             From: <sip:1001@pbx>;tag=t1\r\n\
+             To: <sip:{ext}@pbx>\r\n\
+             Call-ID: reg-call\r\n\
+             CSeq: {n} REGISTER\r\n{auth}\r\n"
+        )
+        .into_bytes()
+    }
+
     /// The softswitch's answer to transaction `n`, reusing its `Via` branch verbatim as
     /// RFC 3261 §17.1.3 requires.
     fn response(n: u32, status: u16) -> Vec<u8> {
@@ -893,7 +1084,12 @@ mod tests {
     fn engine() -> Engine {
         // The tests here exercise the behavioural path, so they opt into it. The default
         // engine is perimeter-only — covered by `perimeter_runs_with_behavioural_off`.
-        Engine::new(DialPlan::new(["+", "00", "011", "9011"]), Mode::Active).with_behavioural()
+        // Warm-up is a separate, explicitly tested gate; existing arm tests disable it.
+        let mut e =
+            Engine::new(DialPlan::new(["+", "00", "011", "9011"]), Mode::Active).with_behavioural();
+        e.params_mut().warmup_secs = 0;
+        e.params_mut().warmup_calls = 0;
+        e
     }
 
     #[test]
@@ -1087,6 +1283,83 @@ mod tests {
         assert!(e.stats.intl_completed > 0);
     }
 
+    /// An INVITE that carries a credential — the normal case for a registered PBX.
+    fn invite_auth(n: u32, dest: &str) -> Vec<u8> {
+        format!(
+            "INVITE sip:{dest}@pbx SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.0.0.5;branch=z9hG4bK{n}\r\n\
+             From: <sip:200@pbx>;tag=t1\r\nTo: <sip:{dest}@pbx>\r\n\
+             Call-ID: call-{n}\r\nCSeq: {n} INVITE\r\n\
+             Proxy-Authorization: Digest username=\"200\", realm=\"pbx\", response=\"x\"\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn authenticated_invites_still_feed_the_completion_arm() {
+        // The auth path used to claim the transaction before the completion path, so every
+        // authenticated INVITE was invisible to the arm that watches call outcomes. This is
+        // the regression test for that.
+        let mut e = engine();
+        let mut fired = false;
+        for i in 0..25u32 {
+            let dest = format!("00{}12345678", 30 + i);
+            e.observe_packet(peer(), switch(), &invite_auth(i, &dest), t(i * 30));
+            fired |= matches!(
+                e.observe_packet(switch(), peer(), &invite_response(i, 404), t(i * 30 + 1))
+                    .1,
+                Decision::Block { .. }
+            );
+        }
+        assert_eq!(
+            e.stats.intl_failed, 25,
+            "every authenticated INVITE's 404 is a failed completion"
+        );
+        assert!(
+            fired,
+            "authenticated calls that never complete must still fire"
+        );
+    }
+
+    #[test]
+    fn a_digest_challenge_to_an_unauthenticated_invite_is_not_a_failure() {
+        // The 401 is the normal proxy handshake, exactly as it is for REGISTER. Counting
+        // it as a failed completion would make every authenticated PBX look like a scanner.
+        let mut e = engine();
+        e.observe_packet(peer(), switch(), &invite_n(1, "00442039967796"), t(0));
+        e.observe_packet(switch(), peer(), &invite_response(1, 401), t(1));
+        assert_eq!(e.stats.intl_failed, 0);
+        assert_eq!(e.stats.intl_completed, 0);
+    }
+
+    #[test]
+    fn a_rejected_credential_on_an_invite_is_an_auth_failure_not_a_completion() {
+        let mut e = engine();
+        e.observe_packet(peer(), switch(), &invite_auth(1, "00442039967796"), t(0));
+        e.observe_packet(switch(), peer(), &invite_response(1, 401), t(1));
+        assert_eq!(e.stats.auth_failures, 1);
+        assert_eq!(e.stats.intl_failed, 0);
+    }
+
+    #[test]
+    fn route_probing_within_one_country_is_caught() {
+        // The premium-destination phase: one country, one dialling format, many ranges in
+        // a burst. No completion needed — the range arm carries it.
+        let mut e = Engine::new(DialPlan::new(["00"]), Mode::Active).with_behavioural();
+        e.params_mut().warmup_secs = 0;
+        e.params_mut().warmup_calls = 0;
+        let mut fired = false;
+        for i in 0..20u32 {
+            let dest = format!("004420{:04}1234", i * 17);
+            fired |= matches!(
+                e.observe(peer(), &invite_n(i, &dest), t(i * 20)),
+                Decision::Block { .. }
+            );
+        }
+        assert!(fired, "a range-probing burst must fire");
+        assert!(e.stats.range_novel > 0);
+    }
+
     #[test]
     fn recalibration_refits_and_still_catches_a_scan() {
         // Feed settled, completing international traffic so the population failure rate is
@@ -1125,6 +1398,48 @@ mod tests {
     }
 
     #[test]
+    fn a_legitimate_sip_username_is_not_injection() {
+        let mut e = engine();
+        let d = e.observe(peer(), &invite("o'brien", "00442039967796"), t(0));
+        assert!(!matches!(d, Decision::Injection { .. }), "{d:?}");
+        assert_eq!(e.stats.injections, 0);
+    }
+
+    #[test]
+    fn an_injection_in_the_request_uri_is_still_caught() {
+        let mut e = engine();
+        let msg = b"INVITE sip:1001'@pbx SIP/2.0\r\n\
+                    Via: SIP/2.0/UDP 10.0.0.5;branch=z9hG4bK1\r\n\
+                    From: <sip:200@pbx>;tag=a\r\nTo: <sip:1001'@pbx>\r\n\
+                    Call-ID: c1\r\nCSeq: 1 INVITE\r\n\r\n";
+        assert!(matches!(
+            e.observe(peer(), msg, t(0)),
+            Decision::Injection { .. }
+        ));
+    }
+
+    #[test]
+    fn duplicate_singleton_headers_are_condemned() {
+        // Two From (or Call-ID/CSeq/User-Agent) copies are ambiguous; the parser keeps the
+        // first and the engine condemns the source instead of guessing which one the
+        // softswitch will use.
+        let msg = b"INVITE sip:00442039967796@pbx SIP/2.0\r\n\
+                    Via: SIP/2.0/UDP 10.0.0.5;branch=z9hG4bK1\r\n\
+                    From: <sip:200@pbx>;tag=a\r\n\
+                    From: <sip:201@pbx>;tag=b\r\n\
+                    To: <sip:00442039967796@pbx>\r\n\
+                    Call-ID: c1\r\nCSeq: 1 INVITE\r\n\r\n";
+        assert_eq!(
+            eobserve(&mut engine(), msg),
+            Decision::Malformed { header: "From" }
+        );
+    }
+
+    fn eobserve(e: &mut Engine, msg: &[u8]) -> Decision {
+        e.observe(peer(), msg, t(0))
+    }
+
+    #[test]
     fn junk_neither_crashes_nor_blocks() {
         let mut e = engine();
         for p in [&b"not sip at all"[..], &[0xff, 0xfe][..], &b""[..]] {
@@ -1135,6 +1450,46 @@ mod tests {
         }
         assert_eq!(e.stats.not_sip, 3);
         assert_eq!(e.stats.blocks, 0);
+    }
+
+    #[test]
+    fn a_new_source_is_reported_but_not_blocked() {
+        let mut e = Engine::new(DialPlan::new(["00"]), Mode::Active).with_behavioural();
+        // Even after the floor is reached, a source younger than the per-source warm-up is
+        // reported as WARMING, never as BLOCK.
+        let mut saw = false;
+        for i in 0..20u32 {
+            let dest = format!("004420{:04}1234", i * 17);
+            let d = e.observe(peer(), &invite_n(i, &dest), t(i * 20));
+            saw |= matches!(d, Decision::Warming { .. });
+            assert!(
+                !matches!(d, Decision::Block { .. }),
+                "warming must not block"
+            );
+        }
+        assert!(saw, "the evidence should have crossed the bound");
+        assert_eq!(e.stats.blocks, 0);
+        assert!(e.stats.warming > 0);
+    }
+
+    #[test]
+    fn a_warm_source_is_blocked() {
+        let mut e = Engine::new(DialPlan::new(["00"]), Mode::Active).with_behavioural();
+        e.params_mut().warmup_secs = 3600;
+        e.params_mut().warmup_calls = 5;
+        // Five benign international calls over the first 400 s.
+        for i in 0..5u32 {
+            e.observe_packet(peer(), switch(), &invite_n(i, "00442039967796"), t(i * 100));
+            e.observe_packet(switch(), peer(), &invite_response(i, 200), t(i * 100 + 1));
+        }
+        // At t=4000 the source is older than the warm-up and has enough calls.
+        let mut fired = false;
+        for i in 5..25u32 {
+            let dest = format!("004420{:04}1234", i * 17);
+            let d = e.observe(peer(), &invite_n(i, &dest), t(4000 + i * 20));
+            fired |= matches!(d, Decision::Block { .. });
+        }
+        assert!(fired, "a warm source crossing the bound is blocked");
     }
 
     #[test]
@@ -1173,7 +1528,7 @@ mod tests {
         let mut e = engine();
         let mut fired = false;
         let mut seq = 0u32;
-        for ext in 1000..1006 {
+        for ext in 1000..1014 {
             // a few tries per extension, as a real scanner paces it
             for _ in 0..4 {
                 let reg = reg_probe(seq, &ext.to_string());
@@ -1231,30 +1586,42 @@ mod tests {
     }
 
     #[test]
-    fn a_source_that_registers_successfully_is_not_a_reg_scanner() {
-        // A NAT/gateway behind one IP: many REGISTERs, but at least one succeeds. Never
-        // flagged, however many attempts.
+    fn a_nat_whose_phones_register_successfully_is_not_a_reg_scanner() {
+        // A NAT/gateway behind one IP: each phone succeeds. The successful AOR is removed
+        // from the probe set, so a real NAT with captured responses is not an enumerator.
         let mut e = engine();
-        // one successful registration from this IP
-        e.observe_packet(peer(), switch(), &register(1, true), t(0));
-        e.observe_packet(switch(), peer(), &response(1, 200), t(1));
-        // then plenty more REGISTER attempts (e.g., other phones behind the NAT)
         let mut ever = false;
-        for i in 2..20u32 {
-            let reg = format!(
-                "REGISTER sip:pbx SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z{i}\r\n\
-                 From: <sip:{i}@pbx>;tag=t\r\nTo: <sip:{i}@pbx>\r\n\
-                 Call-ID: c{i}\r\nCSeq: {i} REGISTER\r\n\r\n"
-            );
+        for i in 0..10u32 {
+            let ext = format!("30{i:02}");
+            e.observe_packet(peer(), switch(), &register_ext(i, &ext, true), t(i));
             ever |= matches!(
-                e.observe(peer(), reg.as_bytes(), t(i * 5)),
+                e.observe_packet(switch(), peer(), &response(i, 200), t(i + 1))
+                    .1,
                 Decision::RegScan { .. }
             );
         }
         assert!(
             !ever,
-            "a source with a successful registration is not an enumerator"
+            "a NAT whose phones register successfully is not enumerating"
         );
+        assert_eq!(e.stats.reg_scans, 0);
+    }
+
+    #[test]
+    fn one_success_does_not_exempt_a_source_from_enumerating_other_aors() {
+        // The security trade-off: a valid registration for one AOR no longer suppresses
+        // RegScan for every other extension. An attacker with one valid account cannot
+        // enumerate with impunity; a phone/NAT that has not yet completed the other lines
+        // is still protected by the distinct-AOR threshold.
+        let mut e = engine();
+        e.observe_packet(peer(), switch(), &register(1, true), t(0));
+        e.observe_packet(switch(), peer(), &response(1, 200), t(1));
+        let mut fired = false;
+        for i in 2..(2 + REG_SCAN_EXTENSIONS as u32) {
+            let reg = reg_probe(i, &format!("40{i}"));
+            fired |= matches!(e.observe(peer(), &reg, t(i * 5)), Decision::RegScan { .. });
+        }
+        assert!(fired, "one success must not exempt the other AORs");
     }
 
     #[test]
@@ -1342,6 +1709,57 @@ mod tests {
     }
 
     #[test]
+    fn a_response_from_a_different_source_is_ignored() {
+        // The responder is pinned when the request is recorded. A forged 200 from another
+        // address must not mark the peer known-good or count as an authentication success.
+        let mut e = engine();
+        e.observe_packet(peer(), switch(), &register(1, true), t(0));
+        let attacker = Ipv4Addr::new(198, 51, 100, 1);
+        let (_, d) = e.observe_packet(attacker, peer(), &response(1, 200), t(1));
+        assert!(matches!(d, Decision::OutOfScope(_)));
+        assert_eq!(e.stats.auth_ok, 0);
+        assert!(!e.is_known_peer(peer(), t(1)));
+
+        // The real responder still matches.
+        let (_, d) = e.observe_packet(switch(), peer(), &response(1, 200), t(2));
+        assert!(matches!(d, Decision::OutOfScope(_)));
+        assert_eq!(e.stats.auth_ok, 1);
+        assert!(e.is_known_peer(peer(), t(2)));
+    }
+
+    #[test]
+    fn an_authenticated_invite_success_does_not_mark_known_good() {
+        // Only a successful REGISTER proves a registered peer. A 2xx to an authenticated
+        // INVITE is a call, not a registration, and used to grant seven days of immunity.
+        let mut e = engine();
+        e.observe_packet(peer(), switch(), &invite_auth(1, "00442039967796"), t(0));
+        e.observe_packet(switch(), peer(), &invite_response(1, 200), t(1));
+        assert_eq!(e.stats.auth_ok, 1);
+        assert!(!e.is_known_peer(peer(), t(1)));
+    }
+
+    #[test]
+    fn one_success_does_not_clear_failures_for_another_aor() {
+        // Four failures for 1001, a success for 2002, then one more failure for 1001. The
+        // valid account must not wipe the other account's run.
+        let mut e = engine();
+        for n in 0..4u32 {
+            e.observe_packet(peer(), switch(), &register_ext(n, "1001", true), t(n));
+            e.observe_packet(switch(), peer(), &response(n, 401), t(n));
+        }
+        e.observe_packet(peer(), switch(), &register_ext(4, "2002", true), t(4));
+        e.observe_packet(switch(), peer(), &response(4, 200), t(4));
+        let (_, d) = {
+            e.observe_packet(peer(), switch(), &register_ext(5, "1001", true), t(5));
+            e.observe_packet(switch(), peer(), &response(5, 401), t(5))
+        };
+        assert!(
+            matches!(d, Decision::AuthFailure { .. }),
+            "a valid 2002 must not clear the 1001 run"
+        );
+    }
+
+    #[test]
     fn a_retransmitted_challenge_counts_once() {
         // UDP retransmits. Counting the same rejection three times would reach five after
         // two real attempts — and the operator would never work out why.
@@ -1376,7 +1794,7 @@ mod tests {
         // verdict is a stop, and neither needs a response to be seen.
         let mut e = engine();
         let mut caught = false;
-        for n in 0..20 {
+        for n in 0..60 {
             let (_, d) = e.observe_packet(peer(), switch(), &register(n, true), t(n));
             caught |= matches!(d, Decision::RegScan { .. } | Decision::AuthAbuse { .. });
         }

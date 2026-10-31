@@ -5,12 +5,14 @@
 //!
 //! The perimeter already enforces: a source condemned by user-agent, URI injection or
 //! credential brute force goes into a map the XDP program consults, and vanishes from
-//! sngrep. The **fraud** verdict is not enforced yet — the forged `603` is still missing.
+//! sngrep. The **fraud** verdict is report-only by default; `--enforce-behavioural` adds a
+//! source-level XDP block. The forged `603` is still missing.
 //!
 //! Needs `CAP_NET_RAW` (capture), plus `CAP_BPF` and `CAP_NET_ADMIN` (XDP).
 
 use tfps::{apiban, config, say, store, xdp};
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::Ipv4Addr;
@@ -20,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tfps_core::dialplan::DialPlan;
-use tfps_core::disposition::{disposition, Disposition};
+use tfps_core::disposition::{disposition, is_one_way, Disposition};
 use tfps_core::engine::{Decision, Engine, Mode};
 use tfps_core::net::{classify_other, parse_ipv4_udp, tcp_ports, NotUdp};
 use tfps_core::novelty::Timestamp;
@@ -48,6 +50,8 @@ struct Args {
     intl_prefixes: Vec<String>,
     learn_secs: u32,
     behavioural: bool,
+    /// Enforce a behavioural Block in XDP (off by default; requires --behavioural).
+    enforce_behavioural: bool,
     stats_every: u64,
     verbose: bool,
     debug_unparsed: bool,
@@ -56,6 +60,8 @@ struct Args {
     iface: Option<String>,
     block_ttl: u64,
     no_enforce: bool,
+    /// Report one-way perimeter evidence but do not enforce it (spoofable source).
+    no_enforce_one_way: bool,
     db: PathBuf,
     /// `manual_log_dir` from the configuration file.
     manual_log_dir: Option<PathBuf>,
@@ -82,6 +88,7 @@ impl Default for Args {
             intl_prefixes: vec!["+".into(), "00".into(), "011".into(), "9011".into()],
             learn_secs: 30 * 24 * 3600,
             behavioural: false,
+            enforce_behavioural: false,
             stats_every: 60,
             verbose: false,
             debug_unparsed: false,
@@ -92,6 +99,7 @@ impl Default for Args {
             // re-blocked on its first packet — the cost of being wrong is one hour.
             block_ttl: 3600,
             no_enforce: false,
+            no_enforce_one_way: false,
             db: PathBuf::from(store::DEFAULT_PATH),
             manual_log_dir: None,
             reapply_manual_bans: false,
@@ -127,10 +135,13 @@ USAGE: tfps [options]
       --drop-map PATH      a drop map already pinned by another product
       --block-ttl N        seconds a block lasts       (default: 3600, 0 = never expires)
       --no-enforce         observe only, do not load XDP
+      --no-enforce-one-way report one-way evidence but do not block it
+      --enforce-one-way    override a config that enabled one-way report-only
+      --enforce-behavioural enforce behavioural Block in XDP (requires --behavioural)
+      --no-enforce-behavioural report-only behavioural verdicts (default)
       --db PATH            SQLite database             (default: /var/lib/tfps/tfps.db)
       --no-db              do not persist (learning dies on restart)
       --checkpoint-every N seconds between writes      (default: 300)
-      --apiban-key KEY     enable APIBAN (optional, in the background)
       --ignoreip CIDR      never enforce against this address or network (repeatable)
       --home-country ISO   your own country, not treated as international (repeatable)
       --signatures PATH    file that ADDS signatures to the built-in ones
@@ -139,6 +150,10 @@ USAGE: tfps [options]
 
 Capture is AF_PACKET; it opens no UDP socket and does not clash with the softswitch.
 Requires CAP_NET_RAW (run as root).
+
+DISCLAIMER: TFPS cannot detect every type of fraud. It sees SIP on the wire only.
+Behavioural detection is experimental; it is report-only unless --enforce-behavioural is set.
+Use at your own risk.
 "
 }
 
@@ -175,6 +190,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--active" => a.learn_secs = 0,
             "--behavioural" | "--fraud" => a.behavioural = true,
+            "--enforce-behavioural" => a.enforce_behavioural = true,
+            "--no-enforce-behavioural" => a.enforce_behavioural = false,
             "--stats-every" => {
                 a.stats_every = next("--stats-every")?.parse().map_err(|e| format!("{e}"))?;
             }
@@ -187,9 +204,12 @@ fn parse_args() -> Result<Args, String> {
                 a.block_ttl = next("--block-ttl")?.parse().map_err(|e| format!("{e}"))?;
             }
             "--no-enforce" => a.no_enforce = true,
+            "--no-enforce-one-way" => a.no_enforce_one_way = true,
+            "--enforce-one-way" => a.no_enforce_one_way = false,
             "--db" => a.db = PathBuf::from(next("--db")?),
             "--no-db" => a.db = PathBuf::new(),
-            "--apiban-key" => a.apiban_key = Some(next("--apiban-key")?),
+            // The key is a secret: accept config only, never argv (/proc/<pid>/cmdline and
+            // shell history are readable by local users).
             "--ignoreip" => a.ignoreip.push(next("--ignoreip")?),
             "--home-country" => a.home_countries.push(next("--home-country")?),
             "--signatures" => a.signatures = Some(PathBuf::from(next("--signatures")?)),
@@ -248,9 +268,17 @@ fn apply_config(a: &mut Args, c: &config::Config) {
         if let Some(d) = c.learn_days {
             a.learn_secs = d.saturating_mul(24 * 3600);
         }
-        if c.behavioural {
-            a.behavioural = true;
-        }
+    }
+    // The file can enable the layer regardless of a CLI --active/--learn-days; those only
+    // choose the window, not whether the layer exists.
+    if c.behavioural {
+        a.behavioural = true;
+    }
+    if !a.given.contains("--enforce-behavioural") && !a.given.contains("--no-enforce-behavioural") {
+        a.enforce_behavioural = c.enforce_behavioural;
+    }
+    if !a.given.contains("--no-enforce-one-way") && !a.given.contains("--enforce-one-way") {
+        a.no_enforce_one_way = c.no_enforce_one_way;
     }
 
     for (ip, pc) in &c.peers {
@@ -354,6 +382,9 @@ fn main() -> ExitCode {
     if args.behavioural {
         engine = engine.with_behavioural();
     }
+    if args.enforce_behavioural && !args.behavioural {
+        eprintln!("WARNING: --enforce-behavioural has no effect without --behavioural");
+    }
     let unknown_home = engine.set_home_countries(args.home_countries.iter().map(String::as_str));
     for iso in &unknown_home {
         eprintln!("WARNING: home country \"{iso}\" is not a known ISO label — ignored");
@@ -421,6 +452,9 @@ fn main() -> ExitCode {
     }
 
     say!("tfps {} — starting", env!("CARGO_PKG_VERSION"));
+    say!(
+        "  disclaimer        : TFPS cannot detect every fraud type; behavioural detection is experimental and report-only unless --enforce-behavioural is set. Use at your own risk."
+    );
     say!("  watched ports     : {:?}", args.ports);
     say!("  intl prefixes     : {:?}", args.intl_prefixes);
     // The NANPA footgun: a bare "1" stripped as a prefix turns 1-212-… into 212… which
@@ -470,13 +504,33 @@ fn main() -> ExitCode {
         match mode {
             // The mode is announced loudly and repeated: this project's difference from
             // fail2ban is that the incumbent fails silently (`SPEC.md` §12).
-            Mode::Active => say!("  mode              : FRAUD DETECTION, ACTIVE — would block right away"),
+            Mode::Active => {
+                if args.enforce_behavioural && !args.no_enforce {
+                    say!(
+                        "  mode              : FRAUD DETECTION, ACTIVE — ENFORCING source-level XDP block (ttl {}s)",
+                        args.block_ttl
+                    );
+                } else if args.enforce_behavioural {
+                    say!(
+                        "  mode              : FRAUD DETECTION, ACTIVE — REPORT-ONLY (--no-enforce overrides --enforce-behavioural)"
+                    );
+                } else {
+                    say!(
+                        "  mode              : FRAUD DETECTION, ACTIVE — REPORT-ONLY (use --enforce-behavioural to block)"
+                    );
+                }
+            }
             Mode::Learning { until } => say!(
                 "  mode              : FRAUD DETECTION, LEARNING for {} days (until {}), does NOT block",
                 args.learn_secs / 86400,
                 until.0
             ),
         }
+    }
+    if args.no_enforce_one_way {
+        say!(
+            "  one-way evidence  : REPORT-ONLY (user-agent, scanner, injection, ambiguous-header, reg-scan, auth-volume)"
+        );
     }
     // Enforcement: load XDP, or say so loudly and carry on observing. Never pretend.
     let mut enforcer = if args.no_enforce {
@@ -658,7 +712,7 @@ fn main() -> ExitCode {
                         if ignoreip.exempt(ip).is_some() || engine.is_known_peer(ip, start) {
                             continue;
                         }
-                        match e.block(ip, 0) {
+                        match e.block(ip, u64::from(APIBAN_RETENTION_SECS)) {
                             Ok(()) => restored += 1,
                             // Announcing a restore that did not happen would leave the
                             // operator believing in protection that is not there.
@@ -735,25 +789,30 @@ fn main() -> ExitCode {
                     let (subject, dec) = engine.observe_packet(d.src, d.dst, d.payload, t);
                     // Perimeter noise condemns the source: its next packets die at XDP,
                     // before the libpcap tap, and vanish from sngrep.
-                    let reason = match &dec {
-                        Decision::Noise { signature } => Some(("user-agent", *signature)),
-                        Decision::Scanner { id } => Some(("scanner", *id)),
-                        Decision::Injection { pattern } => Some(("injection", *pattern)),
-                        Decision::AuthFailure { .. } => Some(("auth-failed", "rejected")),
-                        Decision::RegScan { .. } => Some(("reg-scan", "no-success")),
-                        Decision::AuthAbuse { .. } => Some(("auth-volume", "no-answer")),
-                        _ => None,
-                    };
+                    // A behavioural Block is enforced only when the operator asked for
+                    // it. It goes through the same disposition gate (ignoreip first) and
+                    // is written to XDP for block_ttl; the forged 603 is still missing.
+                    let reason = enforcement_reason(&dec, args.enforce_behavioural);
+                    let reason = reason
+                        .as_ref()
+                        .map(|(kind, detail)| (*kind, detail.as_ref()));
                     let exempt = reason.and_then(|_| ignoreip.exempt(subject).map(str::to_string));
+                    // One-way evidence is a request with no response from the expected
+                    // responder. A UDP source can be spoofed, so with
+                    // --no-enforce-one-way it is reported but never written to the block
+                    // map. Auth-failure is response-based and still enforces.
+                    let one_way = reason.is_some_and(|(kind, _)| is_one_way(kind));
                     // A total match, not a chain: the defect this replaces was a
                     // missing arm, and a chain can silently lack one where an
                     // exhaustive match cannot. `SPEC.md` §12 makes silence an alarm.
-                    match disposition(
-                        reason,
-                        exempt.as_deref(),
-                        engine.is_known_peer(subject, t),
-                        enforcer.is_some(),
-                    ) {
+                    // A registered IP no longer bypasses active perimeter evidence. A
+                    // compromised PBX with valid credentials (the target threat) would
+                    // otherwise be immune to injection, auth-failure, registration-scan and
+                    // auth-volume rules for seven days. The APIBAN integration still honours
+                    // known peers, because that feed is third-party reputation, not our own
+                    // observation.
+                    let enforcing = enforcer.is_some() && !(args.no_enforce_one_way && one_way);
+                    match disposition(reason, exempt.as_deref(), false, enforcing) {
                         Disposition::Ignore => {}
                         Disposition::ExemptIgnoreIp { kind, detail, rule } => {
                             // Judged, reported, not enforced. Staying silent here would hide
@@ -774,10 +833,14 @@ fn main() -> ExitCode {
                             // Observing only. Nothing is blocked and nothing is written to
                             // the audit log, which has no column to say a block did not
                             // happen — but the operator is told, which is the whole point of
-                            // running with --no-enforce. Same shape as the behavioural
-                            // layer's WOULD BLOCK (learning) line.
+                            // running with --no-enforce / --no-enforce-one-way.
+                            let why = if args.no_enforce_one_way && one_way {
+                                "one-way report-only"
+                            } else {
+                                "observe only"
+                            };
                             say!(
-                                "WOULD BLOCK peer={subject} reason={kind} detail={detail} (observe only)"
+                                "WOULD BLOCK peer={subject} reason={kind} detail={detail} ({why})"
                             );
                         }
                         Disposition::Block { kind, detail } => {
@@ -840,7 +903,12 @@ fn main() -> ExitCode {
                             d.payload.len()
                         );
                     }
-                    report(&dec, subject, args.verbose);
+                    // When enforcement is on, the BLOCKED/EXEMPT/WOULD BLOCK line from
+                    // disposition already carries the reason; do not also print the
+                    // report-only BLOCK line.
+                    if !(args.enforce_behavioural && matches!(&dec, Decision::Block { .. })) {
+                        report(&dec, subject, args.verbose);
+                    }
                 }
             }
         }
@@ -866,7 +934,7 @@ fn main() -> ExitCode {
                     &batch.ips,
                     |ip| ignoreip.exempt(ip).map(str::to_string),
                     |ip| engine.is_known_peer(ip, t),
-                    |ip| e.block(ip, 0),
+                    |ip| e.block(ip, u64::from(APIBAN_RETENTION_SECS)),
                 );
                 for (ip, rule) in &applied.exempt {
                     say!("APIBAN: {ip} not blocked, ignoreip={rule}");
@@ -948,15 +1016,22 @@ fn main() -> ExitCode {
                     if let Err(e) = s.meta_set(
                         "calibration",
                         &format!(
-                            "theta0_prefix={:.3} theta0c={:.3} prior_mean={:.2}",
-                            p.theta0_prefix, p.theta0c, p.prior_mean
+                            "theta0_prefix={:.3} theta0_range={:.3} theta0c={:.3} prior_mean={:.2}",
+                            p.theta0_prefix, p.theta0_range, p.theta0c, p.prior_mean
                         ),
                     ) {
                         eprintln!("WARNING: could not write calibration at checkpoint: {e}");
                     }
                     match s.checkpoint(&engine) {
-                        Ok((n, _)) if args.verbose => say!("    checkpoint: {n} sources written"),
-                        Ok(_) => {}
+                        Ok((n, _)) => {
+                            engine.clear_anomaly_dirty();
+                            s.peer_anomaly_prune(
+                                t.0.saturating_sub(tfps::store::PEER_RETENTION_SECS),
+                            );
+                            if args.verbose {
+                                say!("    checkpoint: {n} sources written");
+                            }
+                        }
                         Err(e) => eprintln!("ALARM: checkpoint failed — {e}"),
                     }
                 }
@@ -1056,13 +1131,42 @@ fn main() -> ExitCode {
     }
 }
 
+fn enforcement_reason(
+    dec: &Decision,
+    enforce_behavioural: bool,
+) -> Option<(&'static str, Cow<'static, str>)> {
+    match dec {
+        Decision::Noise { signature } => Some(("user-agent", Cow::Borrowed(signature))),
+        Decision::Scanner { id } => Some(("scanner", Cow::Borrowed(id))),
+        Decision::Injection { pattern } => Some(("injection", Cow::Borrowed(pattern))),
+        Decision::Malformed { header } => Some(("ambiguous-header", Cow::Borrowed(header))),
+        Decision::AuthFailure { .. } => Some(("auth-failed", Cow::Borrowed("rejected"))),
+        Decision::RegScan { .. } => Some(("reg-scan", Cow::Borrowed("no-success"))),
+        Decision::AuthAbuse { .. } => Some(("auth-volume", Cow::Borrowed("no-answer"))),
+        Decision::Block {
+            country,
+            evidence_nats,
+            countries,
+        } if enforce_behavioural => Some((
+            "behavioural",
+            Cow::Owned(format!(
+                "country={country} evidence={evidence_nats}nats distinct_countries={countries}"
+            )),
+        )),
+        _ => None,
+    }
+}
+
 fn report(dec: &Decision, peer: Ipv4Addr, verbose: bool) {
     match dec {
-        Decision::Block { country, bits, countries } => say!(
-            "BLOCK peer={peer} country={country} evidence={bits}bits distinct_countries={countries}"
+        Decision::Block { country, evidence_nats, countries } => say!(
+            "BLOCK (report-only, not enforced) peer={peer} country={country} evidence_nats={evidence_nats} distinct_countries={countries}"
         ),
-        Decision::WouldBlock { country, bits, countries } => say!(
-            "WOULD BLOCK (learning) peer={peer} country={country} evidence={bits}bits distinct_countries={countries}"
+        Decision::WouldBlock { country, evidence_nats, countries } => say!(
+            "WOULD BLOCK (learning) peer={peer} country={country} evidence_nats={evidence_nats} distinct_countries={countries}"
+        ),
+        Decision::Warming { country, evidence_nats, countries } => say!(
+            "WARMING peer={peer} country={country} evidence_nats={evidence_nats} distinct_countries={countries} (source warm-up; not blocked)"
         ),
         Decision::Noise { signature } if verbose => {
             say!("noise peer={peer} signature={signature}")
@@ -1073,6 +1177,10 @@ fn report(dec: &Decision, peer: Ipv4Addr, verbose: bool) {
         }
         Decision::Injection { pattern } if verbose => {
             say!("injection peer={peer} pattern={pattern}")
+        }
+        Decision::Malformed { header } => {
+            // Always visible: a duplicate singleton header is a smuggling signal.
+            say!("MALFORMED peer={peer} duplicate_header={header}")
         }
         Decision::AuthFailure { failures } => {
             // Always visible: a run of rejected credentials is the precursor of Chain A.
@@ -1122,8 +1230,11 @@ fn counter_line(s: &tfps_core::engine::Stats) -> String {
         ("intl", s.international),
         ("unknown_country", s.unknown_country),
         ("first_time", s.novel),
+        ("range_novel", s.range_novel),
         ("blocks", s.blocks),
         ("would_block", s.would_block),
+        ("warming", s.warming),
+        ("known_dropped", s.known_peers_dropped),
         ("pairs_dropped", s.pairs_dropped),
         ("peers_dropped", s.peers_dropped),
     ]
@@ -1187,6 +1298,71 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_behavioural_block_is_only_enforced_when_the_flag_is_set() {
+        let dec = Decision::Block {
+            country: "GB",
+            evidence_nats: 12,
+            countries: 7,
+        };
+        assert!(enforcement_reason(&dec, false).is_none());
+        let (kind, detail) = enforcement_reason(&dec, true).expect("enforcing");
+        assert_eq!(kind, "behavioural");
+        assert!(detail.contains("country=GB"));
+        assert!(detail.contains("evidence=12nats"));
+    }
+
+    #[test]
+    fn malformed_is_mapped_to_the_one_way_reason() {
+        let dec = Decision::Malformed { header: "From" };
+        let (kind, detail) = enforcement_reason(&dec, false).expect("condemned");
+        assert_eq!(kind, "ambiguous-header");
+        assert_eq!(detail, "From");
+        assert!(is_one_way(kind));
+    }
+
+    #[test]
+    fn behavioural_enforcement_can_be_enabled_in_config_even_with_active() {
+        let on: config::Config =
+            serde_json::from_str(r#"{"behavioural": true, "enforce_behavioural": true}"#)
+                .expect("parses");
+        let mut a = Args::default();
+        a.given.insert("--active".into());
+        apply_config(&mut a, &on);
+        assert!(
+            a.behavioural,
+            "the file can enable the layer alongside --active"
+        );
+        assert!(a.enforce_behavioural);
+
+        let mut b = Args::default();
+        b.given.insert("--no-enforce-behavioural".into());
+        apply_config(&mut b, &on);
+        assert!(!b.enforce_behavioural, "the CLI can override the file");
+    }
+
+    #[test]
+    fn one_way_report_only_can_be_set_in_config_and_overridden_on_the_cli() {
+        let on: config::Config =
+            serde_json::from_str(r#"{"no_enforce_one_way": true}"#).expect("parses");
+        let mut a = Args::default();
+        apply_config(&mut a, &on);
+        assert!(a.no_enforce_one_way, "the file can opt in");
+
+        let mut b = Args::default();
+        b.given.insert("--enforce-one-way".into());
+        apply_config(&mut b, &on);
+        assert!(!b.no_enforce_one_way, "the CLI can override the file");
+
+        let mut c = Args {
+            no_enforce_one_way: true, // what parse_args does for the flag
+            ..Default::default()
+        };
+        c.given.insert("--no-enforce-one-way".into());
+        apply_config(&mut c, &serde_json::from_str("{}").expect("parses"));
+        assert!(c.no_enforce_one_way);
+    }
 
     #[test]
     fn the_manual_record_settings_come_from_the_config_file() {

@@ -18,6 +18,8 @@
 //!   "ignoreip": ["10.0.0.0/8", "203.0.113.7"],
 //!   "home_countries": ["BR"],
 //!   "behavioural": false,
+//!   "enforce_behavioural": false,
+//!   "no_enforce_one_way": false,
 //!   "apiban_key": "...",
 //!   "learn_days": 30,
 //!   "block_ttl": 3600
@@ -87,11 +89,23 @@ pub struct Config {
     /// being judged as an international destination.
     #[serde(default)]
     pub home_countries: Vec<String>,
-    /// Turn on behavioural fraud detection (country novelty and the rest). **Off by
+    /// Turn on behavioural fraud detection (dialling-prefix and destination-range novelty). **Off by
     /// default**: the product is noise reduction, and the behavioural layer is an opt-in
     /// extra most installs will not need.
     #[serde(default)]
     pub behavioural: bool,
+    /// Enforce a behavioural `Block` by writing the source into XDP for `block_ttl`.
+    /// **Off by default**: the behavioural verdict is report-only unless the operator opts
+    /// in. It requires `behavioural: true`; learning mode still never blocks.
+    #[serde(default)]
+    pub enforce_behavioural: bool,
+    /// Do not enforce **one-way** perimeter evidence: user-agent noise, scanner identity,
+    /// Request-URI injection, duplicate singleton headers, registration scanning and the
+    /// auth-volume backstop. Those verdicts are still reported, but nothing is written to
+    /// the block map. Response-based evidence (a rejected credential) and the APIBAN feed
+    /// keep enforcing. Off by default: the current product blocks one-way evidence.
+    #[serde(default)]
+    pub no_enforce_one_way: bool,
     pub apiban_key: Option<String>,
     pub learn_days: Option<u32>,
     pub block_ttl: Option<u64>,
@@ -218,6 +232,29 @@ mod tests {
     fn an_absent_file_is_not_an_error() {
         let p = std::path::Path::new("/path/that/does/not/exist/config.json");
         assert!(matches!(load(p), Loaded::Absent));
+    }
+
+    #[test]
+    fn behavioural_enforcement_is_off_by_default_and_opt_in() {
+        assert!(!parse("{}").expect("empty").enforce_behavioural);
+        assert!(
+            parse(r#"{"enforce_behavioural": true}"#)
+                .expect("parses")
+                .enforce_behavioural
+        );
+    }
+
+    #[test]
+    fn one_way_enforcement_is_off_by_default_and_opt_in() {
+        assert!(
+            !parse("{}").expect("empty").no_enforce_one_way,
+            "the current product still enforces one-way evidence"
+        );
+        assert!(
+            parse(r#"{"no_enforce_one_way": true}"#)
+                .expect("parses")
+                .no_enforce_one_way
+        );
     }
 
     #[test]

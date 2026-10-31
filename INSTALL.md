@@ -85,7 +85,7 @@ Configuration lives in `/etc/tfps/config.json`; every field is optional and the 
 ## Pinning a version
 
 ```sh
-curl -fsSL https://tfps.co/install.sh | TFPS_VERSION=v0.2.0 sh
+curl -fsSL https://tfps.co/install.sh | TFPS_VERSION=v0.3.0 sh
 ```
 
 `TFPS_VERSION` is a tag from the [releases page](https://github.com/sippulse/tfps/releases).
@@ -169,3 +169,11 @@ Stopping the service removes the XDP program from the interface, so no block out
 - **Checksum mismatch** — the download did not match the SHA-256 published with the
   release. Nothing was installed. Run again; if it repeats, something between you and
   GitHub is altering the file.
+
+## Disclaimer
+
+TFPS cannot catch every possible type of fraud; it sees SIP on the wire only. Behavioural
+detection is experimental and report-only by default (source-level XDP blocking is opt-in
+with `--enforce-behavioural`). Use it at your own risk, validate it on
+your traffic, and do not treat it as a substitute for a security audit or financial
+controls. The software is provided **AS IS**, under Apache-2.0, without warranty.

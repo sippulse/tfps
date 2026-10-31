@@ -8,7 +8,7 @@
 #     ebpf/tfps_xdp.c                      compiled on the target against its own BTF
 #     packaging/tfps.service  config.example.json  install.sh
 #
-# Cut a release with:   git tag v0.2.0 && git push origin v0.2.0
+# Cut a release with:   git tag v0.3.0 && git push origin v0.3.0
 name: release
 
 on:
@@ -37,7 +37,7 @@ jobs:
           cargo test --workspace
 
       - name: build
-        run: cargo build --release --target x86_64-unknown-linux-musl
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
 
       - name: package
         run: |

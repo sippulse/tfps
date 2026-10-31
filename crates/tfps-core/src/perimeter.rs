@@ -44,8 +44,9 @@ static SIGNATURES: &[(&str, Match)] = &[
 ///
 /// Inherited from rule **R12** of the 2023 `tfps.m4`, which ran seven checks over `$au`,
 /// `$ru`, `$rU`, `$fU`, `$fu` and `Contact`. Unlike a user-agent, this has **no innocent
-/// explanation**: no phone puts a single quote or `--` in the `From` header. That makes it
-/// a higher-confidence signal than the tool list.
+/// explanation** in a dialled Request-URI: no real destination carries a single quote or
+/// `--`. The engine deliberately scans only the Request-URI, not From/To user names, which
+/// can legitimately be names (`o'brien@`, `select@`).
 static INJECTION: &[&str] = &[
     "'",   // single quote — the classic
     "%27", // percent-encoded single quote
@@ -331,7 +332,8 @@ impl NoiseFilter {
 /// Five in ten minutes matches the `maxretry`/`findtime` defaults of the `fail2ban`
 /// Asterisk jail — deliberately, since that threshold has a decade of field use behind it.
 /// The difference is where the evidence comes from: the wire, immediately, instead of a log
-/// file that the softswitch may not even be writing.
+/// file that the softswitch may not even be writing. Counted per AOR: a success for one
+/// account must not wipe a run against another.
 pub const AUTH_FAILURES_TO_BLOCK: usize = 5;
 
 /// Window for the failure counter, in seconds.
@@ -349,14 +351,14 @@ pub const AUTH_FAILURE_WINDOW_SECS: u32 = 600;
 ///
 /// It is looser than the failure rule because it cannot tell success from failure, only
 /// volume: a legitimate phone sends one per registration cycle, typically every 300 s.
-pub const AUTH_ATTEMPTS_TO_BLOCK: usize = 20;
+pub const AUTH_ATTEMPTS_TO_BLOCK: usize = 50;
 
 /// Window for the backstop above, in seconds.
 ///
 /// Measured on the reference server: **2 challenges in 45 s** of legitimate traffic, about
-/// 2.7/min. Twenty per minute leaves roughly 7× headroom. A large NAT aggregating many
-/// phones can still approach it — which the failure rule above does not suffer from, and
-/// which is why the block is temporary either way.
+/// 2.7/min. Fifty per minute leaves roughly 18× headroom. A large NAT aggregating many
+/// phones can still approach it — which is why the rule is a backstop, the block is
+/// temporary, and a NAT belongs in `ignoreip`.
 pub const AUTH_WINDOW_SECS: u32 = 60;
 
 /// A sliding count of the last `N` events, sized exactly to the threshold it serves.
@@ -466,24 +468,94 @@ impl<const N: usize> RegProbes<N> {
             .count() as u32
     }
 
-    /// Forgets everything. Called when a registration is **accepted**: a source that has
-    /// logged in even once is not an enumerator.
+    /// Forgets one accepted AOR. A success for one extension must not wipe the probes of
+    /// every other extension: that was the enumeration bypass.
+    pub fn remove(&mut self, id: u64) {
+        for i in 0..self.len as usize {
+            if self.ids[i] == id {
+                self.ids[i] = u64::MAX;
+                self.stamps[i] = 0;
+            }
+        }
+    }
+
+    /// Forgets everything. Kept for tests that need a clean ring.
     pub fn clear(&mut self) {
         self.len = 0;
         self.next = 0;
     }
 }
 
-/// Failed authentications for one source — requests that carried a credential and were
-/// rejected.
-pub type AuthFailures = SlidingCount<AUTH_FAILURES_TO_BLOCK>;
+/// Failed authentications for one source, tracked **per AOR**.
+///
+/// A single successful login must not wipe failures recorded while guessing a *different*
+/// account: an attacker holding one valid credential could otherwise alternate it with
+/// guesses and keep the counter at zero forever. The ring has the same five slots; the
+/// threshold counts only failures for the same AOR in the window.
+#[derive(Debug, Clone)]
+pub struct AuthFailures {
+    entries: [(u64, u32); AUTH_FAILURES_TO_BLOCK],
+    len: u8,
+    next: u8,
+}
+
+impl Default for AuthFailures {
+    fn default() -> Self {
+        Self {
+            entries: [(0, 0); AUTH_FAILURES_TO_BLOCK],
+            len: 0,
+            next: 0,
+        }
+    }
+}
+
+impl AuthFailures {
+    /// Records a rejection for `aor` and reports how many for that AOR fall inside `span`.
+    pub fn record(&mut self, aor: u64, now: u32, span: u32) -> (u32, bool) {
+        self.entries[self.next as usize] = (aor, now);
+        self.next = ((self.next as usize + 1) % AUTH_FAILURES_TO_BLOCK) as u8;
+        if (self.len as usize) < AUTH_FAILURES_TO_BLOCK {
+            self.len += 1;
+        }
+        let n = self.count_within(aor, now, span);
+        (n, n as usize >= AUTH_FAILURES_TO_BLOCK)
+    }
+
+    /// How many failures for `aor` fall inside `span`.
+    pub fn count_within(&self, aor: u64, now: u32, span: u32) -> u32 {
+        self.entries[..self.len as usize]
+            .iter()
+            .filter(|(a, t)| *a == aor && now.saturating_sub(*t) < span)
+            .count() as u32
+    }
+
+    /// Forgets the failures for one accepted AOR.
+    pub fn clear_aor(&mut self, aor: u64) {
+        for entry in &mut self.entries[..self.len as usize] {
+            if entry.0 == aor {
+                entry.0 = u64::MAX; // a sentinel that no real hash will match
+                entry.1 = 0;
+            }
+        }
+    }
+
+    /// Forgets everything. Kept for tests that need a clean ring.
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.next = 0;
+    }
+}
 
 /// Authenticated attempts for one source, regardless of outcome. The volume backstop.
 pub type AuthAttempts = SlidingCount<AUTH_ATTEMPTS_TO_BLOCK>;
 
 fn matches_sig(ua: &str, sig: &str, kind: Match) -> bool {
     match kind {
-        Match::Prefix => ua.len() >= sig.len() && ua[..sig.len()].eq_ignore_ascii_case(sig),
+        // Byte comparison, not `ua[..sig.len()]`: the User-Agent is arbitrary UTF-8 and a
+        // multibyte character straddling the signature length would panic the daemon.
+        Match::Prefix => {
+            ua.len() >= sig.len() && ua.as_bytes()[..sig.len()].eq_ignore_ascii_case(sig.as_bytes())
+        }
         Match::Exact => ua.eq_ignore_ascii_case(sig),
     }
 }
@@ -511,11 +583,7 @@ fn uri_addr(value: &str) -> Option<&str> {
         (Some(a), Some(b)) if b > a => &after_name[a + 1..b],
         _ => after_name,
     };
-    let start = inner
-        .find("sip:")
-        .map(|i| i + 4)
-        .or_else(|| inner.find("sips:").map(|i| i + 5))
-        .or_else(|| inner.find("tel:").map(|i| i + 4))?;
+    let start = crate::sip::find_scheme(inner)?;
     let rest = &inner[start..];
 
     // The boundary between the address and its parameters is the `@`: a `;` *before* it is
@@ -575,6 +643,19 @@ mod tests {
     }
 
     #[test]
+    fn a_multibyte_user_agent_does_not_panic() {
+        // The prefix matcher compares bytes. An earlier `ua[..sig.len()]` panicked when a
+        // multibyte character straddled a signature length; one UDP packet could abort the
+        // daemon and (on restart) drop the unpinned XDP block map.
+        let mut f = NoiseFilter::new();
+        for ua in ["aaaaaé", "éééé", "xéxx", "Grandstream GXP2140"] {
+            assert!(f.is_noise(Some(ua)).is_none(), "{ua}");
+        }
+        // Non-ASCII after a real signature still matches.
+        assert!(f.is_noise(Some("sipcli/é")).is_some());
+    }
+
+    #[test]
     fn a_missing_user_agent_is_not_noise() {
         // The Java-era TFPS saw 6,843 legitimate INVITEs with no user-agent. Treating
         // absence as noise would discard good traffic — and poison the volume measurement.
@@ -601,13 +682,14 @@ mod tests {
             "sip:?=?@pbx.com",
             "sip:1 union select@pbx.com",
             "sip:a;drop@pbx.com",
+            "SIP:1001'@pbx.com",
         ] {
             assert!(
                 f.injection_in_uri(&[Some(uri)]).is_some(),
                 "should catch injection in {uri}"
             );
         }
-        assert_eq!(f.injections(), 6);
+        assert_eq!(f.injections(), 7);
     }
 
     #[test]
@@ -822,7 +904,7 @@ mod tests {
         let mut f = AuthFailures::default();
         let mut fired = false;
         for i in 0..AUTH_FAILURES_TO_BLOCK as u32 {
-            let (_, b) = f.record(1000 + i * 30, AUTH_FAILURE_WINDOW_SECS);
+            let (_, b) = f.record(1001, 1000 + i * 30, AUTH_FAILURE_WINDOW_SECS);
             fired = b;
         }
         assert!(fired, "5 rejected credentials in 10 minutes must block");
@@ -835,10 +917,10 @@ mod tests {
         // attack.
         let mut f = AuthFailures::default();
         for i in 0..(AUTH_FAILURES_TO_BLOCK as u32 - 1) {
-            assert!(!f.record(1000 + i, AUTH_FAILURE_WINDOW_SECS).1);
+            assert!(!f.record(1001, 1000 + i, AUTH_FAILURE_WINDOW_SECS).1);
         }
-        f.clear();
-        let (n, blocks) = f.record(1100, AUTH_FAILURE_WINDOW_SECS);
+        f.clear_aor(1001);
+        let (n, blocks) = f.record(1001, 1100, AUTH_FAILURE_WINDOW_SECS);
         assert_eq!(n, 1, "the successful login wiped the slate");
         assert!(!blocks);
     }

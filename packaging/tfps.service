@@ -6,6 +6,8 @@ Wants=network-online.target
 
 [Service]
 StateDirectory=tfps
+StateDirectoryMode=0700
+UMask=0077
 Type=simple
 ExecStart=/usr/local/bin/tfps
 Restart=always

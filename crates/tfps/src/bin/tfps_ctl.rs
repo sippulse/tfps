@@ -1785,8 +1785,9 @@ fn source(args: &Args) -> Result<(), String> {
         say!("                    {}", chunk.join(" "));
     }
     say!(
-        "\nThe detector fires when a source's evidence — a burst of novel countries, \
-         several prefixes, or a volume spike against this baseline — crosses the bound."
+        "\nThe detector fires when a source's evidence — several dialling prefixes, a burst \
+         of novel destination ranges, or a volume spike against this baseline — crosses \
+         the bound."
     );
     Ok(())
 }
@@ -3054,8 +3055,8 @@ mod tests {
         );
     }
 
-    /// `calibration` is written as `theta0_prefix={:.3} theta0c={:.3}
-    /// prior_mean={:.2}` — floats. `"inf".parse::<f64>()` succeeds, so the
+    /// `calibration` is written as `theta0_prefix={:.3} theta0_range={:.3}
+    /// theta0c={:.3} prior_mean={:.2}` — floats. `"inf".parse::<f64>()` succeeds, so the
     /// non-finite hazard that made `rate` nullable applies here too: route it
     /// through the same `finite()` rule rather than letting serde decide.
     #[test]
