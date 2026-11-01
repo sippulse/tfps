@@ -318,31 +318,61 @@ not the per-call destination count.
 **Phase:** corroboration — "the call never came here." This is the original TRW mapping:
 connection failed = scan evidence.
 
-Every observed **final** response to an international INVITE is a Bernoulli trial:
+Every observed **final** response to an international INVITE is a trial, and the status code
+says more than "did not complete". Premium-number discovery from a compromised PBX or account
+dials invalid B-numbers, and what comes back is `404` (no such number) and `403` (you may not
+call there). A legitimate source mostly reaches people, who answer, ring out or are busy.
 
-- `2xx` → completed (benign evidence).
-- final `4xx`/`5xx`/`6xx` **to a first-contact range** → did not complete (scan evidence).
-- a failure to a range the source already calls → ignored: that is an outage, not a route
-  probe.
-- `3xx` → neither; ignored.
-- **Provisional `1xx`** → not an outcome; ignored.
+| status | outcome | evidence |
+|---|---|---|
+| `2xx` | completed | benign; ends a failure run |
+| `404` `410` `484` `485` `604` | **no such number** | strong, step `ln(θ₁c/θ₀u)` — to a first-contact range, **or to a number not among the source's last 16 calls** |
+| `403` | **refused** | strong, step `ln(θ₁c/θ₀u)` — to a first-contact range only |
+| `480` `486` `487` `600` `603` | unanswered | **none**, and **not a reset** — a person was rung |
+| any other `4xx`/`5xx`/`6xx` | failed | generic, step `ln(θ₁c/θ₀c)` — to a first-contact range only |
+| `1xx`, `3xx`, `401`/`407` | not an outcome | ignored |
+
+- **No such number counts inside a known range.** Discovery probes many invalid numbers within
+  one block; only the first is a first-contact range, so the novel-range rule alone missed the
+  rest. A `404` is a per-number answer, so a *new* number answered `404` is evidence wherever
+  it lands.
+- **A redial is not a probe.** The same number answered `404` again — a person redialling, a
+  dialer retrying, or a switch that answers `404` for a missing route (FreeSWITCH maps
+  `NO_ROUTE_DESTINATION` to `404`) — is treated as an outage. Each source remembers the hashes
+  of its last 16 B-numbers.
+- **A refusal is per-range policy.** A `403` to a range the source already calls is a barred
+  destination or a missing class of service, applied to every call there, so it is an outage
+  as far as this arm is concerned. A `403` to range after new range is a source finding out
+  where it may dial.
+- **Unanswered calls are not failures.** Busy, no answer, decline and a caller's `CANCEL` all
+  used to count as failed completions. They are now neither evidence nor a reset, so a
+  scanner cannot interleave `CANCEL`s to clear its run.
 - **`401`/`407` digest challenge** → the normal authentication handshake, **not** a failed
   completion, whether or not the INVITE carried a credential.
 - **Silence** → never fed. A softswitch that rejects probes without answering leaves this
   arm no evidence rather than false evidence. This is the same honesty the auth-failure rule
-  keeps.
+  keeps. Not every switch answers `404` for an unallocated number either; some send `503`.
+  The strong step is a bonus where the network is explicit, and its absence is not benign
+  evidence.
 
 ```
-on a failure:  Λ += ln(θ₁c / θ₀c)
-on a success:  Λ += ln((1−θ₁c) / (1−θ₀c))
+on no such number / refused:  Λ += ln(θ₁c / θ₀u)    (never less than the generic step)
+on another failure:           Λ += ln(θ₁c / θ₀c)
+on a success:                 Λ += ln((1−θ₁c) / (1−θ₀c))
 ```
+
+`θ₀u` is the benign rate of unroutable answers. It starts at `0.05` and is calibrated from the
+deployment like `θ₀c`, clamped to `[0.005, 0.3]` and never above `θ₀c`. At the defaults one
+unroutable answer is worth 2.83 nats against 1.45 for a generic failure, so a probe paced at
+one call every five minutes still crosses the bound, where the same pace of generic failures
+leaks away.
 
 The completion arm has its own decay clock (`last_completion`), so an INVITE never dilutes
 its decay. An **authenticated** INVITE is fed here too: the auth path and the completion
 path claim their transactions independently. (An earlier implementation let the auth path
 consume the response first, leaving this arm blind to exactly the traffic it exists to
-watch.) The arm contributes only after **ten novel-range failures**
-(`COMPLETION_MIN_NOVEL_FAILURES`); a completed call resets the run.
+watch.) The arm contributes only after **ten counted failures** (`COMPLETION_MIN_FAILURES`); a
+completed call resets the run.
 
 ### 4.4 Volume — hierarchical Gamma-Poisson surprise
 
@@ -398,6 +428,7 @@ a new international destination; `intl_prefixes` and `home_countries` fix that a
 | `θ₀_prefix` | `0.05` | benign first-contact rate, dialling prefix |
 | `θ₀_range` | `0.15` | benign first-contact rate, destination range |
 | `θ₀c` / `θ₁c` | `0.20` / `0.85` | benign / scanner failure rate, completion |
+| `θ₀u` | `0.05` | benign rate of `403`/no-such-number answers, completion |
 | `prior_mean` / `prior_strength` | `2.0` / `1.0` | volume prior (calls per hour) |
 | volume `decay` | `0.98` | forgetting per window |
 | `SCAN_HALFLIFE_SECS` | `600` | 10-minute half-life for the scan walks |
@@ -406,7 +437,8 @@ a new international destination; `intl_prefixes` and `home_countries` fix that a
 | `VOLUME_WINDOW_SECS` | `3600` | volume scoring period |
 | `PREFIX_MIN_NOVEL` | `4` | hard floor: novel prefixes in the 15-min window |
 | `RANGE_MIN_NOVEL` | `10` | hard floor: novel ranges in the 15-min window |
-| `COMPLETION_MIN_NOVEL_FAILURES` | `10` | hard floor: failed first-contact ranges |
+| `COMPLETION_MIN_FAILURES` | `10` | hard floor: counted completion failures |
+| `RECENT_NUMBERS` | `16` | B-numbers remembered per source, to tell a redial from a new number |
 | `VOLUME_MIN_PERIODS` | `6` | hard floor: completed scoring periods |
 | per-source warm-up | `24 h` / `20` international calls | no block before this |
 
@@ -565,7 +597,8 @@ Userspace counters survive in the checkpoint's `stats` line and are readable by
 `tfps_ctl stats`:
 
 `invites`, `international`, `domestic`, `unknown_country`, `first_time` (country),
-`range_novel`, `intl_ok`, `intl_fail`, `blocks`, `would_block`, `peers_dropped`, plus the
+`range_novel`, `intl_ok`, `intl_fail`, `intl_unroutable` (the `403`/no-such-number share of
+`intl_fail`), `intl_unanswered` (busy / no answer / cancelled, not failures), `blocks`, `would_block`, `peers_dropped`, plus the
 perimeter counters. The prefix first-contact count (`prefix_novel`) is used for
 calibration but is not in the stats line.
 

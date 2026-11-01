@@ -1016,8 +1016,8 @@ fn main() -> ExitCode {
                     if let Err(e) = s.meta_set(
                         "calibration",
                         &format!(
-                            "theta0_prefix={:.3} theta0_range={:.3} theta0c={:.3} prior_mean={:.2}",
-                            p.theta0_prefix, p.theta0_range, p.theta0c, p.prior_mean
+                            "theta0_prefix={:.3} theta0_range={:.3} theta0c={:.3} theta0u={:.3} prior_mean={:.2}",
+                            p.theta0_prefix, p.theta0_range, p.theta0c, p.theta0u, p.prior_mean
                         ),
                     ) {
                         eprintln!("WARNING: could not write calibration at checkpoint: {e}");
@@ -1225,6 +1225,8 @@ fn counter_line(s: &tfps_core::engine::Stats) -> String {
         ("auth_chal", s.digest_challenges),
         ("intl_ok", s.intl_completed),
         ("intl_fail", s.intl_failed),
+        ("intl_unroutable", s.intl_unroutable),
+        ("intl_unanswered", s.intl_unanswered),
         ("auth_volume", s.auth_abuse),
         ("invites", s.invites),
         ("intl", s.international),
@@ -1262,7 +1264,7 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
         }
     };
     say!(
-        "--- mode={mode_label} packets={} sip={} responses={} keepalive={} not_sip={} noise={} ({}%) injection={} scanners={} reg_scan={} auth_att={} auth_fail={} auth_ok={} auth_chal={} auth_volume={} intl_ok={} intl_fail={} invites={} intl={} \
+        "--- mode={mode_label} packets={} sip={} responses={} keepalive={} not_sip={} noise={} ({}%) injection={} scanners={} reg_scan={} auth_att={} auth_fail={} auth_ok={} auth_chal={} auth_volume={} intl_ok={} intl_fail={} intl_unroutable={} intl_unanswered={} invites={} intl={} \
          unknown_country={} first_time={} blocks={} would_block={} sources={} ports={:?}",
         s.packets,
         s.sip_parsed,
@@ -1284,6 +1286,8 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
         s.auth_abuse,
         s.intl_completed,
         s.intl_failed,
+        s.intl_unroutable,
+        s.intl_unanswered,
         s.invites,
         s.international,
         s.unknown_country,
