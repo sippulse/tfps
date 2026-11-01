@@ -66,6 +66,19 @@ impl SeqTest {
         self.evidence()
     }
 
+    /// The log-likelihood ratio of one generic suspicious trial, `ln(θ₁/θ₀)`.
+    pub fn hit_step(&self) -> f64 {
+        self.step_hit
+    }
+
+    /// Records one suspicious trial whose likelihood ratio is not this test's own `θ₁/θ₀` —
+    /// an outcome rarer under the benign hypothesis than the generic hit. `step` is that
+    /// outcome's log-likelihood ratio, in nats.
+    pub fn observe_step(&mut self, step: f64) -> f64 {
+        self.llr = (self.llr + step).clamp(self.floor, self.upper + 1.0);
+        self.evidence()
+    }
+
     /// Adopts new hypotheses and bounds, keeping the walk where it stands. Used when the
     /// population estimate of the benign rate improves.
     pub fn recalibrate(&mut self, theta0: f64, theta1: f64, alpha: f64, beta: f64) {
@@ -106,8 +119,77 @@ pub const RANGE_WINDOW_SECS: u32 = 900;
 /// or two isolated events from being enough. They are the main false-positive control.
 pub const PREFIX_MIN_NOVEL: u32 = 4;
 pub const RANGE_MIN_NOVEL: u32 = 10;
-pub const COMPLETION_MIN_NOVEL_FAILURES: u32 = 10;
+pub const COMPLETION_MIN_FAILURES: u32 = 10;
 pub const VOLUME_MIN_PERIODS: u32 = 6;
+
+/// What the final response to an international `INVITE` says about the call.
+///
+/// The status code is not one bit. A `404` and a `486` are both "did not complete", but the
+/// first says the number does not exist and the second says a person was rung and was
+/// busy. Discovery of an international premium route is a stream of invalid B-numbers, and
+/// what comes back is `404`/`484`/`604` (no such number) and `403` (you may not call
+/// there). A compromised PBX or account dialling international and collecting those is the
+/// signature; a legitimate one mostly reaches people, who answer, ring out or are busy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOutcome {
+    /// `2xx`: the call was answered. Benign evidence, and it ends a failure run.
+    Completed,
+    /// `404`, `410`, `484`, `485`, `604`: the B-number does not exist or is incomplete. A
+    /// per-*number* answer, so it is evidence even inside a range the source already
+    /// calls — probing invalid numbers within one block is exactly route discovery — as
+    /// long as the number itself is new. A redial of one dead number is not a probe, and
+    /// some switches answer `404` for a missing route, so the same number failing over and
+    /// over is treated as the outage it may be.
+    NoSuchNumber,
+    /// `403`: the call was refused by policy (barred destination, no international class
+    /// of service). Strong evidence to a first-contact range; to a range the source
+    /// already calls it is a policy that applies to the whole range, like an outage.
+    Refused,
+    /// `480`, `486`, `487`, `600`, `603`: the call reached a subscriber, who did not
+    /// answer, was busy, or the caller hung up first. Neither scan evidence nor benign
+    /// evidence: it is never fed, and in particular it does **not** end a failure run —
+    /// otherwise a scanner could `CANCEL` its way back to zero.
+    Unanswered,
+    /// Any other final `4xx`/`5xx`/`6xx`: trunk, codec or carrier trouble. Generic
+    /// failure evidence, to first-contact ranges only.
+    Failed,
+}
+
+impl CallOutcome {
+    /// Classifies a final status. `None` for what is not a call outcome: provisional
+    /// `1xx`, a `3xx` redirect, and the `401`/`407` digest challenge, which is the normal
+    /// authentication handshake.
+    pub fn from_status(status: u16) -> Option<Self> {
+        match status {
+            200..=299 => Some(Self::Completed),
+            401 | 407 => None,
+            404 | 410 | 484 | 485 | 604 => Some(Self::NoSuchNumber),
+            403 => Some(Self::Refused),
+            480 | 486 | 487 | 600 | 603 => Some(Self::Unanswered),
+            400..=699 => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    /// `403` or the no-such-number family: the outcomes route discovery produces.
+    pub fn is_unroutable(self) -> bool {
+        matches!(self, Self::NoSuchNumber | Self::Refused)
+    }
+}
+
+/// What was new about the call a final response answers, remembered from its `INVITE`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Novelty {
+    /// The destination range was a first contact for the source in the window.
+    pub range: bool,
+    /// The full B-number is not among the source's last [`RECENT_NUMBERS`] calls.
+    pub number: bool,
+}
+
+/// How many recent B-numbers a source remembers, to tell a redial from a new number. A
+/// person redialling one dead number, or a dialer retrying it, is not route discovery;
+/// sixteen distinct invalid numbers are.
+pub const RECENT_NUMBERS: usize = 16;
 
 /// How many trailing digits are ignored when forming a destination range. Four groups
 /// 10,000 numbers, which is the scale of an IPRN block and matches the durable unit
@@ -237,6 +319,10 @@ pub struct Params {
     /// traffic mostly completes; a scanner probing dead routes mostly does not.
     pub theta0c: f64,
     pub theta1c: f64,
+    /// Completion arm: probability a final international response is *unroutable* (`403`
+    /// or no-such-number) under benign traffic. Far rarer than a generic failure, so one is
+    /// worth `ln(θ₁c/θ₀u)` rather than `ln(θ₁c/θ₀c)`.
+    pub theta0u: f64,
     pub alpha: f64,
     pub beta: f64,
     pub prior_mean: f64,
@@ -262,6 +348,7 @@ impl Default for Params {
             theta0_range: 0.15,
             theta0c: 0.20,
             theta1c: 0.85,
+            theta0u: 0.05,
             alpha,
             beta,
             prior_mean: 2.0,
@@ -295,6 +382,8 @@ pub struct Verdict {
     pub first_prefix: bool,
     /// This destination range was a first for the source in the window.
     pub first_range: bool,
+    /// This B-number is not among the source's recent calls.
+    pub first_number: bool,
     /// The fused evidence crossed the fire bound.
     pub fired: bool,
     /// The source has not yet been observed long enough to enforce against.
@@ -320,11 +409,17 @@ pub struct SourceAnomaly {
     range_previous: RangeBloom,
     range_window: u32,
     range_scan: SeqTest,
-    /// Consecutive novel-range completion failures, and when the run started.
-    completion_novel_failures: u32,
+    /// Hashes of the last [`RECENT_NUMBERS`] B-numbers dialled, as a ring.
+    recent_numbers: [u64; RECENT_NUMBERS],
+    recent_next: usize,
+    /// Counted completion failures (novel-range failures, plus no-such-number anywhere) in
+    /// the current run, and when the run started.
+    completion_failures: u32,
     completion_failure_window: u32,
     /// Completion arm: fed by observed international-call outcomes, not by the INVITE.
     completion_scan: SeqTest,
+    /// The walk's step for an unroutable outcome, `ln(θ₁c/θ₀u)`, never below the generic one.
+    unroutable_step: f64,
     rate: RateModel,
     /// International calls in the current volume window, and when it started.
     window_start: u32,
@@ -350,6 +445,14 @@ pub const VOLUME_WINDOW_SECS: u32 = 3600;
 /// few multiples of this; novelty spread wider than that leaks away.
 pub const SCAN_HALFLIFE_SECS: u32 = 600;
 
+/// The completion walk's step for an unroutable outcome. Never weaker than a generic
+/// failure, whatever calibration does to `θ₀u` and `θ₀c`.
+fn unroutable_step(p: &Params) -> f64 {
+    (p.theta1c / p.theta0u)
+        .ln()
+        .max((p.theta1c / p.theta0c).ln())
+}
+
 impl Default for SourceAnomaly {
     fn default() -> Self {
         Self::new(&Params::default())
@@ -371,9 +474,12 @@ impl SourceAnomaly {
             range_previous: RangeBloom::default(),
             range_window: 0,
             range_scan: SeqTest::new(p.theta0_range, p.theta1, p.alpha, p.beta),
-            completion_novel_failures: 0,
+            recent_numbers: [0; RECENT_NUMBERS],
+            recent_next: 0,
+            completion_failures: 0,
             completion_failure_window: 0,
             completion_scan: SeqTest::new(p.theta0c, p.theta1c, p.alpha, p.beta),
+            unroutable_step: unroutable_step(p),
             rate: RateModel::new(p.prior_mean, p.prior_strength, p.decay),
             window_start: 0,
             window_count: 0,
@@ -525,17 +631,55 @@ impl SourceAnomaly {
         }
         self.range_scan.observe(novel_range);
 
+        let novel_number = self.number_first_contact(digits);
+
         let mut v = self.fused(first_time, now);
         v.first_prefix = novel_prefix;
         v.first_range = novel_range;
+        v.first_number = novel_number;
         v
+    }
+
+    /// Is this B-number new among the source's recent calls? Records it either way.
+    fn number_first_contact(&mut self, digits: &str) -> bool {
+        // Zero marks an empty slot; a hash that happens to be zero is nudged off it.
+        let h = fnv1a(digits.as_bytes()).max(1);
+        if self.recent_numbers.contains(&h) {
+            return false;
+        }
+        self.recent_numbers[self.recent_next] = h;
+        self.recent_next = (self.recent_next + 1) % RECENT_NUMBERS;
+        true
     }
 
     /// Records an observed **outcome** of an international call from this source: whether it
     /// completed (a `2xx`) or failed (a final `4xx`/`5xx`/`6xx`). Provisional responses and
     /// unseen ones are never fed here — silence is not evidence, the same honesty the auth
     /// rule keeps. Returns the refreshed verdict, which may now fire.
-    pub fn observe_completion(&mut self, completed: bool, novel: bool, now: u32) -> Verdict {
+    pub fn observe_completion(
+        &mut self,
+        outcome: CallOutcome,
+        novel: Novelty,
+        now: u32,
+    ) -> Verdict {
+        // Which outcomes are evidence, and how strong. Anything else leaves the arm — its
+        // walk, its run and its clock — exactly as it was.
+        let step = match outcome {
+            CallOutcome::Completed => None,
+            CallOutcome::Unanswered => return self.fused(false, now),
+            // A number that does not exist is a per-number answer, so it counts inside a
+            // known range too — but only for a number not dialled recently. Distinct invalid
+            // numbers are discovery; the same one again is a redial or a broken route.
+            CallOutcome::NoSuchNumber if novel.range || novel.number => Some(self.unroutable_step),
+            // A refusal is per-range policy: novel ranges only, like a generic failure.
+            CallOutcome::Refused if novel.range => Some(self.unroutable_step),
+            CallOutcome::Failed if novel.range => Some(self.completion_scan.hit_step()),
+            // Anything else to a destination the source already calls is an outage or a
+            // standing policy, not a route probe.
+            CallOutcome::NoSuchNumber | CallOutcome::Refused | CallOutcome::Failed => {
+                return self.fused(false, now)
+            }
+        };
         if self.last_completion != 0 {
             let dt = now.saturating_sub(self.last_completion) as f64;
             self.completion_scan
@@ -543,22 +687,23 @@ impl SourceAnomaly {
         }
         // Completions run on their own clock, so an INVITE never dilutes this arm's decay.
         self.last_completion = now;
-        if completed {
-            // A completed call is benign evidence and ends a failure run.
-            self.completion_novel_failures = 0;
-            self.completion_failure_window = 0;
-            self.completion_scan.observe(false);
-        } else if novel {
-            // Only a failure to a first-contact range is scan evidence. An outage against
-            // destinations the source already calls is not a route probe.
-            if self.completion_failure_window == 0 {
-                self.completion_failure_window = now;
-            } else if now.saturating_sub(self.completion_failure_window) >= VOLUME_WINDOW_SECS {
-                self.completion_failure_window = now;
-                self.completion_novel_failures = 0;
+        match step {
+            None => {
+                // A completed call is benign evidence and ends a failure run.
+                self.completion_failures = 0;
+                self.completion_failure_window = 0;
+                self.completion_scan.observe(false);
             }
-            self.completion_novel_failures = self.completion_novel_failures.saturating_add(1);
-            self.completion_scan.observe(true);
+            Some(step) => {
+                if self.completion_failure_window == 0 {
+                    self.completion_failure_window = now;
+                } else if now.saturating_sub(self.completion_failure_window) >= VOLUME_WINDOW_SECS {
+                    self.completion_failure_window = now;
+                    self.completion_failures = 0;
+                }
+                self.completion_failures = self.completion_failures.saturating_add(1);
+                self.completion_scan.observe_step(step);
+            }
         }
         self.fused(false, now)
     }
@@ -582,7 +727,7 @@ impl SourceAnomaly {
         } else {
             0.0
         };
-        let completion_bits = if self.completion_novel_failures >= COMPLETION_MIN_NOVEL_FAILURES {
+        let completion_bits = if self.completion_failures >= COMPLETION_MIN_FAILURES {
             self.completion_scan.evidence()
         } else {
             0.0
@@ -606,6 +751,7 @@ impl SourceAnomaly {
             first_time,
             first_prefix: false,
             first_range: false,
+            first_number: false,
             fired: evidence >= self.fire_bits,
             warming: !warmed,
         }
@@ -619,6 +765,7 @@ impl SourceAnomaly {
             .recalibrate(p.theta0_range, p.theta1, p.alpha, p.beta);
         self.completion_scan
             .recalibrate(p.theta0c, p.theta1c, p.alpha, p.beta);
+        self.unroutable_step = unroutable_step(p);
         self.fire_bits = p.fire_bits;
     }
 
@@ -772,6 +919,17 @@ fn ln_gamma(x: f64) -> f64 {
 mod tests {
     use super::*;
 
+    /// A call to a first-contact range and a number not dialled recently.
+    const NEW: Novelty = Novelty {
+        range: true,
+        number: true,
+    };
+    /// A call to a range and a number the source already dials.
+    const SEEN: Novelty = Novelty {
+        range: false,
+        number: false,
+    };
+
     fn ci(i: u16) -> CountryIndex {
         CountryIndex(i)
     }
@@ -859,7 +1017,9 @@ mod tests {
         }
         let mut fired = false;
         for k in 0..20 {
-            fired |= s.observe_completion(false, true, 240 + k * 30).fired; // nothing answers
+            fired |= s
+                .observe_completion(CallOutcome::Failed, NEW, 240 + k * 30)
+                .fired; // nothing answers
         }
         assert!(fired, "many novel ranges and nothing completing must fire");
 
@@ -867,7 +1027,9 @@ mod tests {
         let mut s = SourceAnomaly::new(&p);
         let mut ever = false;
         for k in 0..40 {
-            ever |= s.observe_completion(true, true, k * 60).fired;
+            ever |= s
+                .observe_completion(CallOutcome::Completed, NEW, k * 60)
+                .fired;
         }
         assert!(!ever, "calls that answer are not a scan");
     }
@@ -925,10 +1087,10 @@ mod tests {
         let p = Params::default();
         let mut s = SourceAnomaly::new(&p);
         for k in 0..9u32 {
-            let v = s.observe_completion(false, true, k * 20);
+            let v = s.observe_completion(CallOutcome::Failed, NEW, k * 20);
             assert!(!v.fired, "nine failures are below the floor");
         }
-        assert!(s.observe_completion(false, true, 200).fired);
+        assert!(s.observe_completion(CallOutcome::Failed, NEW, 200).fired);
     }
 
     #[test]
@@ -936,12 +1098,159 @@ mod tests {
         let p = Params::default();
         let mut s = SourceAnomaly::new(&p);
         for k in 0..30u32 {
-            let v = s.observe_completion(false, false, k * 20);
+            let v = s.observe_completion(CallOutcome::Failed, SEEN, k * 20);
             assert!(
                 !v.fired,
                 "an outage against known destinations is not a probe"
             );
         }
+    }
+
+    #[test]
+    fn statuses_classify_into_call_outcomes() {
+        use CallOutcome::*;
+        for (status, want) in [
+            (200, Some(Completed)),
+            (404, Some(NoSuchNumber)),
+            (410, Some(NoSuchNumber)),
+            (484, Some(NoSuchNumber)),
+            (485, Some(NoSuchNumber)),
+            (604, Some(NoSuchNumber)),
+            (403, Some(Refused)),
+            (480, Some(Unanswered)),
+            (486, Some(Unanswered)),
+            (487, Some(Unanswered)),
+            (600, Some(Unanswered)),
+            (603, Some(Unanswered)),
+            (408, Some(Failed)),
+            (488, Some(Failed)),
+            (503, Some(Failed)),
+            (401, None),
+            (407, None),
+            (183, None),
+            (302, None),
+        ] {
+            assert_eq!(CallOutcome::from_status(status), want, "status {status}");
+        }
+    }
+
+    #[test]
+    fn invalid_numbers_inside_a_known_range_are_scan_evidence() {
+        // Premium-route discovery dials invalid B-numbers, many of them inside one block.
+        // Only the first is a first-contact range; the rest used to be dismissed as an
+        // outage. A 404 is not an outage — it says this number does not exist.
+        let p = Params::default();
+        let mut s = SourceAnomaly::new(&p);
+        let mut fired = false;
+        for k in 0..12u32 {
+            fired |= s
+                .observe_completion(
+                    CallOutcome::NoSuchNumber,
+                    Novelty {
+                        range: k == 0,
+                        number: true,
+                    },
+                    k * 20,
+                )
+                .fired;
+        }
+        assert!(fired, "a run of 404s inside one range must fire");
+    }
+
+    #[test]
+    fn redialling_one_dead_number_is_not_a_probe() {
+        // The same number answered 404 again and again: a redial, a retrying dialer, or a
+        // switch that says 404 for a missing route. None of it is discovery.
+        let p = Params::default();
+        let mut s = SourceAnomaly::new(&p);
+        for k in 0..30u32 {
+            assert!(
+                !s.observe_completion(CallOutcome::NoSuchNumber, SEEN, k * 20)
+                    .fired
+            );
+        }
+    }
+
+    #[test]
+    fn a_redial_is_not_a_new_number() {
+        let p = Params::default();
+        let mut s = SourceAnomaly::new(&p);
+        assert!(s.observe(ci(1), "00", "442079460001", 0).first_number);
+        assert!(!s.observe(ci(1), "00", "442079460001", 10).first_number);
+        assert!(s.observe(ci(1), "00", "442079460002", 20).first_number);
+        // Past the ring, an old number is new again.
+        for i in 0..RECENT_NUMBERS as u32 {
+            s.observe(ci(1), "00", &format!("44207947{i:04}"), 30 + i);
+        }
+        assert!(s.observe(ci(1), "00", "442079460001", 100).first_number);
+    }
+
+    #[test]
+    fn a_refusal_counts_only_to_first_contact_ranges() {
+        let p = Params::default();
+        // A destination the carrier bars, called repeatedly by a source that already calls
+        // it: a policy, not a probe.
+        let mut s = SourceAnomaly::new(&p);
+        for k in 0..30u32 {
+            assert!(
+                !s.observe_completion(CallOutcome::Refused, SEEN, k * 20)
+                    .fired
+            );
+        }
+        // 403 after 403 across new ranges is a source finding out where it may dial.
+        let mut s = SourceAnomaly::new(&p);
+        let mut fired = false;
+        for k in 0..12u32 {
+            fired |= s
+                .observe_completion(CallOutcome::Refused, NEW, k * 20)
+                .fired;
+        }
+        assert!(fired, "refusals across first-contact ranges must fire");
+    }
+
+    #[test]
+    fn unanswered_calls_are_neither_evidence_nor_a_reset() {
+        let p = Params::default();
+        // A source whose international calls ring out, are busy or are cancelled is not
+        // probing — before, each of these was a failed completion.
+        let mut s = SourceAnomaly::new(&p);
+        for k in 0..40u32 {
+            assert!(
+                !s.observe_completion(CallOutcome::Unanswered, NEW, k * 20)
+                    .fired
+            );
+        }
+        // And a scanner cannot clear its run by cancelling calls between probes.
+        let mut s = SourceAnomaly::new(&p);
+        for k in 0..9u32 {
+            s.observe_completion(CallOutcome::NoSuchNumber, NEW, k * 20);
+            s.observe_completion(CallOutcome::Unanswered, NEW, k * 20 + 5);
+        }
+        assert!(
+            s.observe_completion(CallOutcome::NoSuchNumber, NEW, 200)
+                .fired,
+            "487s between probes must not reset the run"
+        );
+    }
+
+    #[test]
+    fn unroutable_outcomes_weigh_more_than_generic_failures() {
+        // Paced at five minutes, a stream of generic failures leaks away faster than it
+        // builds; the same stream of 404s does not, because a benign source almost never
+        // dials a number that does not exist.
+        let p = Params::default();
+        let (mut generic, mut unroutable) = (SourceAnomaly::new(&p), SourceAnomaly::new(&p));
+        let (mut g_fired, mut u_fired) = (false, false);
+        for k in 0..12u32 {
+            g_fired |= generic
+                .observe_completion(CallOutcome::Failed, NEW, k * 300)
+                .fired;
+            u_fired |= unroutable
+                .observe_completion(CallOutcome::NoSuchNumber, NEW, k * 300)
+                .fired;
+        }
+        assert!(!g_fired, "paced generic failures do not accumulate");
+        assert!(u_fired, "paced no-such-number answers do");
     }
 
     #[test]

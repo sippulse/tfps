@@ -423,6 +423,44 @@ fn main() {
     }
     h.row("outage: known ranges", "active");
 
+    // 6c. Premium-number discovery inside one block: a different invalid B-number each
+    //     time, every one answered 404. One first-contact range, so the range arm is quiet;
+    //     the completion arm counts each new number that does not exist.
+    let mut h = Harness::new(Mode::Active, DialPlan::new(["00"])).capture("number_probe_one_range");
+    for i in 0..30 {
+        h.exchange("200", &format!("0044207946{i:04}"), false, 404, i * 20);
+        if h.fired() {
+            break;
+        }
+    }
+    h.row("number probe: one range (404)", "active");
+
+    // 6d. Refusals across new ranges: the PBX is not allowed to dial there, and the source
+    //     keeps trying new destinations anyway.
+    let mut h = Harness::new(Mode::Active, DialPlan::new(["00"])).capture("refused_new_ranges");
+    for i in 0..30 {
+        let dest = format!("00{}12345678", 30 + i);
+        h.exchange("200", &dest, false, 403, i * 30);
+        if h.fired() {
+            break;
+        }
+    }
+    h.row("refused: new ranges (403)", "active");
+
+    // 6e. People not answering: busy, no answer, cancelled. A person was rung each time.
+    let mut h = Harness::new(Mode::Active, DialPlan::new(["00"])).capture("unanswered_calls");
+    for i in 0..40u32 {
+        let status = [486, 480, 487, 603][i as usize % 4];
+        h.exchange(
+            "200",
+            &format!("00442079460{:03}", i % 6),
+            false,
+            status,
+            i * 30,
+        );
+    }
+    h.row("legit: busy / no answer", "active");
+
     // 7. Exploitation: build six scoring periods of history, then 300 calls in an hour.
     let mut h =
         Harness::new(Mode::Active, DialPlan::new(["00"])).capture("volume_spike_300_per_hour");

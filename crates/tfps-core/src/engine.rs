@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
-use crate::anomaly::{AnomalySnapshot, Params, SourceAnomaly};
+use crate::anomaly::{AnomalySnapshot, CallOutcome, Novelty, Params, SourceAnomaly};
 use crate::country::{self, Country};
 use crate::dialplan::{DialPlan, InternationalDigits};
 use crate::novelty::Timestamp;
@@ -150,8 +150,15 @@ pub struct Stats {
     pub digest_challenges: u64,
     /// International calls observed to complete (a `2xx`).
     pub intl_completed: u64,
-    /// International calls observed to fail (a final `4xx`/`5xx`/`6xx`) — the scan signal.
+    /// International calls observed to fail (a final `4xx`/`5xx`/`6xx` that is not a
+    /// subscriber outcome) — the scan signal. Includes `intl_unroutable`.
     pub intl_failed: u64,
+    /// Of those, `403` or no-such-number (`404`/`410`/`484`/`485`/`604`): what dialling
+    /// invalid premium-range numbers collects, and the strongest form of the signal.
+    pub intl_unroutable: u64,
+    /// International calls that reached a subscriber and were not answered (`480`, `486`,
+    /// `487`, `600`, `603`). Not evidence either way, counted so it is not invisible.
+    pub intl_unanswered: u64,
     /// First-time-dialling-prefix events, for the learned prefix benign rate.
     pub prefix_novel: u64,
     /// First-time-destination-range events, for the learned range benign rate.
@@ -270,7 +277,8 @@ struct PendingEntry {
     /// None = unconfirmed legacy caller (`observe`, tests); Some = the request's destination.
     responder: Option<Ipv4Addr>,
     aor: Option<u64>,
-    novel: bool,
+    /// For an international INVITE, what was new about the call.
+    novel: Novelty,
 }
 
 #[derive(Debug, Default)]
@@ -285,7 +293,7 @@ impl PendingAuth {
         now: u32,
         responder: Option<Ipv4Addr>,
         aor: Option<u64>,
-        novel: bool,
+        novel: Novelty,
     ) {
         self.entries
             .retain(|e| now.saturating_sub(e.at) < PENDING_TTL_SECS);
@@ -312,7 +320,7 @@ impl PendingAuth {
     /// address the request was sent to**. Returning the recorded AOR lets a success clear
     /// only that AOR's failures. Removing the entry on the first matching response keeps a
     /// retransmitted `401` from counting twice.
-    fn claim(&mut self, key: &str, src: Ipv4Addr) -> Option<(Option<u64>, bool)> {
+    fn claim(&mut self, key: &str, src: Ipv4Addr) -> Option<(Option<u64>, Novelty)> {
         let i = self
             .entries
             .iter()
@@ -482,6 +490,10 @@ impl Engine {
         if finals >= 200 {
             let rc = self.stats.intl_failed as f64 / finals as f64;
             p.theta0c = rc.clamp(0.05, 0.7);
+            // theta0u: the population rate of unroutable answers. Never above theta0c —
+            // they are a subset of the failures — so an unroutable step never weakens.
+            let ru = self.stats.intl_unroutable as f64 / finals as f64;
+            p.theta0u = ru.clamp(0.005, 0.3).min(p.theta0c);
         }
         // Volume prior: a method-of-moments Gamma fit to the current per-source rates.
         let rates: Vec<f64> = self
@@ -569,9 +581,9 @@ impl Engine {
     /// Approximate memory held by detector state, for the report.
     pub fn approx_state_bytes(&self) -> usize {
         // A SourceAnomaly is a fixed handful of words: three walks, a rate posterior, a
-        // 256-bit country set, and two 128-byte range filters. Call it ~600 bytes per peer
-        // with map overhead.
-        const PER_PEER: usize = 600;
+        // 256-bit country set, two 128-byte range filters and a 16-number ring. Call it
+        // ~750 bytes per peer with map overhead.
+        const PER_PEER: usize = 750;
         self.peers.len() * PER_PEER
     }
 
@@ -671,7 +683,7 @@ impl Engine {
         }
 
         let aor = auth.and_then(|(aor, _)| aor);
-        let novel = intl.is_some_and(|(_, novel)| novel);
+        let novel = intl.map(|(_, novel)| novel).unwrap_or_default();
         if was_auth {
             let is_register = r
                 .cseq
@@ -715,18 +727,22 @@ impl Engine {
         // Only a final response is an outcome, and silence is never fed — the same honesty
         // the auth rule keeps. A digest challenge is the normal handshake, not a routing
         // outcome, whether or not the INVITE carried a credential.
-        if was_intl && !r.is_digest_challenge() {
-            let completed = r.is_success();
-            if completed {
-                self.stats.intl_completed += 1;
-            } else if r.status >= 400 {
-                self.stats.intl_failed += 1;
-            } else {
-                // A 3xx redirect is neither a completion nor a failure; ignore it.
+        if was_intl {
+            // A 3xx redirect and the 401/407 challenge are not outcomes; ignore them.
+            let Some(outcome) = CallOutcome::from_status(r.status) else {
                 return Decision::OutOfScope("SIP response");
+            };
+            match outcome {
+                CallOutcome::Completed => self.stats.intl_completed += 1,
+                CallOutcome::Unanswered => self.stats.intl_unanswered += 1,
+                CallOutcome::Failed => self.stats.intl_failed += 1,
+                CallOutcome::NoSuchNumber | CallOutcome::Refused => {
+                    self.stats.intl_failed += 1;
+                    self.stats.intl_unroutable += 1;
+                }
             }
             if behavioural {
-                let v = st.anomaly.observe_completion(completed, novel, now.0);
+                let v = st.anomaly.observe_completion(outcome, novel, now.0);
                 st.dirty = true;
                 let evidence_nats = v.evidence.round().max(0.0) as u32;
                 if v.fired {
@@ -852,7 +868,7 @@ impl Engine {
                         now.0,
                         responder,
                         is_register.then_some(aor_hash),
-                        false,
+                        Novelty::default(),
                     );
                 }
                 // The volume backstop, for deployments where no response is ever seen.
@@ -952,9 +968,16 @@ impl Engine {
             request.call_id.as_deref(),
             request.cseq.as_deref(),
         ) {
-            state
-                .pending_intl
-                .remember(key, now.0, responder, None, v.first_range);
+            state.pending_intl.remember(
+                key,
+                now.0,
+                responder,
+                None,
+                Novelty {
+                    range: v.first_range,
+                    number: v.first_number,
+                },
+            );
         }
         // A first-time country registers as novelty for the report's thermometer.
         stats.novel += u64::from(v.first_time);
@@ -1395,6 +1418,76 @@ mod tests {
             );
         }
         assert!(fired, "recalibration must not blind the detector to a scan");
+    }
+
+    #[test]
+    fn invalid_numbers_probed_inside_one_range_are_caught() {
+        // Premium-number discovery from a compromised PBX: one GB block, one dialling
+        // format, a different invalid B-number each time, every one answered 404. Only the
+        // first call is a first-contact range, so neither the range arm nor the old
+        // novel-only completion rule could see it.
+        let mut e = engine();
+        let mut fired = false;
+        for i in 0..15u32 {
+            let dest = format!("0044207946{i:04}");
+            e.observe_packet(peer(), switch(), &invite_n(i, &dest), t(i * 20));
+            fired |= matches!(
+                e.observe_packet(switch(), peer(), &invite_response(i, 404), t(i * 20 + 1))
+                    .1,
+                Decision::Block { .. }
+            );
+        }
+        assert_eq!(
+            e.stats.range_novel, 1,
+            "one range, so the range arm is quiet"
+        );
+        assert_eq!(e.stats.intl_unroutable, 15);
+        assert!(fired, "a run of 404s inside one range must block");
+    }
+
+    #[test]
+    fn unanswered_international_calls_are_not_failures() {
+        // Busy, no answer, cancelled: a person was rung. None of it is a routing failure.
+        let mut e = engine();
+        let mut ever = false;
+        for (i, status) in [486u16, 480, 487, 603, 600]
+            .iter()
+            .cycle()
+            .take(40)
+            .enumerate()
+        {
+            let i = i as u32;
+            let dest = format!("00{}12345678", 30 + (i % 3));
+            e.observe_packet(peer(), switch(), &invite_n(i, &dest), t(i * 30));
+            ever |= matches!(
+                e.observe_packet(
+                    switch(),
+                    peer(),
+                    &invite_response(i, *status),
+                    t(i * 30 + 1)
+                )
+                .1,
+                Decision::Block { .. }
+            );
+        }
+        assert!(!ever);
+        assert_eq!(e.stats.intl_failed, 0);
+        assert_eq!(e.stats.intl_unanswered, 40);
+    }
+
+    #[test]
+    fn recalibration_keeps_theta0u_at_or_below_theta0c() {
+        let mut e = engine();
+        // A deployment where every failure is a 404 — theta0u would equal theta0c.
+        for i in 0..300u32 {
+            let status = if i % 2 == 0 { 200 } else { 404 };
+            e.observe_packet(peer(), switch(), &invite_n(i, "00551199998888"), t(i * 60));
+            e.observe_packet(switch(), peer(), &invite_response(i, status), t(i * 60 + 1));
+        }
+        e.recalibrate();
+        let p = e.params();
+        assert!(p.theta0u <= p.theta0c);
+        assert!(p.theta0u > 0.0);
     }
 
     #[test]

@@ -505,6 +505,7 @@ KERNEL  (live)
 CALIBRATION  (benign hypotheses learned from this deployment)
   theta0                 0.083
   theta0c                0.310
+  theta0u                0.040
   prior_mean             1.90
 
 TRAFFIC  (as of the last checkpoint, 2m ago)
@@ -525,7 +526,8 @@ state needs only the database file.
 ```
 --- mode=PREVENTION packets=330 sip=98 responses=0 keepalive=232 not_sip=0
     noise=12 (12%) injection=0 auth_att=142 auth_fail=5 auth_ok=97 auth_chal=104
-    auth_volume=0 intl_ok=0 intl_fail=0 invites=62 intl=62 unknown_country=20
+    auth_volume=0 intl_ok=0 intl_fail=0 intl_unroutable=0 intl_unanswered=0
+    invites=62 intl=62 unknown_country=20
     first_time=21 blocks=0 would_block=0 sources=3 ports={5060: 330}
     XDP: dropped=1840 seen=2100 expired=3 in_map=7 blocked_by_us=7
 ```
@@ -539,6 +541,8 @@ state needs only the database file.
 | `auth_fail` / `auth_ok` / `auth_chal` | rejected credentials, accepted, challenges seen |
 | `auth_volume` | sources condemned by the volume backstop |
 | `intl_ok` / `intl_fail` | international calls observed to complete / fail (the completion arm's fuel) |
+| `intl_unroutable` | of `intl_fail`, answered `403` or no-such-number (`404`/`484`/`604`…) — the discovery signature |
+| `intl_unanswered` | busy / no answer / cancelled — a person was rung, not counted as a failure |
 | `unknown_country` | international by shape, no recognisable country — prefix padding |
 | `first_time` | first-time-country events; feeds the learned benign rate |
 | `blocks` / `would_block` | behavioural verdicts (active / during learning) |
