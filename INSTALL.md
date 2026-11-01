@@ -85,7 +85,7 @@ Configuration lives in `/etc/tfps/config.json`; every field is optional and the 
 ## Pinning a version
 
 ```sh
-curl -fsSL https://tfps.co/install.sh | TFPS_VERSION=v0.3.0 sh
+curl -fsSL https://tfps.co/install.sh | TFPS_VERSION=v0.3.1 sh
 ```
 
 `TFPS_VERSION` is a tag from the [releases page](https://github.com/sippulse/tfps/releases).

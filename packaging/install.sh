@@ -11,7 +11,7 @@
 #   1. TFPS_TARBALL=<file or URL>   a release tarball you already have (air-gapped hosts,
 #                                   or a build from another machine)
 #   2. a checkout                   when run from inside the repository
-#   3. the GitHub release           TFPS_VERSION=latest (default) or a tag such as v0.3.0
+#   3. the GitHub release           TFPS_VERSION=latest (default) or a tag such as v0.3.1
 #   4. the source                   built here, only when the host can afford it
 #
 # Everything is idempotent: run it again to upgrade. /etc/tfps/config.json is written

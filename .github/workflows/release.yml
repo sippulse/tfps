@@ -8,7 +8,7 @@
 #     ebpf/tfps_xdp.c                      compiled on the target against its own BTF
 #     packaging/tfps.service  config.example.json  install.sh
 #
-# Cut a release with:   git tag v0.3.0 && git push origin v0.3.0
+# Cut a release with:   git tag v0.3.1 && git push origin v0.3.1
 name: release
 
 on:

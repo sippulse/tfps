@@ -168,7 +168,7 @@ Sources: a list of user-agents and IP ranges in the JSON; rate; optionally APIBA
 
 ### The perimeter stays quiet; the forged answer is not implemented
 
-Current v0.3.0 drops the source and sends no response. The argument below is the design
+Current v0.3.1 drops the source and sends no response. The argument below is the design
 rationale for the forged `603` once it exists.
 
 Any response to a scanner — `403`, `404`, even `401` — confirms a live SIP endpoint and invites escalation; differentiated responses still leak extension enumeration. But silently dropping a **legitimate customer** costs 32 seconds of retransmission under RFC 3261's A/B timers, and the product's central case is a paying customer, where silence looks like an outage.
@@ -177,7 +177,7 @@ Any response to a scanner — `403`, `404`, even `401` — confirms a live SIP e
 
 ### Drop-then-forge (planned)
 
-**Not implemented in v0.3.0.** The source is dropped; no response is forged yet. When it is,
+**Not implemented in v0.3.1.** The source is dropped; no response is forged yet. When it is,
 XDP **drops** the INVITE and userspace **forges** the response through a raw socket (`CAP_NET_RAW`). This **eliminates the race** against the softswitch instead of trying to win it. RFC 3261 §17.1.3 makes the forgery mechanical: the response reuses the INVITE's own `Via`/`branch`, `From` tag, `Call-ID` and `CSeq` — only the `To-tag` and `Contact` have to be generated.
 
 **eBPF cannot create a packet from scratch** — no helper builds a new frame, only rewrites or redirects. Hence the forgery lives in userspace.

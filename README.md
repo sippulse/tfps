@@ -99,7 +99,7 @@ configured on the softswitch at all.
 
 ---
 
-## Status — v0.3.0
+## Status — v0.3.1
 
 | working | not yet |
 |---|---|

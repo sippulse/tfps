@@ -167,7 +167,7 @@ not block**, announcing that explicitly. The perimeter blocks normally during th
 
 **Silence** — not answering an attempt. Applied to **production addresses** against
 attackers, because any response confirms a live endpoint and invites escalation. The design
-answers legitimate customers and **decoys**, but v0.3.0 does **not** forge the `603`
+answers legitimate customers and **decoys**, but v0.3.1 does **not** forge the `603`
 response yet: all blocked sources are silent.
 
 **Decoy** — an idle extension or DID used as a trap. Traffic aimed at a decoy is suspicious
