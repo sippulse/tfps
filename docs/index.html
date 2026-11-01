@@ -90,11 +90,13 @@
             <h3>Behavioural detection</h3>
             <p>
               Learns each source’s international calling pattern—the dialling formats it
-              tries and the destination ranges it probes—and reports anomalous scans and
-              volume, even when the attacker has valid credentials.
+              tries, the destination ranges it probes, and the invalid numbers it dials
+              hunting for premium-rate routes—and reports anomalous scans and volume, even
+              when the attacker has valid credentials.
             </p>
             <ul>
               <li>Opt-in with <code>--behavioural</code></li>
+              <li>Floods of <code>404</code>/<code>403</code> on international calls flag a compromised source</li>
               <li>30-day learning window by default</li>
               <li>Detection and reporting by default; source-level blocking is opt-in</li>
             </ul>
